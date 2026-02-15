@@ -1172,44 +1172,6 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         
         {subTab === 'history' && (
           <div className="space-y-4 h-full overflow-y-auto">
-            {/* Draft Invoices Section */}
-            <div>
-              <h3 className="font-bold text-slate-800 dark:text-white mb-2 flex items-center gap-2">
-                Draft Invoices
-                <span className="text-xs font-normal text-slate-500">(not yet generated)</span>
-              </h3>
-              {invoices.filter(i => i.status === 'draft').length === 0 ? (
-                 <p className="text-sm text-slate-500 italic">No draft invoices.</p>
-              ) : (
-                 invoices.filter(i => i.status === 'draft').map(rec => (
-                  <div key={rec.id} className="bg-amber-50 dark:bg-amber-900/20 p-3 rounded-lg border border-amber-200 dark:border-amber-800 shadow-sm">
-                    <div className="flex justify-between items-start mb-2">
-                      <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded-full">Draft</span>
-                        <button
-                          onClick={async () => {
-                            if (confirm('Are you sure you want to delete this draft invoice?')) {
-                              await DB.deleteInvoice(rec.id);
-                              const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
-                              setInvoices(refreshedInvoices);
-                            }
-                          }}
-                          className="text-slate-400 hover:text-red-500 transition-colors"
-                          title="Delete draft"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1">
-                      <p>Inv #: {rec.invoiceNumber || 'Not set'}</p>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-            
             {/* Generated Invoices Section */}
             <div>
               <h3 className="font-bold text-slate-800 dark:text-white mb-2">Generated Invoices</h3>
