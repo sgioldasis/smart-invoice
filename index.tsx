@@ -72,8 +72,6 @@ interface InvoiceRecord {
   status: 'draft' | 'generated';
   // History fields
   invoiceNumber?: string;
-  savedAmount?: number;
-  savedDays?: number;
   generatedDate?: string;
 }
 
@@ -634,6 +632,8 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
   const [invoice, setInvoice] = useState<InvoiceRecord | null>(null);
   const [invoiceNumberInput, setInvoiceNumberInput] = useState('');
   const [previewInvoice, setPreviewInvoice] = useState<InvoiceRecord | null>(null);
+  const [previewStats, setPreviewStats] = useState<{ days: number; amount: number } | null>(null);
+  const [previewMonth, setPreviewMonth] = useState<string | null>(null);
   
   // Holidays State
   const [holidaysMap, setHolidaysMap] = useState<Record<string, Record<string, string>>>({});
@@ -647,16 +647,31 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
       const loadInvoices = async () => {
         const data = await DB.getInvoices(userId, selectedClient.id);
         setInvoices(data);
+        
+        // If we were previewing an invoice, try to find the same month for the new client
+        if (previewMonth) {
+          const sameMonthInvoice = data.find(i => i.month === previewMonth && i.status === 'generated');
+          if (sameMonthInvoice) {
+            setPreviewInvoice({ ...sameMonthInvoice, includedDates: sameMonthInvoice.includedDates || [] });
+            setPreviewStats(calculateStats(sameMonthInvoice, selectedClient));
+          } else {
+            setPreviewInvoice(null);
+            setPreviewStats(null);
+            setPreviewMonth(null);
+          }
+        }
       };
       loadInvoices();
     } else {
       setInvoices([]);
     }
-  }, [selectedClient, userId]);
+  }, [selectedClient, userId, previewMonth]);
 
   // Handle clientId prop change
   useEffect(() => {
-    if (clientId) setSelectedClientId(clientId);
+    if (clientId) {
+      setSelectedClientId(clientId);
+    }
   }, [clientId]);
 
   // Calendar Logic
@@ -824,13 +839,8 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
     // Note: Invoice is NOT saved to DB here - only when Generate is clicked
   };
 
-  const calculateStats = (inv = invoice, client = selectedClient, useSaved = false) => {
+  const calculateStats = (inv = invoice, client = selectedClient) => {
     if (!inv || !client) return { days: 0, amount: 0, excludedCount: 0 };
-    
-    // If we want to use saved data (e.g., for history list), check if it exists
-    if(useSaved && inv.status === 'generated' && inv.savedAmount !== undefined) {
-      return { days: inv.savedDays || 0, amount: inv.savedAmount, excludedCount: 0 };
-    }
 
     // Otherwise calculate dynamically
     let validDays = 0;
@@ -875,7 +885,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
   };
 
   // Editor always uses dynamic stats
-  const stats = calculateStats(invoice, selectedClient, false);
+  const stats = calculateStats(invoice, selectedClient);
 
   const handleGenerateExcel = async (targetInvoice = invoice, targetStats: any = null) => {
     console.log("Generating Excel...", { targetInvoice, targetStats, selectedClient });
@@ -897,7 +907,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
     try {
       // 2. Prepare Stats & Data
       const isCurrentEditorInvoice = targetInvoice.id === invoice?.id;
-      const finalStats = targetStats || calculateStats(targetInvoice, selectedClient, !isCurrentEditorInvoice);
+      const finalStats = targetStats || calculateStats(targetInvoice, selectedClient);
       const invNum = isCurrentEditorInvoice ? invoiceNumberInput : (targetInvoice.invoiceNumber || "");
       
       if (!invNum || !invNum.trim()) {
@@ -1013,8 +1023,6 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         id: existingWithSameNumber?.id || targetInvoice.id, // Use existing ID if found, otherwise keep current
         status: 'generated' as const,
         invoiceNumber: invNum,
-        savedAmount: finalStats.amount,
-        savedDays: finalStats.days,
         generatedDate: new Date().toISOString()
       };
       
@@ -1049,10 +1057,10 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
       <div className="w-80 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-700 p-6 overflow-y-auto flex flex-col h-full">
         <div className="mb-6">
           <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Select Client</label>
-          <select 
+          <select
             className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white"
             value={selectedClientId}
-            onChange={(e) => setSelectedClientId(e.target.value)}
+            onChange={(e) => { setSelectedClientId(e.target.value); }}
           >
             {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
@@ -1060,14 +1068,14 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
 
         {/* Sub Tabs */}
         <div className="flex p-1 bg-slate-100 dark:bg-slate-800 rounded-lg mb-6">
-          <button 
-            onClick={() => setSubTab('new')}
+          <button
+            onClick={() => { setSubTab('new'); setPreviewInvoice(null); setPreviewStats(null); setPreviewMonth(null); }}
             className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${subTab === 'new' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}
           >
             New Invoice
           </button>
-          <button 
-            onClick={() => setSubTab('history')}
+          <button
+            onClick={() => { setSubTab('history'); setPreviewInvoice(null); setPreviewStats(null); setPreviewMonth(null); }}
             className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-all ${subTab === 'history' ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}
           >
             History
@@ -1178,12 +1186,14 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
               {historyInvoices.length === 0 ? (
                  <p className="text-sm text-slate-500 italic">No invoices generated yet.</p>
               ) : (
-                 historyInvoices.map(rec => (
+                 historyInvoices.map(rec => {
+                   const recStats = calculateStats(rec, selectedClient);
+                   return (
                     <div key={rec.id} className="bg-white dark:bg-slate-800 p-3 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
                       <div className="flex justify-between items-center mb-2">
                         <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
                         <div className="flex items-center gap-2">
-                          <span className="font-bold text-indigo-600 dark:text-indigo-400">{selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</span>
+                          <span className="font-bold text-indigo-600 dark:text-indigo-400">{selectedClient?.currency} {recStats.amount.toLocaleString()}</span>
                         </div>
                       </div>
                       <div className="flex justify-between items-center mb-3">
@@ -1218,20 +1228,22 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                               ...rec,
                               includedDates: rec.includedDates || []
                             });
+                            setPreviewStats(calculateStats(rec, selectedClient));
+                            setPreviewMonth(rec.month);
                           }}
                           className="flex-1 flex items-center justify-center gap-1 bg-indigo-100 dark:bg-indigo-900 hover:bg-indigo-200 dark:hover:bg-indigo-800 py-1.5 rounded text-xs font-medium text-indigo-700 dark:text-indigo-300"
                         >
                           <Eye size={14} /> Preview
                         </button>
                         <button
-                          onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient, true))}
+                          onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient))}
                           className="flex-1 flex items-center justify-center gap-1 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 py-1.5 rounded text-xs font-medium text-slate-700 dark:text-slate-300"
                         >
                           <FileSpreadsheet size={14} /> Download
                         </button>
                       </div>
                     </div>
-                  ))
+                  );})
                )}
              </div>
            </div>
@@ -1315,12 +1327,26 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                     Invoice #{previewInvoice.invoiceNumber}
                   </span>
                   <button
-                    onClick={() => setPreviewInvoice(null)}
+                    onClick={() => { setPreviewInvoice(null); setPreviewStats(null); setPreviewMonth(null); }}
                     className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 underline"
                   >
                     Close Preview
                   </button>
                 </div>
+              </div>
+              {/* Invoice Summary in Header */}
+              <div className="mt-3 flex items-center gap-4 text-sm">
+                <span className="text-slate-600 dark:text-slate-400">
+                  <span className="font-medium text-slate-800 dark:text-white">{previewStats?.days}</span> days
+                </span>
+                <span className="text-slate-400">×</span>
+                <span className="text-slate-600 dark:text-slate-400">
+                  {selectedClient?.currency} <span className="font-medium text-slate-800 dark:text-white">{selectedClient?.dailyRate}</span>
+                </span>
+                <span className="text-slate-400">=</span>
+                <span className="font-bold text-indigo-600 dark:text-indigo-400">
+                  {selectedClient?.currency} {previewStats?.amount.toLocaleString()}
+                </span>
               </div>
             </div>
             
@@ -1375,24 +1401,6 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
               })()}
             </div>
             
-            {/* Summary for preview */}
-            <div className="mt-8 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
-              <h3 className="font-semibold text-slate-800 dark:text-slate-200 mb-3">Invoice Summary</h3>
-              <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
-                <div className="flex justify-between">
-                  <span>Working Days</span>
-                  <span className="font-medium text-slate-900 dark:text-white">{previewInvoice.savedDays}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>Rate</span>
-                  <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.currency} {selectedClient?.dailyRate}</span>
-                </div>
-                <div className="pt-2 border-t border-slate-200 dark:border-slate-700 flex justify-between text-lg font-bold text-indigo-600 dark:text-indigo-400">
-                  <span>Total</span>
-                  <span>{selectedClient?.currency} {previewInvoice.savedAmount?.toLocaleString()}</span>
-                </div>
-              </div>
-            </div>
           </>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-slate-500">
