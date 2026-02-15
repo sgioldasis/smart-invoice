@@ -78,6 +78,7 @@ interface InvoiceRecord {
   // History fields
   invoiceNumber?: string;
   generatedDate?: string;
+  totalAmount?: number; // Stored amount at time of generation
 }
 
 interface AnalysisResult {
@@ -331,7 +332,7 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto min-w-0">
         {children}
       </main>
     </div>
@@ -1066,7 +1067,8 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         id: existingWithSameNumber?.id || targetInvoice.id, // Use existing ID if found, otherwise keep current
         status: 'generated' as const,
         invoiceNumber: invNum,
-        generatedDate: new Date().toISOString()
+        generatedDate: new Date().toISOString(),
+        totalAmount: finalStats.amount // Store the actual invoiced amount
       };
       
       await DB.saveInvoice({ ...invoiceToSave, userId });
@@ -1505,25 +1507,31 @@ const Analytics = ({ userId }: { userId: string }) => {
       if (client) {
         const monthMap = dataMap.get(inv.month);
         if (monthMap) {
-          // Calculate amount dynamically
-          const days = (() => {
-            const date = parseISO(`${inv.month}-01`);
-            const daysInMonth = eachDayOfInterval({ start: startOfMonth(date), end: endOfMonth(date) });
-            let count = 0;
-            daysInMonth.forEach(day => {
-              const isWknd = isWeekend(day);
-              const holidayName = inv.useGreekHolidays ? getHolidayName(day) : undefined;
-              const isHol = !!holidayName;
-              const isDefaultNonWorking = isWknd || isHol;
-              const isExcluded = inv.excludedDates.some(d => isSameDay(parseISO(d), day));
-              const isIncluded = inv.includedDates?.some(d => isSameDay(parseISO(d), day));
-              if ((!isDefaultNonWorking && !isExcluded) || isIncluded) {
-                count++;
-              }
-            });
-            return count;
-          })();
-          const amount = days * client.dailyRate + inv.manualAdjustment;
+          // Use stored totalAmount if available (from generated invoice), otherwise calculate dynamically
+          let amount: number;
+          if (inv.totalAmount !== undefined && inv.totalAmount !== null) {
+            amount = inv.totalAmount;
+          } else {
+            // Fallback: Calculate amount dynamically for older invoices
+            const days = (() => {
+              const date = parseISO(`${inv.month}-01`);
+              const daysInMonth = eachDayOfInterval({ start: startOfMonth(date), end: endOfMonth(date) });
+              let count = 0;
+              daysInMonth.forEach(day => {
+                const isWknd = isWeekend(day);
+                const holidayName = inv.useGreekHolidays ? getHolidayName(day) : undefined;
+                const isHol = !!holidayName;
+                const isDefaultNonWorking = isWknd || isHol;
+                const isExcluded = inv.excludedDates.some(d => isSameDay(parseISO(d), day));
+                const isIncluded = inv.includedDates?.some(d => isSameDay(parseISO(d), day));
+                if ((!isDefaultNonWorking && !isExcluded) || isIncluded) {
+                  count++;
+                }
+              });
+              return count;
+            })();
+            amount = days * client.dailyRate + inv.manualAdjustment;
+          }
           monthMap.set(client.id, amount);
         }
       }
@@ -1558,6 +1566,13 @@ const Analytics = ({ userId }: { userId: string }) => {
   // Custom tooltip with glassmorphic design
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload && payload.length) {
+      // Sort payload: Total first, then by value descending
+      const sortedPayload = [...payload].sort((a: any, b: any) => {
+        if (a.name === 'Total') return -1;
+        if (b.name === 'Total') return 1;
+        return b.value - a.value;
+      });
+
       return (
         <motion.div
           initial={{ opacity: 0, y: 10 }}
@@ -1569,9 +1584,9 @@ const Analytics = ({ userId }: { userId: string }) => {
           }}
         >
           <p className="text-white font-semibold mb-2">{label}</p>
-          {payload.map((entry: any, index: number) => (
+          {sortedPayload.map((entry: any, index: number) => (
             <motion.div
-              key={index}
+              key={entry.name}
               initial={{ opacity: 0, x: -10 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: index * 0.05 }}
@@ -1620,14 +1635,14 @@ const Analytics = ({ userId }: { userId: string }) => {
   }
 
   return (
-    <div className="p-8">
+    <div className="h-full overflow-auto p-8">
       <h2 className="text-2xl font-bold text-slate-800 dark:text-white mb-6">Invoice Analytics</h2>
       
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-        className="relative p-6 rounded-2xl overflow-hidden"
+        className="relative p-6 rounded-2xl min-w-0"
         style={{
           background: 'linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9))',
           backdropFilter: 'blur(20px)',
@@ -1646,9 +1661,9 @@ const Analytics = ({ userId }: { userId: string }) => {
           </div>
         </div>
         
-        <div className="h-96">
+        <div className="relative h-96 w-full">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={chartData} margin={{ top: 10, right: 30, left: 20, bottom: 5 }}>
+            <AreaChart data={chartData} margin={{ top: 10, right: 40, left: 10, bottom: 20 }}>
               <defs>
                 {/* Gradient definitions for each client */}
                 {clients.map(client => (
@@ -1687,36 +1702,12 @@ const Analytics = ({ userId }: { userId: string }) => {
               <Legend
                 wrapperStyle={{ paddingTop: '20px' }}
                 iconType="circle"
+                formatter={(value: string, entry: any) => (
+                  <span style={{ color: entry.color }}>{value}</span>
+                )}
               />
               
-              {/* Client areas */}
-              {clients.map((client, index) => (
-                <Area
-                  key={client.id}
-                  type="monotone"
-                  dataKey={client.name}
-                  stroke={clientColors[client.id]}
-                  strokeWidth={2}
-                  fill={`url(#gradient-${client.id})`}
-                  fillOpacity={1}
-                  animationDuration={1500}
-                  animationBegin={index * 200}
-                  dot={{
-                    fill: clientColors[client.id],
-                    r: 4,
-                    strokeWidth: 2,
-                    stroke: 'rgba(15, 23, 42, 0.8)'
-                  }}
-                  activeDot={{
-                    r: 6,
-                    strokeWidth: 3,
-                    stroke: '#fff',
-                    fill: clientColors[client.id]
-                  }}
-                />
-              ))}
-              
-              {/* Total Income Line - rendered on top */}
+              {/* Total Income Line - rendered first for tooltip/legend order */}
               <Area
                 type="monotone"
                 dataKey="Total"
@@ -1726,7 +1717,7 @@ const Analytics = ({ userId }: { userId: string }) => {
                 fill={`url(#gradient-total)`}
                 fillOpacity={1}
                 animationDuration={2000}
-                animationBegin={clients.length * 200}
+                animationBegin={0}
                 dot={{
                   fill: '#f59e0b',
                   r: 5,
@@ -1740,6 +1731,65 @@ const Analytics = ({ userId }: { userId: string }) => {
                   fill: '#f59e0b'
                 }}
               />
+              
+              {/* Client areas - sorted by total revenue descending */}
+              {clients
+                .map(client => ({
+                  client,
+                  totalRevenue: invoices
+                    .filter(inv => inv.clientId === client.id)
+                    .reduce((sum, inv) => {
+                      // Use stored totalAmount if available
+                      if (inv.totalAmount !== undefined && inv.totalAmount !== null) {
+                        return sum + inv.totalAmount;
+                      }
+                      // Fallback for older invoices
+                      const days = (() => {
+                        const date = parseISO(`${inv.month}-01`);
+                        const daysInMonth = eachDayOfInterval({ start: startOfMonth(date), end: endOfMonth(date) });
+                        let count = 0;
+                        daysInMonth.forEach(day => {
+                          const isWknd = isWeekend(day);
+                          const holidayName = inv.useGreekHolidays ? getHolidayName(day) : undefined;
+                          const isHol = !!holidayName;
+                          const isDefaultNonWorking = isWknd || isHol;
+                          const isExcluded = inv.excludedDates.some(d => isSameDay(parseISO(d), day));
+                          const isIncluded = inv.includedDates?.some(d => isSameDay(parseISO(d), day));
+                          if ((!isDefaultNonWorking && !isExcluded) || isIncluded) {
+                            count++;
+                          }
+                        });
+                        return count;
+                      })();
+                      return sum + (days * client.dailyRate + inv.manualAdjustment);
+                    }, 0)
+                }))
+                .sort((a, b) => b.totalRevenue - a.totalRevenue)
+                .map(({ client }, index) => (
+                  <Area
+                    key={client.id}
+                    type="monotone"
+                    dataKey={client.name}
+                    stroke={clientColors[client.id]}
+                    strokeWidth={2}
+                    fill={`url(#gradient-${client.id})`}
+                    fillOpacity={1}
+                    animationDuration={1500}
+                    animationBegin={(index + 1) * 200}
+                    dot={{
+                      fill: clientColors[client.id],
+                      r: 4,
+                      strokeWidth: 2,
+                      stroke: 'rgba(15, 23, 42, 0.8)'
+                    }}
+                    activeDot={{
+                      r: 6,
+                      strokeWidth: 3,
+                      stroke: '#fff',
+                      fill: clientColors[client.id]
+                    }}
+                  />
+                ))}
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -1768,6 +1818,11 @@ const Analytics = ({ userId }: { userId: string }) => {
           <h4 className="text-sm font-medium text-slate-400 mb-1">Total Revenue</h4>
           <p className="text-3xl font-bold text-white tracking-tight">
             €{invoices.reduce((sum, inv) => {
+              // Use stored totalAmount if available, otherwise calculate dynamically
+              if (inv.totalAmount !== undefined && inv.totalAmount !== null) {
+                return sum + inv.totalAmount;
+              }
+              // Fallback for older invoices without stored amount
               const client = clients.find(c => c.id === inv.clientId);
               if (!client) return sum;
               const date = parseISO(`${inv.month}-01`);
