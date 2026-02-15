@@ -1,17 +1,17 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { 
-  Building2, 
-  Calendar as CalendarIcon, 
-  FileSpreadsheet, 
-  Settings, 
-  LogOut, 
-  Plus, 
-  Save, 
-  Download, 
-  Check, 
-  X, 
+import {
+  Building2,
+  Calendar as CalendarIcon,
+  FileSpreadsheet,
+  Settings,
+  LogOut,
+  Plus,
+  Save,
+  Download,
+  Check,
+  X,
   Bot,
   Loader2,
   ChevronLeft,
@@ -26,12 +26,13 @@ import {
   Landmark,
   UserSquare,
   Info,
-  Briefcase
+  Briefcase,
+  Eye
 } from 'lucide-react';
 import { GoogleGenAI, Type } from "@google/genai";
 import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
-import { format, getDaysInMonth, startOfMonth, endOfMonth, eachDayOfInterval, isWeekend, isSameDay, parseISO, addMonths, subMonths } from 'date-fns';
+import { format, getDaysInMonth, startOfMonth, endOfMonth, eachDayOfInterval, isWeekend, isSameDay, parseISO, addMonths, subMonths, addDays } from 'date-fns';
 import { Auth } from './Auth';
 
 // --- Types ---
@@ -632,6 +633,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
   // Invoice State
   const [invoice, setInvoice] = useState<InvoiceRecord | null>(null);
   const [invoiceNumberInput, setInvoiceNumberInput] = useState('');
+  const [previewInvoice, setPreviewInvoice] = useState<InvoiceRecord | null>(null);
   
   // Holidays State
   const [holidaysMap, setHolidaysMap] = useState<Record<string, Record<string, string>>>({});
@@ -1216,8 +1218,14 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
               ) : (
                  historyInvoices.map(rec => (
                     <div key={rec.id} className="bg-white dark:bg-slate-800 p-3 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
-                      <div className="flex justify-between items-start mb-2">
+                      <div className="flex justify-between items-center mb-2">
                         <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-indigo-600 dark:text-indigo-400">{selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</span>
+                        </div>
+                      </div>
+                      <div className="flex justify-between items-center mb-3">
+                        <span className="text-xs text-slate-500 dark:text-slate-400">Inv #{rec.invoiceNumber}</span>
                         <div className="flex items-center gap-2">
                           <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">Generated</span>
                           <button
@@ -1235,19 +1243,29 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                           </button>
                         </div>
                       </div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3">
-                       <p>Inv #: {rec.invoiceNumber}</p>
-                       <p>Amount: {selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</p>
-                       {rec.generatedDate && typeof rec.generatedDate === 'string' && rec.generatedDate.includes('T') && (
-                         <p>Generated: {format(parseISO(rec.generatedDate), 'dd/MM/yyyy HH:mm:ss')}</p>
-                       )}
-                     </div>
+                      {rec.generatedDate && typeof rec.generatedDate === 'string' && rec.generatedDate.includes('T') && (
+                        <div className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                          Generated: {format(parseISO(rec.generatedDate), 'dd/MM/yyyy HH:mm:ss')}
+                        </div>
+                      )}
                       <div className="flex gap-2">
+                        <button
+                          onClick={() => {
+                            // Set this invoice for preview in the right panel
+                            setPreviewInvoice({
+                              ...rec,
+                              includedDates: rec.includedDates || []
+                            });
+                          }}
+                          className="flex-1 flex items-center justify-center gap-1 bg-indigo-100 dark:bg-indigo-900 hover:bg-indigo-200 dark:hover:bg-indigo-800 py-1.5 rounded text-xs font-medium text-indigo-700 dark:text-indigo-300"
+                        >
+                          <Eye size={14} /> Preview
+                        </button>
                         <button
                           onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient, true))}
                           className="flex-1 flex items-center justify-center gap-1 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 py-1.5 rounded text-xs font-medium text-slate-700 dark:text-slate-300"
                         >
-                          <FileSpreadsheet size={14} /> Download Again
+                          <FileSpreadsheet size={14} /> Download
                         </button>
                       </div>
                     </div>
@@ -1322,11 +1340,103 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
             })}
             </div>
         </>
+        ) : previewInvoice ? (
+          // Preview mode - show the selected invoice's calendar
+          <>
+            <div className="mb-6">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-lg text-slate-800 dark:text-white">
+                  {format(parseISO(`${previewInvoice.month}-01`), 'MMMM yyyy')}
+                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-1 rounded-full font-medium">
+                    Invoice #{previewInvoice.invoiceNumber}
+                  </span>
+                  <button
+                    onClick={() => setPreviewInvoice(null)}
+                    className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 underline"
+                  >
+                    Close Preview
+                  </button>
+                </div>
+              </div>
+            </div>
+            
+            <div className="grid grid-cols-7 gap-4">
+              {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => (
+                <div key={d} className="text-center text-sm font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2">{d}</div>
+              ))}
+              
+              {/* Pad start of month */}
+              {Array.from({ length: (startOfMonth(parseISO(`${previewInvoice.month}-01`)).getDay() + 6) % 7 }).map((_, i) => (
+                <div key={`pad-${i}`} />
+              ))}
+
+              {(() => {
+                const previewDate = parseISO(`${previewInvoice.month}-01`);
+                const previewDays = Array.from({ length: getDaysInMonth(previewDate) }, (_, i) => addDays(startOfMonth(previewDate), i));
+                return previewDays.map(day => {
+                  const isWknd = isWeekend(day);
+                  const holidayName = previewInvoice?.useGreekHolidays ? getHolidayName(day) : undefined;
+                  const isHol = !!holidayName;
+                  const isDefaultNonWorking = isWknd || isHol;
+                  
+                  const isExcluded = previewInvoice?.excludedDates.some(d => isSameDay(parseISO(d), day));
+                  const isIncluded = previewInvoice?.includedDates?.some(d => isSameDay(parseISO(d), day));
+                  
+                  const isOff = (isDefaultNonWorking && !isIncluded) || isExcluded;
+                  
+                  return (
+                    <div
+                      key={day.toISOString()}
+                      className={`
+                        h-24 rounded-xl border flex flex-col items-start p-3
+                        ${isOff
+                          ? 'bg-slate-100 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-600'
+                          : 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-800 dark:text-white'}
+                        ${isExcluded ? 'ring-2 ring-red-200 dark:ring-red-900/50 bg-red-50 dark:bg-red-900/10' : ''}
+                        ${isIncluded ? 'ring-2 ring-green-200 dark:ring-green-900/50 bg-green-50 dark:bg-green-900/10' : ''}
+                      `}
+                    >
+                      <span className={`font-medium text-lg ${isOff ? 'text-slate-400 dark:text-slate-600' : 'text-slate-700 dark:text-slate-200'}`}>{format(day, 'd')}</span>
+                      
+                      <div className="mt-auto flex flex-col items-start gap-1 w-full">
+                        {isWknd && <span className="text-xs px-2 py-0.5 bg-slate-200 dark:bg-slate-700 rounded text-slate-500 dark:text-slate-400">Weekend</span>}
+                        {isHol && <span className="text-xs px-2 py-0.5 bg-red-100 dark:bg-red-900/30 rounded text-red-600 dark:text-red-400 truncate w-full">{holidayName}</span>}
+                        {!isOff && <span className="text-xs px-2 py-0.5 bg-green-100 dark:bg-green-900/30 rounded text-green-600 dark:text-green-400">Working</span>}
+                        {isExcluded && <span className="text-xs px-2 py-0.5 bg-red-100 dark:bg-red-900/30 rounded text-red-600 dark:text-red-400">Excluded</span>}
+                        {isIncluded && <span className="text-xs px-2 py-0.5 bg-green-100 dark:bg-green-900/30 rounded text-green-600 dark:text-green-400">Working</span>}
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+            
+            {/* Summary for preview */}
+            <div className="mt-8 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700">
+              <h3 className="font-semibold text-slate-800 dark:text-slate-200 mb-3">Invoice Summary</h3>
+              <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
+                <div className="flex justify-between">
+                  <span>Working Days</span>
+                  <span className="font-medium text-slate-900 dark:text-white">{previewInvoice.savedDays}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Rate</span>
+                  <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.currency} {selectedClient?.dailyRate}</span>
+                </div>
+                <div className="pt-2 border-t border-slate-200 dark:border-slate-700 flex justify-between text-lg font-bold text-indigo-600 dark:text-indigo-400">
+                  <span>Total</span>
+                  <span>{selectedClient?.currency} {previewInvoice.savedAmount?.toLocaleString()}</span>
+                </div>
+              </div>
+            </div>
+          </>
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-slate-500">
             <History size={48} className="mb-4 text-slate-300 dark:text-slate-700" />
-            <p className="text-lg">Select an invoice from the history list on the left to re-download.</p>
-            <p className="text-sm mt-2">Historical data is preserved.</p>
+            <p className="text-lg">Click "Preview" on a history invoice to view its details.</p>
+            <p className="text-sm mt-2">Or click "Download" to get the Excel file.</p>
           </div>
         )}
       </div>
