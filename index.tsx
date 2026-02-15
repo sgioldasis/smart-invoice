@@ -363,7 +363,7 @@ const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
             <h3 className="text-lg font-bold text-slate-800 dark:text-white mb-1">{client.name}</h3>
             <p className="text-xs text-slate-500 mb-3">Issued by: {client.issuerName || 'Me'}</p>
             <div className="flex justify-between text-sm text-slate-500 dark:text-slate-400 mt-4 pt-4 border-t border-slate-100 dark:border-slate-700">
-              <span>Rate: {client.currency}{client.dailyRate}/day</span>
+              <span>Rate: {client.currency} {client.dailyRate}/day</span>
               <span className={client.templateBase64 ? "text-green-600 dark:text-green-400 flex items-center gap-1" : "text-amber-500 dark:text-amber-400 flex items-center gap-1"}>
                 {client.templateBase64 ? <><Check size={14} /> Template</> : "No Template"}
               </span>
@@ -725,7 +725,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
       // Save new invoice to Firebase
       DB.saveInvoice(newInvoice);
     }
-  }, [selectedClientId, currentDate]);
+  }, [selectedClientId, currentDate, invoices]);
 
   const toggleDayStatus = async (date: Date) => {
     if (!invoice) return;
@@ -1070,11 +1070,11 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                  </div>
                  <div className="flex justify-between">
                    <span className="">Rate</span>
-                   <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.currency}{selectedClient?.dailyRate}</span>
+                   <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.currency} {selectedClient?.dailyRate}</span>
                  </div>
                  <div className="pt-2 border-t border-slate-200 dark:border-slate-700 flex justify-between text-lg font-bold text-indigo-600 dark:text-indigo-400">
                    <span>Total</span>
-                   <span>{selectedClient?.currency}{stats.amount.toLocaleString()}</span>
+                   <span>{selectedClient?.currency} {stats.amount.toLocaleString()}</span>
                  </div>
                </div>
 
@@ -1135,7 +1135,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                    </div>
                    <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3">
                      <p>Inv #: {rec.invoiceNumber}</p>
-                     <p>Amount: {selectedClient?.currency}{rec.savedAmount?.toLocaleString()}</p>
+                     <p>Amount: {selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</p>
                    </div>
                    <div className="flex gap-2">
                      <button
