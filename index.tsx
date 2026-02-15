@@ -27,8 +27,13 @@ import {
   UserSquare,
   Info,
   Briefcase,
-  Eye
+  Eye,
+  BarChart3,
+  TrendingUp,
+  Users
 } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
+import { motion } from 'framer-motion';
 import { GoogleGenAI, Type } from "@google/genai";
 import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
@@ -84,6 +89,37 @@ interface AnalysisResult {
     dailyRate?: number;
   };
 }
+
+// --- Shared Holiday Utilities ---
+
+// Store holidays in a module-level cache that can be accessed by any component
+const holidaysCache: Record<number, Record<string, string>> = {};
+
+const fetchGreekHolidays = async (year: number): Promise<Record<string, string>> => {
+  if (holidaysCache[year]) return holidaysCache[year];
+  
+  try {
+    const res = await fetch(`https://date.nager.at/api/v3/PublicHolidays/${year}/GR`);
+    if (!res.ok) throw new Error('Failed to fetch');
+    const data = await res.json();
+    const map: Record<string, string> = {};
+    if (Array.isArray(data)) {
+      data.forEach((h: any) => { map[h.date] = h.localName || h.name; });
+    }
+    holidaysCache[year] = map;
+    return map;
+  } catch (err) {
+    console.error("Failed to fetch holidays", err);
+    holidaysCache[year] = {};
+    return {};
+  }
+};
+
+const getHolidayName = (date: Date): string | undefined => {
+  const y = date.getFullYear();
+  const d = format(date, 'yyyy-MM-dd');
+  return holidaysCache[y]?.[d];
+};
 
 // --- Services ---
 
@@ -265,12 +301,19 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
             <Briefcase size={20} />
             <span>Clients</span>
           </button>
-          <button 
+          <button
              onClick={() => setActiveTab('generator')}
              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'generator' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
           >
             <CalendarIcon size={20} />
             <span>Invoice Generator</span>
+          </button>
+          <button
+             onClick={() => setActiveTab('analytics')}
+             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'analytics' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+          >
+            <BarChart3 size={20} />
+            <span>Invoice Analytics</span>
           </button>
         </nav>
         <div className="p-4 border-t border-slate-800 space-y-4">
@@ -1416,8 +1459,398 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
 
 // --- Main App ---
 
+// --- Analytics Component ---
+
+const Analytics = ({ userId }: { userId: string }) => {
+  const [clients, setClients] = useState<Client[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const loadData = async () => {
+      setLoading(true);
+      console.log('Analytics: Loading data for user', userId);
+      const clientsData = await DB.getClients(userId);
+      console.log('Analytics: Loaded clients', clientsData.length);
+      setClients(clientsData);
+      
+      // Load all invoices for all clients
+      const allInvoices: InvoiceRecord[] = [];
+      for (const client of clientsData) {
+        const clientInvoices = await DB.getInvoices(userId, client.id);
+        console.log(`Analytics: Loaded ${clientInvoices.length} invoices for client ${client.name}`);
+        allInvoices.push(...clientInvoices.filter(i => i.status === 'generated'));
+      }
+      console.log('Analytics: Total generated invoices', allInvoices.length);
+      setInvoices(allInvoices);
+      setLoading(false);
+    };
+    loadData();
+  }, [userId]);
+
+  // Prepare chart data
+  const chartData = useMemo(() => {
+    // Get all unique months sorted
+    const months = Array.from(new Set(invoices.map(i => i.month))).sort() as string[];
+    
+    // Create a map of month -> clientId -> amount
+    const dataMap = new Map<string, Map<string, number>>();
+    
+    months.forEach((month: string) => {
+      dataMap.set(month, new Map());
+    });
+    
+    invoices.forEach(inv => {
+      const client = clients.find(c => c.id === inv.clientId);
+      if (client) {
+        const monthMap = dataMap.get(inv.month);
+        if (monthMap) {
+          // Calculate amount dynamically
+          const days = (() => {
+            const date = parseISO(`${inv.month}-01`);
+            const daysInMonth = eachDayOfInterval({ start: startOfMonth(date), end: endOfMonth(date) });
+            let count = 0;
+            daysInMonth.forEach(day => {
+              const isWknd = isWeekend(day);
+              const holidayName = inv.useGreekHolidays ? getHolidayName(day) : undefined;
+              const isHol = !!holidayName;
+              const isDefaultNonWorking = isWknd || isHol;
+              const isExcluded = inv.excludedDates.some(d => isSameDay(parseISO(d), day));
+              const isIncluded = inv.includedDates?.some(d => isSameDay(parseISO(d), day));
+              if ((!isDefaultNonWorking && !isExcluded) || isIncluded) {
+                count++;
+              }
+            });
+            return count;
+          })();
+          const amount = days * client.dailyRate + inv.manualAdjustment;
+          monthMap.set(client.id, amount);
+        }
+      }
+    });
+    
+    // Convert to array format for recharts
+    return months.map((month: string) => {
+      const entry: any = {
+        month: format(parseISO(`${month}-01`), 'MMM yyyy'),
+        rawMonth: month
+      };
+      let monthTotal = 0;
+      clients.forEach(client => {
+        const amount = dataMap.get(month)?.get(client.id) || 0;
+        entry[client.name] = amount;
+        monthTotal += amount;
+      });
+      entry['Total'] = monthTotal;
+      return entry;
+    });
+  }, [invoices, clients]);
+
+  // Generate colors for each client
+  const clientColors = useMemo(() => {
+    const colors = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+    return clients.reduce((acc, client, index) => {
+      acc[client.id] = colors[index % colors.length];
+      return acc;
+    }, {} as Record<string, string>);
+  }, [clients]);
+
+  // Custom tooltip with glassmorphic design
+  const CustomTooltip = ({ active, payload, label }: any) => {
+    if (active && payload && payload.length) {
+      return (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-slate-900/90 backdrop-blur-xl border border-white/10 rounded-xl p-4 shadow-2xl"
+          style={{
+            background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.9))',
+            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.1)'
+          }}
+        >
+          <p className="text-white font-semibold mb-2">{label}</p>
+          {payload.map((entry: any, index: number) => (
+            <motion.div
+              key={index}
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: index * 0.05 }}
+              className="flex items-center gap-2 mb-1"
+            >
+              <div
+                className="w-3 h-3 rounded-full"
+                style={{ backgroundColor: entry.color, boxShadow: `0 0 10px ${entry.color}` }}
+              />
+              <span className="text-slate-300 text-sm">{entry.name}:</span>
+              <span className="text-white font-mono font-semibold">
+                {entry.value.toLocaleString()}
+              </span>
+            </motion.div>
+          ))}
+        </motion.div>
+      );
+    }
+    return null;
+  };
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Loader2 className="animate-spin text-indigo-600" size={48} />
+      </div>
+    );
+  }
+
+  if (clients.length === 0) {
+    return (
+      <div className="p-8">
+        <h2 className="text-2xl font-bold text-slate-800 dark:text-white mb-4">Invoice Analytics</h2>
+        <p className="text-slate-500 dark:text-slate-400">Please create a client first to see analytics.</p>
+      </div>
+    );
+  }
+
+  if (invoices.length === 0) {
+    return (
+      <div className="p-8">
+        <h2 className="text-2xl font-bold text-slate-800 dark:text-white mb-4">Invoice Analytics</h2>
+        <p className="text-slate-500 dark:text-slate-400">No generated invoices yet. Generate some invoices to see analytics.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-8">
+      <h2 className="text-2xl font-bold text-slate-800 dark:text-white mb-6">Invoice Analytics</h2>
+      
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+        className="relative p-6 rounded-2xl overflow-hidden"
+        style={{
+          background: 'linear-gradient(135deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.9))',
+          backdropFilter: 'blur(20px)',
+          border: '1px solid rgba(255, 255, 255, 0.1)',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5), inset 0 1px 0 0 rgba(255, 255, 255, 0.05)'
+        }}
+      >
+        {/* Glossy top highlight */}
+        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent pointer-events-none" />
+        
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-lg font-semibold text-white">Revenue by Client</h3>
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span className="text-xs text-slate-400">Live Data</span>
+          </div>
+        </div>
+        
+        <div className="h-96">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={chartData} margin={{ top: 10, right: 30, left: 20, bottom: 5 }}>
+              <defs>
+                {/* Gradient definitions for each client */}
+                {clients.map(client => (
+                  <linearGradient key={client.id} id={`gradient-${client.id}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor={clientColors[client.id]} stopOpacity={0.3} />
+                    <stop offset="95%" stopColor={clientColors[client.id]} stopOpacity={0.05} />
+                  </linearGradient>
+                ))}
+                {/* Total gradient */}
+                <linearGradient id="gradient-total" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.4} />
+                  <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.05} />
+                </linearGradient>
+              </defs>
+              
+              <CartesianGrid
+                strokeDasharray="3 3"
+                stroke="rgba(255, 255, 255, 0.05)"
+                vertical={false}
+              />
+              <XAxis
+                dataKey="month"
+                stroke="rgba(255, 255, 255, 0.3)"
+                style={{ fontSize: '12px' }}
+                tick={{ fill: 'rgba(255, 255, 255, 0.6)' }}
+                axisLine={{ stroke: 'rgba(255, 255, 255, 0.1)' }}
+              />
+              <YAxis
+                stroke="rgba(255, 255, 255, 0.3)"
+                style={{ fontSize: '12px' }}
+                tick={{ fill: 'rgba(255, 255, 255, 0.6)' }}
+                tickFormatter={(value) => `${value.toLocaleString()}`}
+                axisLine={{ stroke: 'rgba(255, 255, 255, 0.1)' }}
+              />
+              <Tooltip content={<CustomTooltip />} />
+              <Legend
+                wrapperStyle={{ paddingTop: '20px' }}
+                iconType="circle"
+              />
+              
+              {/* Client areas */}
+              {clients.map((client, index) => (
+                <Area
+                  key={client.id}
+                  type="monotone"
+                  dataKey={client.name}
+                  stroke={clientColors[client.id]}
+                  strokeWidth={2}
+                  fill={`url(#gradient-${client.id})`}
+                  fillOpacity={1}
+                  animationDuration={1500}
+                  animationBegin={index * 200}
+                  dot={{
+                    fill: clientColors[client.id],
+                    r: 4,
+                    strokeWidth: 2,
+                    stroke: 'rgba(15, 23, 42, 0.8)'
+                  }}
+                  activeDot={{
+                    r: 6,
+                    strokeWidth: 3,
+                    stroke: '#fff',
+                    fill: clientColors[client.id]
+                  }}
+                />
+              ))}
+              
+              {/* Total Income Line - rendered on top */}
+              <Area
+                type="monotone"
+                dataKey="Total"
+                stroke="#f59e0b"
+                strokeWidth={3}
+                strokeDasharray="5 5"
+                fill={`url(#gradient-total)`}
+                fillOpacity={1}
+                animationDuration={2000}
+                animationBegin={clients.length * 200}
+                dot={{
+                  fill: '#f59e0b',
+                  r: 5,
+                  strokeWidth: 2,
+                  stroke: 'rgba(15, 23, 42, 0.8)'
+                }}
+                activeDot={{
+                  r: 7,
+                  strokeWidth: 3,
+                  stroke: '#fff',
+                  fill: '#f59e0b'
+                }}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </motion.div>
+      
+      {/* Summary Stats */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, delay: 0.1 }}
+          className="relative p-6 rounded-2xl overflow-hidden group cursor-pointer"
+          style={{
+            background: 'linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.05))',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(99, 102, 241, 0.2)',
+            boxShadow: '0 25px 50px -12px rgba(99, 102, 241, 0.25), inset 0 1px 0 0 rgba(255, 255, 255, 0.1)'
+          }}
+          whileHover={{ scale: 1.02, transition: { duration: 0.2 } }}
+        >
+          {/* Glossy top highlight */}
+          <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-indigo-400/30 to-transparent pointer-events-none" />
+          {/* Soft glow on hover */}
+          <div className="absolute inset-0 bg-gradient-to-tr from-indigo-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
+          
+          <h4 className="text-sm font-medium text-slate-400 mb-1">Total Revenue</h4>
+          <p className="text-3xl font-bold text-white tracking-tight">
+            €{invoices.reduce((sum, inv) => {
+              const client = clients.find(c => c.id === inv.clientId);
+              if (!client) return sum;
+              const date = parseISO(`${inv.month}-01`);
+              const daysInMonth = eachDayOfInterval({ start: startOfMonth(date), end: endOfMonth(date) });
+              let days = 0;
+              daysInMonth.forEach(day => {
+                const isWknd = isWeekend(day);
+                const holidayName = inv.useGreekHolidays ? getHolidayName(day) : undefined;
+                const isHol = !!holidayName;
+                const isDefaultNonWorking = isWknd || isHol;
+                const isExcluded = inv.excludedDates.some(d => isSameDay(parseISO(d), day));
+                const isIncluded = inv.includedDates?.some(d => isSameDay(parseISO(d), day));
+                if ((!isDefaultNonWorking && !isExcluded) || isIncluded) {
+                  days++;
+                }
+              });
+              return sum + (days * client.dailyRate + inv.manualAdjustment);
+            }, 0).toLocaleString()}
+          </p>
+          <div className="mt-2 flex items-center gap-1 text-xs text-emerald-400">
+            <TrendingUp size={14} />
+            <span>Lifetime earnings</span>
+          </div>
+        </motion.div>
+        
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, delay: 0.2 }}
+          className="relative p-6 rounded-2xl overflow-hidden group cursor-pointer"
+          style={{
+            background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(16, 185, 129, 0.05))',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(16, 185, 129, 0.2)',
+            boxShadow: '0 25px 50px -12px rgba(16, 185, 129, 0.25), inset 0 1px 0 0 rgba(255, 255, 255, 0.1)'
+          }}
+          whileHover={{ scale: 1.02, transition: { duration: 0.2 } }}
+        >
+          <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-emerald-400/30 to-transparent pointer-events-none" />
+          <div className="absolute inset-0 bg-gradient-to-tr from-emerald-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
+          
+          <h4 className="text-sm font-medium text-slate-400 mb-1">Total Invoices</h4>
+          <p className="text-3xl font-bold text-white tracking-tight">{invoices.length}</p>
+          <div className="mt-2 flex items-center gap-1 text-xs text-emerald-400">
+            <FileText size={14} />
+            <span>Generated invoices</span>
+          </div>
+        </motion.div>
+        
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, delay: 0.3 }}
+          className="relative p-6 rounded-2xl overflow-hidden group cursor-pointer"
+          style={{
+            background: 'linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(245, 158, 11, 0.05))',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(245, 158, 11, 0.2)',
+            boxShadow: '0 25px 50px -12px rgba(245, 158, 11, 0.25), inset 0 1px 0 0 rgba(255, 255, 255, 0.1)'
+          }}
+          whileHover={{ scale: 1.02, transition: { duration: 0.2 } }}
+        >
+          <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-amber-400/30 to-transparent pointer-events-none" />
+          <div className="absolute inset-0 bg-gradient-to-tr from-amber-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
+          
+          <h4 className="text-sm font-medium text-slate-400 mb-1">Active Clients</h4>
+          <p className="text-3xl font-bold text-white tracking-tight">
+            {new Set(invoices.map(i => i.clientId)).size}
+          </p>
+          <div className="mt-2 flex items-center gap-1 text-xs text-emerald-400">
+            <Users size={14} />
+            <span>With invoices</span>
+          </div>
+        </motion.div>
+      </div>
+    </div>
+  );
+};
+
+// --- Main App ---
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard | generator
+  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard | generator | analytics
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [viewState, setViewState] = useState<'list' | 'edit'>('list');
   const [targetClientId, setTargetClientId] = useState<string | undefined>();
@@ -1531,6 +1964,10 @@ export default function App() {
 
           {activeTab === 'generator' && (
             <InvoiceGenerator userId={user.uid} clientId={targetClientId} />
+          )}
+
+          {activeTab === 'analytics' && (
+            <Analytics userId={user.uid} />
           )}
         </>
       )}
