@@ -159,6 +159,14 @@ const DB = {
       console.error('Error saving invoice:', e);
       throw e;
     }
+  },
+  deleteInvoice: async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'invoices', id));
+    } catch (e) {
+      console.error('Error deleting invoice:', e);
+      throw e;
+    }
   }
 };
 
@@ -639,6 +647,8 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         setInvoices(data);
       };
       loadInvoices();
+    } else {
+      setInvoices([]);
     }
   }, [selectedClient, userId]);
 
@@ -690,7 +700,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
     if (!selectedClient) return;
     
     const monthStr = format(currentDate, 'yyyy-MM');
-    const existing = invoices.find(i => i.month === monthStr);
+    const existing = invoices.find(i => i.month === monthStr && i.clientId === selectedClient.id);
     
     if (existing) {
       setInvoice({
@@ -699,7 +709,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
       });
       setInvoiceNumberInput(existing.invoiceNumber || `INV-${format(currentDate, 'yyyyMM')}-${Math.floor(Math.random()*100)}`);
     } else {
-      setInvoice({
+      const newInvoice: InvoiceRecord = {
         id: crypto.randomUUID(),
         userId: userId,
         clientId: selectedClient.id,
@@ -709,8 +719,11 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         useGreekHolidays: selectedClient.defaultUseGreekHolidays || false,
         manualAdjustment: 0,
         status: 'draft'
-      });
+      };
+      setInvoice(newInvoice);
       setInvoiceNumberInput(`INV-${format(currentDate, 'yyyyMM')}-${Math.floor(Math.random()*100)}`);
+      // Save new invoice to Firebase
+      DB.saveInvoice(newInvoice);
     }
   }, [selectedClientId, currentDate]);
 
@@ -1103,14 +1116,29 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                  <div key={rec.id} className="bg-white dark:bg-slate-800 p-3 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
                    <div className="flex justify-between items-start mb-2">
                      <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
-                     <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">Generated</span>
+                     <div className="flex items-center gap-2">
+                       <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">Generated</span>
+                       <button
+                         onClick={async () => {
+                           if (confirm('Are you sure you want to delete this invoice?')) {
+                             await DB.deleteInvoice(rec.id);
+                             const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+                             setInvoices(refreshedInvoices);
+                           }
+                         }}
+                         className="text-slate-400 hover:text-red-500 transition-colors"
+                         title="Delete invoice"
+                       >
+                         <Trash2 size={14} />
+                       </button>
+                     </div>
                    </div>
                    <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3">
                      <p>Inv #: {rec.invoiceNumber}</p>
                      <p>Amount: {selectedClient?.currency}{rec.savedAmount?.toLocaleString()}</p>
                    </div>
                    <div className="flex gap-2">
-                     <button 
+                     <button
                        onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient, true))}
                        className="flex-1 flex items-center justify-center gap-1 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 py-1.5 rounded text-xs font-medium text-slate-700 dark:text-slate-300"
                      >
