@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { 
   Building2, 
@@ -137,13 +137,13 @@ const DB = {
       throw e;
     }
   },
-  getInvoices: async (userId: string, clientId: string): Promise<InvoiceRecord[]> => {
+  getInvoices: async (userId: string, clientId?: string): Promise<InvoiceRecord[]> => {
     try {
-      const q = query(
-        collection(db, 'invoices'),
-        where('userId', '==', userId),
-        where('clientId', '==', clientId)
-      );
+      const constraints: any[] = [where('userId', '==', userId)];
+      if (clientId) {
+        constraints.push(where('clientId', '==', clientId));
+      }
+      const q = query(collection(db, 'invoices'), ...constraints);
       const snapshot = await getDocs(q);
       return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as InvoiceRecord));
     } catch (e) {
@@ -695,37 +695,71 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
 
   const checkIsHoliday = (date: Date) => !!getHolidayName(date);
 
+  // Function to calculate next invoice number (max + 1) across all invoices
+  const getNextInvoiceNumber = (invoices: InvoiceRecord[]): string => {
+    let maxNum = 0;
+    invoices.forEach(inv => {
+      if (inv.invoiceNumber) {
+        const match = inv.invoiceNumber.match(/(\d+)$/);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (!isNaN(num) && num > maxNum) {
+            maxNum = num;
+          }
+        }
+      }
+    });
+    return String(maxNum + 1).padStart(2, '0');
+  };
+
   // Load or Create Invoice Record for this month
   useEffect(() => {
-    if (!selectedClient) return;
+    if (!selectedClient || loading) return;
     
     const monthStr = format(currentDate, 'yyyy-MM');
-    const existing = invoices.find(i => i.month === monthStr && i.clientId === selectedClient.id);
+    const client = selectedClient; // capture client reference
     
-    if (existing) {
-      setInvoice({
-        ...existing,
-        includedDates: existing.includedDates || []
-      });
-      setInvoiceNumberInput(existing.invoiceNumber || `INV-${format(currentDate, 'yyyyMM')}-${Math.floor(Math.random()*100)}`);
-    } else {
-      const newInvoice: InvoiceRecord = {
+    const loadOrCreateInvoice = async () => {
+      // Get all invoices for this user to calculate next number
+      const allInvoices = await DB.getInvoices(userId);
+      
+      // Check if there's an existing invoice for this client/month
+      const existing = allInvoices.find(i => i.month === monthStr && i.clientId === client.id);
+      
+      if (existing) {
+        // Use existing invoice
+        setInvoice({
+          ...existing,
+          includedDates: existing.includedDates || []
+        });
+        setInvoiceNumberInput(existing.invoiceNumber || '');
+        setInvoices(allInvoices.filter(i => i.clientId === client.id));
+        return;
+      }
+      
+      // No existing invoice - just calculate suggested number, don't save yet
+      const nextInvoiceNum = getNextInvoiceNumber(allInvoices);
+      
+      // Create temporary invoice object (not saved to DB yet)
+      const tempInvoice: InvoiceRecord = {
         id: crypto.randomUUID(),
         userId: userId,
-        clientId: selectedClient.id,
+        clientId: client.id,
         month: monthStr,
         excludedDates: [],
         includedDates: [],
-        useGreekHolidays: selectedClient.defaultUseGreekHolidays || false,
+        useGreekHolidays: client.defaultUseGreekHolidays || false,
         manualAdjustment: 0,
-        status: 'draft'
+        status: 'draft',
+        invoiceNumber: nextInvoiceNum
       };
-      setInvoice(newInvoice);
-      setInvoiceNumberInput(`INV-${format(currentDate, 'yyyyMM')}-${Math.floor(Math.random()*100)}`);
-      // Save new invoice to Firebase
-      DB.saveInvoice(newInvoice);
-    }
-  }, [selectedClientId, currentDate, invoices]);
+      setInvoice(tempInvoice);
+      setInvoiceNumberInput(nextInvoiceNum);
+      setInvoices(allInvoices.filter(i => i.clientId === client.id));
+    };
+    
+    loadOrCreateInvoice();
+  }, [selectedClient, currentDate, userId, loading]);
 
   const toggleDayStatus = async (date: Date) => {
     if (!invoice) return;
@@ -771,13 +805,10 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
     };
     
     setInvoice(updated);
-    await DB.saveInvoice({ ...updated, userId });
-    // Refresh invoices list
-    const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
-    setInvoices(refreshedInvoices);
+    // Note: Invoice is NOT saved to DB here - only when Generate is clicked
   };
 
-  const toggleGreekHolidays = async () => {
+  const toggleGreekHolidays = () => {
     if (!invoice) return;
     
     // Maintain existing status to keep history visible until explicit re-generation
@@ -788,10 +819,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
     };
     
     setInvoice(updated);
-    await DB.saveInvoice({ ...updated, userId });
-    // Refresh invoices list
-    const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
-    setInvoices(refreshedInvoices);
+    // Note: Invoice is NOT saved to DB here - only when Generate is clicked
   };
 
   const calculateStats = (inv = invoice, client = selectedClient, useSaved = false) => {
@@ -970,21 +998,33 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
       anchor.click();
       window.URL.revokeObjectURL(url);
       
-      // Update status if it's the current one (effectively "deletes" the old history record by overwriting it with new generation data)
+      // Save to DB - check for existing invoice with same number to overwrite
+      // Get all invoices for this client to check for existing one with same number
+      const allClientInvoices = await DB.getInvoices(userId, selectedClient.id);
+      const existingWithSameNumber = allClientInvoices.find(
+        i => i.invoiceNumber === invNum && i.id !== targetInvoice.id
+      );
+      
+      // If there's an existing invoice with the same number, use its ID to overwrite
+      const invoiceToSave = {
+        ...targetInvoice,
+        id: existingWithSameNumber?.id || targetInvoice.id, // Use existing ID if found, otherwise keep current
+        status: 'generated' as const,
+        invoiceNumber: invNum,
+        savedAmount: finalStats.amount,
+        savedDays: finalStats.days,
+        generatedDate: new Date().toISOString()
+      };
+      
+      await DB.saveInvoice({ ...invoiceToSave, userId });
+      
+      // Refresh invoices list
+      const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+      setInvoices(refreshedInvoices);
+      
+      // Update editor state if this is the current invoice being edited
       if (isCurrentEditorInvoice) {
-        const updated = {
-          ...targetInvoice,
-          status: 'generated' as const,
-          invoiceNumber: invNum,
-          savedAmount: finalStats.amount,
-          savedDays: finalStats.days,
-          generatedDate: invDate
-        };
-        setInvoice(updated);
-        await DB.saveInvoice({ ...updated, userId });
-        // Refresh invoices list
-        const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
-        setInvoices(refreshedInvoices);
+        setInvoice(invoiceToSave);
       }
 
     } catch (e: any) {
@@ -1034,7 +1074,8 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
 
         {subTab === 'new' && (
           <>
-            <div className="mb-6 flex items-center justify-between">
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-2">
                 <button onClick={() => setCurrentDate(subMonths(currentDate, 1))} className="p-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded text-slate-600 dark:text-slate-300">
                   <ChevronLeft size={20}/>
                 </button>
@@ -1042,6 +1083,15 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                 <button onClick={() => setCurrentDate(addMonths(currentDate, 1))} className="p-1 hover:bg-slate-100 dark:hover:bg-slate-800 rounded text-slate-600 dark:text-slate-300">
                   <ChevronRight size={20}/>
                 </button>
+              </div>
+              {/* Show Generated tag if invoice already generated */}
+              {invoice?.status === 'generated' && (
+                <div className="text-center">
+                  <span className="inline-flex items-center gap-1 text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-1 rounded-full font-medium">
+                    ✓ Invoice Generated
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="space-y-4 mb-8">
@@ -1080,23 +1130,35 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
 
                {/* Prominent Invoice Number Input */}
                <div className="mb-4">
-                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wide mb-1">Invoice Number <span className="text-red-500">*</span></label>
+                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wide mb-1">Invoice # <span className="text-red-500">*</span></label>
                  <input 
                     type="text" 
                     value={invoiceNumberInput}
-                    placeholder="e.g. INV-2024-001"
+                    placeholder="e.g. 01"
                     onChange={(e) => setInvoiceNumberInput(e.target.value)}
                     className="w-full bg-white dark:bg-slate-900 border-2 border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white font-medium focus:border-indigo-500 outline-none"
                  />
                </div>
 
                <div className="grid grid-cols-1 gap-2 mt-4">
-                 <button 
-                   onClick={() => handleGenerateExcel(invoice, stats)}
+                 <button
+                   onClick={() => {
+                     if (invoice?.status === 'generated') {
+                       if (confirm('This invoice has already been generated. Re-generating will overwrite the existing record. Are you sure?')) {
+                         handleGenerateExcel(invoice, stats);
+                       }
+                     } else {
+                       handleGenerateExcel(invoice, stats);
+                     }
+                   }}
                    disabled={!selectedClient?.templateBase64}
-                   className="flex items-center justify-center gap-2 bg-green-600 text-white py-3 rounded-lg hover:bg-green-700 disabled:opacity-50 text-base font-medium"
+                   className={`flex items-center justify-center gap-2 py-3 rounded-lg disabled:opacity-50 text-base font-medium ${
+                     invoice?.status === 'generated'
+                       ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                       : 'bg-green-600 hover:bg-green-700 text-white'
+                   }`}
                  >
-                   <Download size={18} /> Generate Invoice (Excel)
+                   <Download size={18} /> {invoice?.status === 'generated' ? 'Re-generate Invoice' : 'Generate Invoice'}
                  </button>
                </div>
                {!selectedClient?.templateBase64 && (
@@ -1107,49 +1169,93 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
         )}
         
         {subTab === 'history' && (
-          <div className="space-y-3 h-full overflow-y-auto">
-            <h3 className="font-bold text-slate-800 dark:text-white mb-2">Generated Invoices</h3>
-            {historyInvoices.length === 0 ? (
-               <p className="text-sm text-slate-500 italic">No invoices generated yet.</p>
-            ) : (
-               historyInvoices.map(rec => (
-                 <div key={rec.id} className="bg-white dark:bg-slate-800 p-3 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
-                   <div className="flex justify-between items-start mb-2">
-                     <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
-                     <div className="flex items-center gap-2">
-                       <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">Generated</span>
-                       <button
-                         onClick={async () => {
-                           if (confirm('Are you sure you want to delete this invoice?')) {
-                             await DB.deleteInvoice(rec.id);
-                             const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
-                             setInvoices(refreshedInvoices);
-                           }
-                         }}
-                         className="text-slate-400 hover:text-red-500 transition-colors"
-                         title="Delete invoice"
-                       >
-                         <Trash2 size={14} />
-                       </button>
+          <div className="space-y-4 h-full overflow-y-auto">
+            {/* Draft Invoices Section */}
+            <div>
+              <h3 className="font-bold text-slate-800 dark:text-white mb-2 flex items-center gap-2">
+                Draft Invoices
+                <span className="text-xs font-normal text-slate-500">(not yet generated)</span>
+              </h3>
+              {invoices.filter(i => i.status === 'draft').length === 0 ? (
+                 <p className="text-sm text-slate-500 italic">No draft invoices.</p>
+              ) : (
+                 invoices.filter(i => i.status === 'draft').map(rec => (
+                  <div key={rec.id} className="bg-amber-50 dark:bg-amber-900/20 p-3 rounded-lg border border-amber-200 dark:border-amber-800 shadow-sm">
+                    <div className="flex justify-between items-start mb-2">
+                      <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300 px-2 py-0.5 rounded-full">Draft</span>
+                        <button
+                          onClick={async () => {
+                            if (confirm('Are you sure you want to delete this draft invoice?')) {
+                              await DB.deleteInvoice(rec.id);
+                              const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+                              setInvoices(refreshedInvoices);
+                            }
+                          }}
+                          className="text-slate-400 hover:text-red-500 transition-colors"
+                          title="Delete draft"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1">
+                      <p>Inv #: {rec.invoiceNumber || 'Not set'}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            
+            {/* Generated Invoices Section */}
+            <div>
+              <h3 className="font-bold text-slate-800 dark:text-white mb-2">Generated Invoices</h3>
+              {historyInvoices.length === 0 ? (
+                 <p className="text-sm text-slate-500 italic">No invoices generated yet.</p>
+              ) : (
+                 historyInvoices.map(rec => (
+                    <div key={rec.id} className="bg-white dark:bg-slate-800 p-3 rounded-lg border border-slate-200 dark:border-slate-700 shadow-sm">
+                      <div className="flex justify-between items-start mb-2">
+                        <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 px-2 py-0.5 rounded-full">Generated</span>
+                          <button
+                            onClick={async () => {
+                              if (confirm('Are you sure you want to delete this invoice?')) {
+                                await DB.deleteInvoice(rec.id);
+                                const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+                                setInvoices(refreshedInvoices);
+                              }
+                            }}
+                            className="text-slate-400 hover:text-red-500 transition-colors"
+                            title="Delete invoice"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3">
+                       <p>Inv #: {rec.invoiceNumber}</p>
+                       <p>Amount: {selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</p>
+                       {rec.generatedDate && typeof rec.generatedDate === 'string' && rec.generatedDate.includes('T') && (
+                         <p>Generated: {format(parseISO(rec.generatedDate), 'dd/MM/yyyy HH:mm:ss')}</p>
+                       )}
                      </div>
-                   </div>
-                   <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 mb-3">
-                     <p>Inv #: {rec.invoiceNumber}</p>
-                     <p>Amount: {selectedClient?.currency} {rec.savedAmount?.toLocaleString()}</p>
-                   </div>
-                   <div className="flex gap-2">
-                     <button
-                       onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient, true))}
-                       className="flex-1 flex items-center justify-center gap-1 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 py-1.5 rounded text-xs font-medium text-slate-700 dark:text-slate-300"
-                     >
-                       <FileSpreadsheet size={14} /> Download Again
-                     </button>
-                   </div>
-                 </div>
-               ))
-            )}
-          </div>
-        )}
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleGenerateExcel(rec, calculateStats(rec, selectedClient, true))}
+                          className="flex-1 flex items-center justify-center gap-1 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 py-1.5 rounded text-xs font-medium text-slate-700 dark:text-slate-300"
+                        >
+                          <FileSpreadsheet size={14} /> Download Again
+                        </button>
+                      </div>
+                    </div>
+                  ))
+               )}
+             </div>
+           </div>
+         )}
       </div>
 
       {/* Right Panel: Calendar */}
