@@ -32,6 +32,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
 import { format, getDaysInMonth, startOfMonth, endOfMonth, eachDayOfInterval, isWeekend, isSameDay, parseISO, addMonths, subMonths } from 'date-fns';
+import { Auth } from './Auth';
 
 // --- Types ---
 
@@ -46,19 +47,21 @@ interface CellMapping {
 
 interface Client {
   id: string;
+  userId: string; // Owner of this client
   name: string; // The Client's Name (Bill To)
   issuerName?: string; // The User's Name (From)
   issuerDetails?: string; // Address/Tax/Bank for PDF Header/Footer
   dailyRate: number;
   currency: string;
   templateName?: string;
-  templateBase64?: string; 
+  templateBase64?: string;
   mapping: CellMapping;
   defaultUseGreekHolidays?: boolean;
 }
 
 interface InvoiceRecord {
   id: string;
+  userId: string; // Owner of this invoice
   clientId: string;
   month: string; // YYYY-MM
   excludedDates: string[]; // ISO strings
@@ -85,37 +88,77 @@ interface AnalysisResult {
 
 // --- Services ---
 
-// 1. Storage Service (Simulating Firebase/DB)
+import { db, signUp, logIn, logOut, onAuthChange } from './firebase';
+import type { User } from 'firebase/auth';
+import {
+  collection,
+  doc,
+  getDocs,
+  getDoc,
+  setDoc,
+  deleteDoc,
+  query,
+  where,
+  Timestamp
+} from 'firebase/firestore';
+
+// 1. Firestore Storage Service
 const DB = {
-  getClients: (): Client[] => {
+  getClients: async (userId: string): Promise<Client[]> => {
     try {
-      const data = localStorage.getItem('app_clients');
-      return data ? JSON.parse(data) : [];
-    } catch (e) { return []; }
+      const q = query(collection(db, 'clients'), where('userId', '==', userId));
+      const snapshot = await getDocs(q);
+      return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Client));
+    } catch (e) {
+      console.error('Error fetching clients:', e);
+      return [];
+    }
   },
-  saveClient: (client: Client) => {
-    const list = DB.getClients();
-    const idx = list.findIndex(c => c.id === client.id);
-    if (idx >= 0) list[idx] = client;
-    else list.push(client);
-    localStorage.setItem('app_clients', JSON.stringify(list));
-  },
-  deleteClient: (id: string) => {
-    const list = DB.getClients().filter(c => c.id !== id);
-    localStorage.setItem('app_clients', JSON.stringify(list));
-  },
-  getInvoices: (clientId: string): InvoiceRecord[] => {
+  saveClient: async (client: Client) => {
     try {
-      const data = localStorage.getItem(`app_invoices_${clientId}`);
-      return data ? JSON.parse(data) : [];
-    } catch (e) { return []; }
+      const clientRef = doc(db, 'clients', client.id);
+      await setDoc(clientRef, client, { merge: true });
+    } catch (e) {
+      console.error('Error saving client:', e);
+      throw e;
+    }
   },
-  saveInvoice: (invoice: InvoiceRecord) => {
-    const list = DB.getInvoices(invoice.clientId);
-    const idx = list.findIndex(i => i.id === invoice.id);
-    if (idx >= 0) list[idx] = invoice;
-    else list.push(invoice);
-    localStorage.setItem(`app_invoices_${invoice.clientId}`, JSON.stringify(list));
+  deleteClient: async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'clients', id));
+      // Also delete all invoices for this client
+      const invoicesSnapshot = await getDocs(
+        query(collection(db, 'invoices'), where('clientId', '==', id))
+      );
+      const deletePromises = invoicesSnapshot.docs.map(invDoc => deleteDoc(invDoc.ref));
+      await Promise.all(deletePromises);
+    } catch (e) {
+      console.error('Error deleting client:', e);
+      throw e;
+    }
+  },
+  getInvoices: async (userId: string, clientId: string): Promise<InvoiceRecord[]> => {
+    try {
+      const q = query(
+        collection(db, 'invoices'),
+        where('userId', '==', userId),
+        where('clientId', '==', clientId)
+      );
+      const snapshot = await getDocs(q);
+      return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as InvoiceRecord));
+    } catch (e) {
+      console.error('Error fetching invoices:', e);
+      return [];
+    }
+  },
+  saveInvoice: async (invoice: InvoiceRecord) => {
+    try {
+      const invoiceRef = doc(db, 'invoices', invoice.id);
+      await setDoc(invoiceRef, invoice, { merge: true });
+    } catch (e) {
+      console.error('Error saving invoice:', e);
+      throw e;
+    }
   }
 };
 
@@ -196,7 +239,7 @@ const AIService = {
 
 // --- Components ---
 
-const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme }: any) => {
+const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authComponent }: any) => {
   return (
     <div className="flex h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans transition-colors duration-200">
       {/* Sidebar */}
@@ -225,7 +268,7 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme }: any) 
         </nav>
         <div className="p-4 border-t border-slate-800 space-y-4">
            {/* Theme Toggle */}
-          <button 
+          <button
             onClick={toggleTheme}
             className="w-full flex items-center gap-3 px-4 py-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
           >
@@ -233,13 +276,7 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme }: any) 
             <span>{theme === 'light' ? 'Dark Mode' : 'Light Mode'}</span>
           </button>
 
-          <div className="flex items-center gap-3 px-4 py-2">
-            <div className="w-8 h-8 bg-indigo-500 rounded-full flex items-center justify-center text-white font-bold">U</div>
-            <div className="text-sm">
-              <div className="text-white">user@gmail.com</div>
-              <div className="text-xs text-slate-500">Free Tier</div>
-            </div>
-          </div>
+          {authComponent}
         </div>
       </aside>
 
@@ -251,18 +288,26 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme }: any) 
   );
 };
 
-const Dashboard = ({ onEditClient, onSelectClient }: any) => {
+const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
   const [clients, setClients] = useState<Client[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const loadClients = async () => {
+    setLoading(true);
+    const data = await DB.getClients(userId);
+    setClients(data);
+    setLoading(false);
+  };
 
   useEffect(() => {
-    setClients(DB.getClients());
+    loadClients();
   }, []);
 
-  const handleDelete = (e: React.MouseEvent, id: string) => {
+  const handleDelete = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     if(confirm('Are you sure you want to delete this client?')) {
-      DB.deleteClient(id);
-      setClients(DB.getClients());
+      await DB.deleteClient(id);
+      await loadClients();
     }
   };
 
@@ -328,9 +373,10 @@ const Dashboard = ({ onEditClient, onSelectClient }: any) => {
   );
 };
 
-const ClientEditor = ({ client, onSave, onCancel }: any) => {
+const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
   const [formData, setFormData] = useState<Client>(client || {
     id: crypto.randomUUID(),
+    userId: userId,
     name: '',
     issuerName: 'My Company',
     issuerDetails: '',
@@ -553,9 +599,25 @@ const ClientEditor = ({ client, onSave, onCancel }: any) => {
   );
 };
 
-const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
-  const [clients] = useState(DB.getClients());
-  const [selectedClientId, setSelectedClientId] = useState(clientId || (clients[0]?.id || ''));
+const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: string }) => {
+  const [clients, setClients] = useState<Client[]>([]);
+  const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
+  const [selectedClientId, setSelectedClientId] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const loadClients = async () => {
+      const data = await DB.getClients(userId);
+      setClients(data);
+      if (!clientId && data.length > 0) {
+        setSelectedClientId(data[0].id);
+      } else if (clientId) {
+        setSelectedClientId(clientId);
+      }
+      setLoading(false);
+    };
+    loadClients();
+  }, [clientId, userId]);
   const [currentDate, setCurrentDate] = useState(new Date());
   const [subTab, setSubTab] = useState<'new' | 'history'>('new');
   
@@ -567,7 +629,18 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
   const [holidaysMap, setHolidaysMap] = useState<Record<string, Record<string, string>>>({});
 
   const selectedClient = useMemo(() => clients.find(c => c.id === selectedClientId), [clients, selectedClientId]);
-  const historyInvoices = useMemo(() => selectedClient ? DB.getInvoices(selectedClient.id).filter(i => i.status === 'generated').sort((a,b) => b.month.localeCompare(a.month)) : [], [selectedClient, currentDate, invoice]);
+  const historyInvoices = useMemo(() => invoices.filter(i => i.status === 'generated').sort((a,b) => b.month.localeCompare(a.month)), [invoices]);
+
+  // Load invoices when client changes
+  useEffect(() => {
+    if (selectedClient) {
+      const loadInvoices = async () => {
+        const data = await DB.getInvoices(userId, selectedClient.id);
+        setInvoices(data);
+      };
+      loadInvoices();
+    }
+  }, [selectedClient, userId]);
 
   // Handle clientId prop change
   useEffect(() => {
@@ -617,7 +690,7 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
     if (!selectedClient) return;
     
     const monthStr = format(currentDate, 'yyyy-MM');
-    const existing = DB.getInvoices(selectedClient.id).find(i => i.month === monthStr);
+    const existing = invoices.find(i => i.month === monthStr);
     
     if (existing) {
       setInvoice({
@@ -628,6 +701,7 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
     } else {
       setInvoice({
         id: crypto.randomUUID(),
+        userId: userId,
         clientId: selectedClient.id,
         month: monthStr,
         excludedDates: [],
@@ -640,7 +714,7 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
     }
   }, [selectedClientId, currentDate]);
 
-  const toggleDayStatus = (date: Date) => {
+  const toggleDayStatus = async (date: Date) => {
     if (!invoice) return;
     const dateStr = date.toISOString();
     
@@ -684,21 +758,27 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
     };
     
     setInvoice(updated);
-    DB.saveInvoice(updated);
+    await DB.saveInvoice({ ...updated, userId });
+    // Refresh invoices list
+    const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+    setInvoices(refreshedInvoices);
   };
 
-  const toggleGreekHolidays = () => {
+  const toggleGreekHolidays = async () => {
     if (!invoice) return;
     
     // Maintain existing status to keep history visible until explicit re-generation
-    const updated: InvoiceRecord = { 
-      ...invoice, 
+    const updated: InvoiceRecord = {
+      ...invoice,
       useGreekHolidays: !invoice.useGreekHolidays,
       // status: 'draft' // REMOVED: Do not reset to draft
     };
     
     setInvoice(updated);
-    DB.saveInvoice(updated);
+    await DB.saveInvoice({ ...updated, userId });
+    // Refresh invoices list
+    const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+    setInvoices(refreshedInvoices);
   };
 
   const calculateStats = (inv = invoice, client = selectedClient, useSaved = false) => {
@@ -879,8 +959,8 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
       
       // Update status if it's the current one (effectively "deletes" the old history record by overwriting it with new generation data)
       if (isCurrentEditorInvoice) {
-        const updated = { 
-          ...targetInvoice, 
+        const updated = {
+          ...targetInvoice,
           status: 'generated' as const,
           invoiceNumber: invNum,
           savedAmount: finalStats.amount,
@@ -888,7 +968,10 @@ const InvoiceGenerator = ({ clientId }: { clientId?: string }) => {
           generatedDate: invDate
         };
         setInvoice(updated);
-        DB.saveInvoice(updated);
+        await DB.saveInvoice({ ...updated, userId });
+        // Refresh invoices list
+        const refreshedInvoices = await DB.getInvoices(userId, selectedClient.id);
+        setInvoices(refreshedInvoices);
       }
 
     } catch (e: any) {
@@ -1125,6 +1208,10 @@ export default function App() {
   const [viewState, setViewState] = useState<'list' | 'edit'>('list');
   const [targetClientId, setTargetClientId] = useState<string | undefined>();
   
+  // Auth State
+  const [user, setUser] = useState<{ uid: string; email: string | null } | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  
   // Theme State
   const [theme, setTheme] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -1132,6 +1219,19 @@ export default function App() {
     }
     return 'light';
   });
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthChange((firebaseUser) => {
+      if (firebaseUser) {
+        setUser({ uid: firebaseUser.uid, email: firebaseUser.email });
+      } else {
+        setUser(null);
+      }
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -1152,8 +1252,9 @@ export default function App() {
     setViewState('edit');
   };
 
-  const handleSaveClient = (client: Client) => {
-    DB.saveClient(client);
+  const handleSaveClient = async (client: Client) => {
+    if (!user) return;
+    await DB.saveClient({ ...client, userId: user.uid });
     setViewState('list');
     setEditingClient(null);
   };
@@ -1163,33 +1264,61 @@ export default function App() {
     setActiveTab('generator');
   };
 
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-50 dark:bg-slate-950">
+        <div className="animate-spin text-indigo-600">
+          <Loader2 size={48} />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <Layout 
-      activeTab={activeTab} 
+    <Layout
+      activeTab={activeTab}
       setActiveTab={(tab: string) => {
         setActiveTab(tab);
         setViewState('list');
       }}
       theme={theme}
       toggleTheme={toggleTheme}
+      authComponent={<Auth user={user} onAuthChange={() => {}} />}
     >
-      {activeTab === 'dashboard' && viewState === 'list' && (
-        <Dashboard 
-          onEditClient={handleEditClient} 
-          onSelectClient={handleSelectClientForInvoice}
-        />
-      )}
-      
-      {activeTab === 'dashboard' && viewState === 'edit' && (
-        <ClientEditor 
-          client={editingClient} 
-          onSave={handleSaveClient}
-          onCancel={() => setViewState('list')}
-        />
-      )}
+      {!user ? (
+        <div className="flex flex-col items-center justify-center h-full p-8">
+          <div className="text-center max-w-md">
+            <FileText className="mx-auto mb-4 text-indigo-600" size={64} />
+            <h2 className="text-2xl font-bold text-slate-800 dark:text-white mb-2">Welcome to SmartInvoice</h2>
+            <p className="text-slate-500 dark:text-slate-400 mb-6">Please sign in or create an account to manage your invoices.</p>
+            <div className="bg-white dark:bg-slate-800 p-6 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700">
+              <Auth user={user} onAuthChange={() => {}} />
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          {activeTab === 'dashboard' && viewState === 'list' && (
+            <Dashboard
+              userId={user.uid}
+              onEditClient={handleEditClient}
+              onSelectClient={handleSelectClientForInvoice}
+            />
+          )}
+          
+          {activeTab === 'dashboard' && viewState === 'edit' && (
+            <ClientEditor
+              userId={user.uid}
+              client={editingClient}
+              onSave={handleSaveClient}
+              onCancel={() => setViewState('list')}
+            />
+          )}
 
-      {activeTab === 'generator' && (
-        <InvoiceGenerator clientId={targetClientId} />
+          {activeTab === 'generator' && (
+            <InvoiceGenerator userId={user.uid} clientId={targetClientId} />
+          )}
+        </>
       )}
     </Layout>
   );

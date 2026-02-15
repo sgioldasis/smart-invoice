@@ -1,0 +1,15 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Only allow s.gioldasis@gmail.com to access data
+    match /clients/{clientId} {
+      allow read, write: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
+      allow create: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com' && request.resource.data.userId == request.auth.uid;
+    }
+    
+    match /invoices/{invoiceId} {
+      allow read, write: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
+      allow create: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com' && request.resource.data.userId == request.auth.uid;
+    }
+  }
+}
