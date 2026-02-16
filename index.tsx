@@ -32,7 +32,6 @@ import {
   TrendingUp,
   Users,
   ClipboardList,
-  Database,
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
 import { motion } from 'framer-motion';
@@ -51,9 +50,6 @@ import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/Invoic
 
 // NEW: Document Manager
 import { DocumentManager } from './src/components/DocumentManager';
-
-// NEW: Migration Tool
-import { MigrationTool } from './src/components/MigrationTool';
 
 // NEW: Import WorkRecord types
 import type { WorkRecord, Document } from './src/types';
@@ -374,13 +370,6 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
           >
             <BarChart3 size={20} />
             <span>Invoice Analytics</span>
-          </button>
-          <button
-             onClick={() => setActiveTab('migration')}
-             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'migration' ? 'bg-amber-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
-          >
-            <Database size={20} />
-            <span>Migration</span>
           </button>
         </nav>
         <div className="p-4 border-t border-slate-800 space-y-4">
@@ -2177,11 +2166,6 @@ export default function App() {
           {/* Analytics Tab */}
           {activeTab === 'analytics' && (
             <Analytics userId={user.uid} />
-          )}
-
-          {/* Migration Tab */}
-          {activeTab === 'migration' && (
-            <MigrationTool userId={user.uid} />
           )}
         </>
       )}
