@@ -13,6 +13,17 @@ export interface CellMapping {
   totalAmount: string;
 }
 
+/**
+ * Timesheet column mapping configuration
+ * Used to fill existing cells in the template without adding/removing rows or columns
+ */
+export interface TimesheetMapping {
+  dateColumn?: string;      // Column letter for dates (e.g., 'A')
+  hoursColumn?: string;     // Column letter for hours (e.g., 'B')
+  descriptionColumn?: string;  // Optional column letter for descriptions (e.g., 'C')
+  startRow?: number;        // Row number where data starts (default: 2 to skip header)
+}
+
 // ============================================
 // Client Types
 // ============================================
@@ -29,6 +40,12 @@ export interface Client {
   templateBase64?: string;
   mapping: CellMapping;
   defaultUseGreekHolidays?: boolean;
+  // Timesheet template fields
+  timesheetTemplateName?: string;
+  timesheetTemplateBase64?: string;
+  timesheetPrompt?: string; // AI prompt describing how to handle each month
+  timesheetMapping?: TimesheetMapping; // Column mapping for timesheet generation
+  timesheetTemplateFileName?: string; // Original filename of the uploaded template
 }
 
 // ============================================
@@ -98,6 +115,45 @@ export interface WorkRecordInput {
   config: WorkRecordConfig;
   notes?: string;
   totalWorkingDays: number;
+}
+
+// ============================================
+// Timesheet Types (NEW)
+// ============================================
+
+/**
+ * Timesheet template override for a specific work record/month
+ * Allows uploading a different template for a specific month
+ */
+export interface WorkRecordTimesheet {
+  id: string;
+  userId: string;
+  clientId: string;
+  workRecordId: string; // Link to the work record
+  month: string; // YYYY-MM format
+  
+  // Month-specific template (optional - falls back to client's default)
+  templateName?: string;
+  templateBase64?: string;
+  
+  // Month-specific prompt (optional - falls back to client's default)
+  prompt?: string;
+  
+  // Metadata
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Input type for creating/updating a work record timesheet
+ */
+export interface WorkRecordTimesheetInput {
+  clientId: string;
+  workRecordId: string;
+  month: string;
+  templateName?: string | null;
+  templateBase64?: string | null;
+  prompt?: string | null;
 }
 
 // ============================================

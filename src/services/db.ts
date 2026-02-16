@@ -29,6 +29,8 @@ import type {
   Document,
   DocumentInput,
   InvoiceRecord,
+  WorkRecordTimesheet,
+  WorkRecordTimesheetInput,
 } from '../types';
 
 // ============================================
@@ -40,6 +42,7 @@ const COLLECTIONS = {
   WORK_RECORDS: 'workRecords',
   DOCUMENTS: 'documents',
   INVOICES: 'invoices', // Legacy
+  TIMESHEETS: 'timesheets', // Work record specific timesheet templates
 } as const;
 
 // ============================================
@@ -63,7 +66,24 @@ export async function getClients(userId: string): Promise<Client[]> {
 export async function saveClient(client: Client): Promise<void> {
   try {
     const clientRef = doc(db, COLLECTIONS.CLIENTS, client.id);
-    await setDoc(clientRef, client, { merge: true });
+
+    // Sanitize client object to remove undefined values which Firestore doesn't support
+    // We convert undefined to null to ensure fields are properly reset if needed
+    const clientData = {
+      ...client,
+      issuerName: client.issuerName ?? null,
+      issuerDetails: client.issuerDetails ?? null,
+      templateName: client.templateName ?? null,
+      templateBase64: client.templateBase64 ?? null,
+      defaultUseGreekHolidays: client.defaultUseGreekHolidays ?? null,
+      timesheetTemplateName: client.timesheetTemplateName ?? null,
+      timesheetTemplateBase64: client.timesheetTemplateBase64 ?? null,
+      timesheetPrompt: client.timesheetPrompt ?? null,
+      timesheetMapping: client.timesheetMapping ?? null,
+      timesheetTemplateFileName: client.timesheetTemplateFileName ?? null,
+    };
+
+    await setDoc(clientRef, clientData, { merge: true });
   } catch (e) {
     console.error('Error saving client:', e);
     throw e;
@@ -74,23 +94,23 @@ export async function deleteClient(id: string): Promise<void> {
   try {
     // Delete the client
     await deleteDoc(doc(db, COLLECTIONS.CLIENTS, id));
-    
+
     // Delete all associated work records (and their documents)
     const workRecordsSnapshot = await getDocs(
       query(collection(db, COLLECTIONS.WORK_RECORDS), where('clientId', '==', id))
     );
-    
+
     for (const wrDoc of workRecordsSnapshot.docs) {
       // Delete documents associated with this work record
       const documentsSnapshot = await getDocs(
         query(collection(db, COLLECTIONS.DOCUMENTS), where('workRecordId', '==', wrDoc.id))
       );
       await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
-      
+
       // Delete the work record
       await deleteDoc(wrDoc.ref);
     }
-    
+
     // Also delete legacy invoices
     const invoicesSnapshot = await getDocs(
       query(collection(db, COLLECTIONS.INVOICES), where('clientId', '==', id))
@@ -115,10 +135,10 @@ export async function getWorkRecords(
     if (clientId) {
       constraints.push(where('clientId', '==', clientId));
     }
-    
+
     const q = query(collection(db, COLLECTIONS.WORK_RECORDS), ...constraints);
     const snapshot = await getDocs(q);
-    
+
     return snapshot.docs.map((doc) => ({
       ...doc.data(),
       id: doc.id,
@@ -133,9 +153,9 @@ export async function getWorkRecordById(id: string): Promise<WorkRecord | null> 
   try {
     const docRef = doc(db, COLLECTIONS.WORK_RECORDS, id);
     const snapshot = await getDoc(docRef);
-    
+
     if (!snapshot.exists()) return null;
-    
+
     return { ...snapshot.data(), id: snapshot.id } as WorkRecord;
   } catch (e) {
     console.error('Error fetching work record:', e);
@@ -155,11 +175,11 @@ export async function getWorkRecordByMonth(
       where('clientId', '==', clientId),
       where('month', '==', month)
     );
-    
+
     const snapshot = await getDocs(q);
-    
+
     if (snapshot.empty) return null;
-    
+
     // Return the first match (should only be one per client/month)
     const doc = snapshot.docs[0];
     return { ...doc.data(), id: doc.id } as WorkRecord;
@@ -177,30 +197,30 @@ export async function saveWorkRecord(
   try {
     const id = existingId || crypto.randomUUID();
     const now = new Date().toISOString();
-    
+
     console.log('DB: Saving work record', { id, userId, existingId });
-    
+
     // Clean undefined values for Firestore
     const cleanWorkRecord: WorkRecordInput = {
       ...workRecord,
       notes: workRecord.notes || null,
       holidayNames: workRecord.holidayNames || null,
     };
-    
+
     const workRecordData: Omit<WorkRecord, 'id'> = {
       ...cleanWorkRecord,
       userId,
       createdAt: existingId ? (await getWorkRecordById(existingId))?.createdAt || now : now,
       updatedAt: now,
     };
-    
+
     console.log('DB: Work record data prepared', workRecordData);
-    
+
     const workRecordRef = doc(db, COLLECTIONS.WORK_RECORDS, id);
     await setDoc(workRecordRef, workRecordData, { merge: true });
-    
+
     console.log('DB: Work record saved successfully');
-    
+
     return { ...workRecordData, id };
   } catch (e: any) {
     console.error('DB: Error saving work record:', e);
@@ -217,7 +237,7 @@ export async function deleteWorkRecord(id: string): Promise<void> {
       query(collection(db, COLLECTIONS.DOCUMENTS), where('workRecordId', '==', id))
     );
     await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
-    
+
     // Then delete the work record
     await deleteDoc(doc(db, COLLECTIONS.WORK_RECORDS, id));
   } catch (e) {
@@ -240,7 +260,7 @@ export async function getDocuments(
 ): Promise<Document[]> {
   try {
     const constraints: any[] = [where('userId', '==', userId)];
-    
+
     if (filters?.clientId) {
       constraints.push(where('clientId', '==', filters.clientId));
     }
@@ -250,10 +270,10 @@ export async function getDocuments(
     if (filters?.type) {
       constraints.push(where('type', '==', filters.type));
     }
-    
+
     const q = query(collection(db, COLLECTIONS.DOCUMENTS), ...constraints);
     const snapshot = await getDocs(q);
-    
+
     return snapshot.docs
       .map((doc) => ({ ...doc.data(), id: doc.id } as Document))
       .sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime());
@@ -267,9 +287,9 @@ export async function getDocumentById(id: string): Promise<Document | null> {
   try {
     const docRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     const snapshot = await getDoc(docRef);
-    
+
     if (!snapshot.exists()) return null;
-    
+
     return { ...snapshot.data(), id: snapshot.id } as Document;
   } catch (e) {
     console.error('Error fetching document:', e);
@@ -284,16 +304,16 @@ export async function saveDocument(
 ): Promise<Document> {
   try {
     const id = existingId || crypto.randomUUID();
-    
+
     const documentData: Omit<Document, 'id'> = {
       ...document,
       userId,
       generatedAt: new Date().toISOString(),
     };
-    
+
     const documentRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     await setDoc(documentRef, documentData, { merge: true });
-    
+
     return { ...documentData, id };
   } catch (e) {
     console.error('Error saving document:', e);
@@ -343,28 +363,28 @@ export async function markDocumentsAsOutdated(
       collection(db, COLLECTIONS.DOCUMENTS),
       where('workRecordId', '==', workRecordId)
     );
-    
+
     const snapshot = await getDocs(q);
     const now = new Date().toISOString();
-    
+
     // Sort current working days for comparison
     const sortedCurrent = [...currentWorkingDays].sort();
-    
+
     const updatePromises = snapshot.docs.map((docSnapshot) => {
       const docData = docSnapshot.data() as Document;
       const savedDays = docData.workingDaysArray || [];
-      
+
       // Skip if already marked as outdated
       if (docData.isOutdated) {
         return Promise.resolve();
       }
-      
+
       // Compare working days arrays
       // If savedDays is empty (migrated document), mark as outdated to be safe
       const isOutdated = savedDays.length === 0 ||
         savedDays.length !== sortedCurrent.length ||
         savedDays.slice().sort().some((day, index) => day !== sortedCurrent[index]);
-      
+
       if (isOutdated) {
         return setDoc(
           docSnapshot.ref,
@@ -375,10 +395,10 @@ export async function markDocumentsAsOutdated(
           { merge: true }
         );
       }
-      
+
       return Promise.resolve();
     });
-    
+
     await Promise.all(updatePromises);
     console.log(`Checked documents for work record ${workRecordId}, marked as outdated where needed`);
   } catch (e) {
@@ -409,6 +429,115 @@ export async function clearDocumentOutdatedFlag(id: string): Promise<void> {
 }
 
 // ============================================
+// Timesheet Operations (NEW)
+// ============================================
+
+export async function getTimesheetByWorkRecord(
+  workRecordId: string
+): Promise<WorkRecordTimesheet | null> {
+  try {
+    const q = query(
+      collection(db, COLLECTIONS.TIMESHEETS),
+      where('workRecordId', '==', workRecordId)
+    );
+
+    const snapshot = await getDocs(q);
+
+    if (snapshot.empty) return null;
+
+    const doc = snapshot.docs[0];
+    return { ...doc.data(), id: doc.id } as WorkRecordTimesheet;
+  } catch (e) {
+    console.error('Error fetching timesheet:', e);
+    return null;
+  }
+}
+
+export async function getTimesheetsByClient(
+  userId: string,
+  clientId: string
+): Promise<WorkRecordTimesheet[]> {
+  try {
+    const q = query(
+      collection(db, COLLECTIONS.TIMESHEETS),
+      where('userId', '==', userId),
+      where('clientId', '==', clientId)
+    );
+
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map((doc) => ({
+      ...doc.data(),
+      id: doc.id,
+    } as WorkRecordTimesheet));
+  } catch (e) {
+    console.error('Error fetching timesheets:', e);
+    return [];
+  }
+}
+
+export async function saveTimesheet(
+  userId: string,
+  timesheet: WorkRecordTimesheetInput,
+  existingId?: string
+): Promise<WorkRecordTimesheet> {
+  try {
+    const id = existingId || crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Clean undefined values for Firestore
+    const cleanTimesheet: WorkRecordTimesheetInput = {
+      ...timesheet,
+      templateBase64: timesheet.templateBase64 || null,
+      templateName: timesheet.templateName || null,
+      prompt: timesheet.prompt || null,
+    };
+
+    const timesheetData: Omit<WorkRecordTimesheet, 'id'> = {
+      ...cleanTimesheet,
+      userId,
+      createdAt: existingId ? (await getDoc(doc(db, COLLECTIONS.TIMESHEETS, existingId))).data()?.createdAt || now : now,
+      updatedAt: now,
+    };
+
+    const timesheetRef = doc(db, COLLECTIONS.TIMESHEETS, id);
+    await setDoc(timesheetRef, timesheetData, { merge: true });
+
+    return { ...timesheetData, id };
+  } catch (e) {
+    console.error('Error saving timesheet:', e);
+    throw e;
+  }
+}
+
+export async function deleteTimesheet(id: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, COLLECTIONS.TIMESHEETS, id));
+  } catch (e) {
+    console.error('Error deleting timesheet:', e);
+    throw e;
+  }
+}
+
+export async function deleteAllClientTimesheets(userId: string, clientId: string): Promise<number> {
+  try {
+    const q = query(
+      collection(db, COLLECTIONS.TIMESHEETS),
+      where('userId', '==', userId),
+      where('clientId', '==', clientId)
+    );
+
+    const snapshot = await getDocs(q);
+    const deletePromises = snapshot.docs.map(d => deleteDoc(d.ref));
+    await Promise.all(deletePromises);
+
+    return snapshot.docs.length;
+  } catch (e) {
+    console.error('Error deleting all client timesheets:', e);
+    throw e;
+  }
+}
+
+// ============================================
 // Legacy Invoice Operations (for migration)
 // ============================================
 
@@ -424,10 +553,10 @@ export async function getInvoices(
     if (clientId) {
       constraints.push(where('clientId', '==', clientId));
     }
-    
+
     const q = query(collection(db, COLLECTIONS.INVOICES), ...constraints);
     const snapshot = await getDocs(q);
-    
+
     return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as InvoiceRecord));
   } catch (e) {
     console.error('Error fetching invoices:', e);

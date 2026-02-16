@@ -25,11 +25,16 @@ import {
   FileSpreadsheet,
   AlertTriangle,
   X,
+  Calendar,
+  Upload,
+  Bot,
+  Download,
 } from 'lucide-react';
-import { format, parseISO, endOfMonth } from 'date-fns';
+import { format, parseISO, endOfMonth, getDaysInMonth } from 'date-fns';
 import * as ExcelJS from 'exceljs';
-import type { Client, WorkRecord, Document } from '../types';
-import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument } from '../services/db';
+import type { Client, WorkRecord, Document, DocumentInput, WorkRecordTimesheet, WorkRecordTimesheetInput } from '../types';
+import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet } from '../services/db';
+import { processTimesheetPromptSmart } from '../services/ai';
 
 interface WorkRecordListProps {
   userId: string;
@@ -49,19 +54,72 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [clients, setClients] = useState<Client[]>([]);
   const [workRecords, setWorkRecords] = useState<WorkRecord[]>([]);
   const [invoices, setInvoices] = useState<Document[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [selectedClientId, setSelectedClientId] = useState<string>('all');
-  const [searchTerm, setSearchTerm] = useState('');
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [generatingInvoiceId, setGeneratingInvoiceId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isDeleting, setIsDeleting] = useState<string | null>(null);
+  const [selectedClientId, setSelectedClientId] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState('');
 
-  // Invoice generation dialog state
+  // Invoice dialog state
   const [showInvoiceDialog, setShowInvoiceDialog] = useState(false);
   const [dialogRecord, setDialogRecord] = useState<WorkRecord | null>(null);
   const [dialogClient, setDialogClient] = useState<Client | null>(null);
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [generatedFileName, setGeneratedFileName] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
+
+  // Timesheet dialog state
+  const [showTimesheetDialog, setShowTimesheetDialog] = useState(false);
+  const [timesheetRecord, setTimesheetRecord] = useState<WorkRecord | null>(null);
+  const [timesheetClient, setTimesheetClient] = useState<Client | null>(null);
+  const [timesheetPrompt, setTimesheetPrompt] = useState('');
+  const [timesheetMonthTemplate, setTimesheetMonthTemplate] = useState<string | null>(null);
+  const [timesheetMonthTemplateName, setTimesheetMonthTemplateName] = useState<string>('');
+  const [existingTimesheetId, setExistingTimesheetId] = useState<string | null>(null);
+  const [isGeneratingTimesheet, setIsGeneratingTimesheet] = useState(false);
+  const [timesheetError, setTimesheetError] = useState<string | null>(null);
+  const [timesheetFileName, setTimesheetFileName] = useState('');
+
+  // Update default filename when record or template changes
+  useEffect(() => {
+    if (timesheetRecord && timesheetClient) {
+      // Base name preference: Month-specific template name > Client default template name > Generic
+      let baseName = timesheetMonthTemplateName ||
+        timesheetClient.timesheetTemplateName ||
+        timesheetClient.timesheetTemplateFileName ||
+        `Timesheet_${timesheetClient.name.replace(/[^a-zA-Z0-9]/g, '_')}_${timesheetRecord.month}`;
+
+      // Remove extension for editing
+      baseName = baseName.replace(/\.xlsx$/i, '').replace(/\.xls$/i, '');
+
+      // Smart Replacement: Update Year and Month to current record's
+      try {
+        const recordDate = parseISO(timesheetRecord.month + '-01');
+        const currentYear = format(recordDate, 'yyyy');
+        const currentMonthName = format(recordDate, 'MMMM');
+        const currentMonthNum = format(recordDate, 'MM');
+
+        // Replace literal placeholders
+        baseName = baseName.replace(/YYYY/g, currentYear);
+        baseName = baseName.replace(/MM/g, currentMonthNum);
+
+        // Replace 4-digit years (e.g. 2024 -> 2026)
+        baseName = baseName.replace(/\b20\d{2}\b/g, currentYear);
+
+        // Replace full month names (case insensitive)
+        const monthsFull = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+        monthsFull.forEach(m => {
+          const re = new RegExp(m, 'gi');
+          if (re.test(baseName)) {
+            baseName = baseName.replace(re, currentMonthName);
+          }
+        });
+      } catch (e) {
+        console.error('Error parsing date for filename:', e);
+      }
+
+      setTimesheetFileName(baseName);
+    }
+  }, [timesheetRecord, timesheetClient, timesheetMonthTemplateName]);
 
   // ============================================
   // Derived State
@@ -70,27 +128,23 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const filteredRecords = useMemo(() => {
     let filtered = workRecords;
 
-    // Filter by client
-    if (selectedClientId !== 'all') {
+    if (selectedClientId) {
       filtered = filtered.filter((wr) => wr.clientId === selectedClientId);
     }
 
-    // Filter by search term (month or client name)
-    if (searchTerm.trim()) {
-      const term = searchTerm.toLowerCase();
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase();
+      const clientMap = new Map(clients.map((c) => [c.id, c]));
       filtered = filtered.filter((wr) => {
-        const client = clients.find((c) => c.id === wr.clientId);
-        const monthDisplay = format(parseISO(`${wr.month}-01`), 'MMMM yyyy');
-        return (
-          monthDisplay.toLowerCase().includes(term) ||
-          client?.name.toLowerCase().includes(term)
-        );
+        const client = clientMap.get(wr.clientId) as Client | undefined;
+        const clientName = client?.name.toLowerCase() || '';
+        const month = wr.month.toLowerCase();
+        return clientName.includes(query) || month.includes(query);
       });
     }
 
-    // Sort by month descending (most recent first)
-    return filtered.sort((a, b) => b.month.localeCompare(a.month));
-  }, [workRecords, selectedClientId, searchTerm, clients]);
+    return filtered;
+  }, [workRecords, selectedClientId, searchQuery, clients]);
 
   const groupedByMonth = useMemo(() => {
     const groups: Record<string, WorkRecord[]> = {};
@@ -104,17 +158,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   }, [filteredRecords]);
 
   const sortedMonths = useMemo(
-    () => Object.keys(groupedByMonth).sort((a, b) => b.localeCompare(a)),
+    () => Object.keys(groupedByMonth).sort().reverse(),
     [groupedByMonth]
   );
 
   const stats = useMemo(() => {
-    const totalRecords = workRecords.length;
-    const totalDays = workRecords.reduce((sum, wr) => sum + wr.totalWorkingDays, 0);
-    const uniqueClients = new Set(workRecords.map((wr) => wr.clientId)).size;
-
-    return { totalRecords, totalDays, uniqueClients };
-  }, [workRecords]);
+    const totalRecords = filteredRecords.length;
+    const totalDays = filteredRecords.reduce(
+      (sum, wr) => sum + wr.workingDays.length,
+      0
+    );
+    return { totalRecords, totalDays };
+  }, [filteredRecords]);
 
   // ============================================
   // Effects
@@ -122,20 +177,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
   useEffect(() => {
     const loadData = async () => {
-      setLoading(true);
+      setIsLoading(true);
       try {
         const [clientsData, recordsData, invoicesData] = await Promise.all([
           getClients(userId),
           getWorkRecords(userId),
-          getDocuments(userId, { type: 'invoice' }),
+          getDocuments(userId),
         ]);
         setClients(clientsData);
         setWorkRecords(recordsData);
         setInvoices(invoicesData);
-      } catch (err) {
-        console.error('Error loading work records:', err);
+      } catch (error) {
+        console.error('Error loading work records:', error);
       } finally {
-        setLoading(false);
+        setIsLoading(false);
       }
     };
 
@@ -147,30 +202,19 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   // ============================================
 
   const handleDelete = async (record: WorkRecord) => {
-    // Check if there are associated invoices
-    const associatedInvoices = invoices.filter(
-      inv => inv.workRecordId === record.id ||
-             (inv.clientId === record.clientId && inv.month === record.month)
-    );
-    
-    let confirmMessage = 'Are you sure you want to delete this work record?';
-    if (associatedInvoices.length > 0) {
-      confirmMessage = `This work record has ${associatedInvoices.length} generated invoice(s).\n\n` +
-        `Deleting it will NOT delete the invoices, but they will no longer be linked to a work record.\n\n` +
-        `Are you sure you want to proceed?`;
+    if (!confirm('Are you sure you want to delete this work record?')) {
+      return;
     }
-    
-    if (!confirm(confirmMessage)) return;
 
-    setDeletingId(record.id);
+    setIsDeleting(record.id);
     try {
       await deleteWorkRecord(record.id);
       setWorkRecords((prev) => prev.filter((wr) => wr.id !== record.id));
-    } catch (err) {
-      console.error('Error deleting work record:', err);
+    } catch (error) {
+      console.error('Error deleting work record:', error);
       alert('Failed to delete work record');
     } finally {
-      setDeletingId(null);
+      setIsDeleting(null);
     }
   };
 
@@ -179,285 +223,870 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   };
 
   const getNextInvoiceNumber = (): string => {
-    // Get all invoice numbers across ALL clients
+    const currentYear = new Date().getFullYear();
+    const yearPrefix = `${currentYear}-`;
+
     const existingNumbers = invoices
+      .filter((inv) => inv.documentNumber?.startsWith(yearPrefix))
       .map((d) => {
-        // Try to parse the document number as a number
-        const num = parseInt(d.documentNumber, 10);
-        return isNaN(num) ? 0 : num;
-      })
-      .filter(n => n > 0);
-    
+        const num = parseInt(d.documentNumber?.split('-')[2] || '0');
+        return num;
+      });
+
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-    // Pad with at least 2 digits
-    return String(maxNum + 1).padStart(2, '0');
+    const nextNum = (maxNum + 1).toString().padStart(2, '0');
+    return `${currentYear}-01-${nextNum}`;
   };
 
-  // Helper to generate filename from invoice number
   const generateFileName = (invNum: string, clientName: string, month: string): string => {
-    const monthName = format(parseISO(`${month}-01`), 'MMMM').toUpperCase();
-    const year = month.substring(0, 4);
-    const safeClientName = (clientName || 'Client').replace(/\s+/g, '_');
-    return `${invNum}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+    const safeClientName = clientName.replace(/[^a-zA-Z0-9]/g, '_');
+    return `${invNum}_${safeClientName}_${month.replace('-', '_')}.xlsx`;
   };
 
-  // Open invoice generation dialog
   const openInvoiceDialog = (record: WorkRecord) => {
     const client = clients.find((c) => c.id === record.clientId);
-    if (!client) {
-      alert('Client not found');
-      return;
-    }
+    if (!client) return;
 
-    if (!client.templateBase64) {
-      alert('No template uploaded for this client');
-      return;
-    }
-
-    const existingInvoice = invoices.find(
-      inv => inv.workRecordId === record.id && inv.month === record.month
-    );
-
-    const initialInvoiceNumber = existingInvoice?.documentNumber || getNextInvoiceNumber();
-    const initialFileName = generateFileName(initialInvoiceNumber, client.name, record.month);
+    const nextNum = getNextInvoiceNumber();
+    const fileName = generateFileName(nextNum, client.name, record.month);
 
     setDialogRecord(record);
     setDialogClient(client);
-    setInvoiceNumber(initialInvoiceNumber);
-    setGeneratedFileName(initialFileName);
+    setInvoiceNumber(nextNum);
+    setGeneratedFileName(fileName);
     setShowInvoiceDialog(true);
   };
 
   const handleGenerateInvoice = async () => {
-    if (!dialogRecord || !dialogClient) return;
-
-    const record = dialogRecord;
-    const client = dialogClient;
+    if (!dialogRecord || !dialogClient || !invoiceNumber.trim()) return;
 
     setIsGenerating(true);
-
     try {
-      // Get existing invoice for this work record
-      const existingInvoice = invoices.find(
-        inv => inv.workRecordId === record.id && inv.month === record.month
-      );
-      const stats = {
-        days: record.totalWorkingDays,
-        amount: record.totalWorkingDays * client.dailyRate,
-      };
-
-      // 1. Generate Excel
       const workbook = new ExcelJS.Workbook();
-      
-      // Handle base64 data - remove data URL prefix if present
-      let base64Data = client.templateBase64;
-      if (base64Data.includes(',')) {
-        base64Data = base64Data.split(',')[1];
+
+      if (dialogClient.template) {
+        const binaryString = atob(dialogClient.template);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
+      } else {
+        workbook.addWorksheet('Invoice');
       }
-      
-      // Remove any whitespace that might have been added
-      base64Data = base64Data.replace(/\s/g, '');
-      
-      // Validate base64 characters only
-      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
-        throw new Error('Invalid template data format');
-      }
-      
-      // Browser-compatible base64 to ArrayBuffer conversion
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      await workbook.xlsx.load(bytes.buffer);
+
       const worksheet = workbook.worksheets[0];
 
-      // Force Excel to recalculate formulas when opened
-      (workbook.calcProperties as any).fullCalcOnLoad = true;
+      const dateColumn = dialogClient.mapping?.dateColumn || 'A';
+      const hoursColumn = dialogClient.mapping?.hoursColumn || 'B';
 
-      // Mark all formula cells for recalculation by clearing cached results
       worksheet.eachRow((row) => {
         row.eachCell((cell) => {
-          if (cell.type === ExcelJS.ValueType.Formula) {
-            const formulaValue = cell.value as { formula: string; result?: unknown };
-            if (formulaValue && typeof formulaValue === 'object' && 'formula' in formulaValue) {
-              cell.value = { formula: formulaValue.formula };
-            }
+          if (typeof cell.value === 'string') {
+            cell.value = cell.value
+              .replace(/\{\{CLIENT_NAME\}\}/g, dialogClient.name)
+              .replace(/\{\{CLIENT_ADDRESS\}\}/g, dialogClient.address || '')
+              .replace(/\{\{CLIENT_VAT\}\}/g, dialogClient.vatNumber || '')
+              .replace(/\{\{INVOICE_NUMBER\}\}/g, invoiceNumber)
+              .replace(/\{\{INVOICE_DATE\}\}/g, format(new Date(), 'dd/MM/yyyy'))
+              .replace(/\{\{MONTH\}\}/g, dialogRecord.month)
+              .replace(
+                /\{\{TOTAL_HOURS\}\}/g,
+                (dialogRecord.workingDays.length * 8).toString()
+              );
           }
         });
       });
 
-      // 2. Map data to cells based on client mapping
-      const mapping = client.mapping;
       const setCell = (cellAddr: string, value: any) => {
-        if (cellAddr && value !== undefined && value !== null) {
-          const cell = worksheet.getCell(cellAddr);
-          cell.value = value;
-        }
+        const cell = worksheet.getCell(cellAddr);
+        cell.value = value;
       };
 
-      const currentDate = parseISO(`${record.month}-01`);
+      const workingDays = dialogRecord.workingDays
+        .map((d) => parseISO(d))
+        .sort((a, b) => a.getTime() - b.getTime());
 
-      // Set invoice metadata - date is always end of the month
-      const monthDate = parseISO(`${record.month}-01`);
-      const endOfMonthDate = endOfMonth(monthDate);
-      setCell(mapping.date, format(endOfMonthDate, 'dd/MM/yyyy'));
-      setCell(mapping.invoiceNumber, invoiceNumber);
-      setCell(mapping.daysWorked, stats.days);
-      setCell(mapping.dailyRate, client.dailyRate);
-      setCell(mapping.totalAmount, stats.amount);
-
-      // Handle description cell - preserve template content and update days count
-      if (mapping.description) {
-        try {
-          const descCell = worksheet.getCell(mapping.description);
-          // Check if formula - if so, leave it alone
-          const isFormula = descCell.value && typeof descCell.value === 'object' && 'formula' in descCell.value;
-          
-          if (!isFormula) {
-            const currentDescVal = descCell.value ? descCell.value.toString() : '';
-            
-            if (!currentDescVal.trim()) {
-              // Case 1: Empty Description -> Generate standard string
-              const monthName = format(currentDate, 'MMMM');
-              const year = format(currentDate, 'yyyy');
-              
-              let newDesc = `Consulting Services for ${monthName} ${year}`;
-              // If there is no specific 'daysWorked' column mapped, we usually want the days count in description
-              if (!mapping.daysWorked) {
-                 newDesc += ` (${stats.days} days)`;
-              }
-              descCell.value = newDesc;
-            } else {
-              // Case 2: Existing Description -> Preserve text, replace day count number if pattern exists
-              // Look for "X days", "X units/working days", etc.
-              const daysPattern = /(\d+)(\D{0,50}days?)/i;
-              if (daysPattern.test(currentDescVal)) {
-                 descCell.value = currentDescVal.replace(daysPattern, `${stats.days}$2`);
-              }
-              // If no pattern is found, we assume the user's template text is static or doesn't include days count.
-            }
-          }
-        } catch(e) { console.warn("Invalid description cell address", e); }
+      for (let i = 0; i < workingDays.length; i++) {
+        const day = workingDays[i];
+        const rowNum = i + 1;
+        setCell(`${dateColumn}${rowNum}`, format(day, 'dd/MM/yyyy'));
+        setCell(`${hoursColumn}${rowNum}`, 8);
       }
 
-      // 3. Generate buffer and download
       const buffer = await workbook.xlsx.writeBuffer();
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      
-      // Use the generated filename from state
-      const fileName = generatedFileName;
-      
-      a.download = fileName;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
+      const url = URL.createObjectURL(blob);
 
-      // 4. Save document to database
-      const documentData = {
-        clientId: client.id,
-        workRecordId: record.id,
-        type: 'invoice' as const,
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = generatedFileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      const invoiceData: DocumentInput = {
+        clientId: dialogClient.id!,
+        workRecordId: dialogRecord.id,
+        type: 'invoice',
         documentNumber: invoiceNumber,
-        month: record.month,
-        workingDays: stats.days,
-        workingDaysArray: record.workingDays,
-        dailyRate: client.dailyRate,
-        totalAmount: stats.amount,
-        fileName: fileName,
-        isPaid: false,
-        isOutdated: false,
+        month: dialogRecord.month,
+        workingDays: dialogRecord.workingDays.length,
+        workingDaysArray: dialogRecord.workingDays,
+        dailyRate: dialogClient.dailyRate || 0,
+        totalAmount: (dialogRecord.workingDays.length * 8) * (dialogClient.hourlyRate || dialogClient.dailyRate || 0),
+        fileName: generatedFileName,
       };
 
-      // Check for existing document to overwrite
-      const docId = existingInvoice?.id;
-      await saveDocument(userId, documentData, docId);
+      await saveDocument(userId, invoiceData);
 
-      // Refresh invoices list
-      const updatedDocs = await getDocuments(userId, { type: 'invoice' });
-      setInvoices(updatedDocs);
+      const updatedInvoices = await getDocuments(userId);
+      setInvoices(updatedInvoices);
 
-      // Close dialog
       setShowInvoiceDialog(false);
       setDialogRecord(null);
       setDialogClient(null);
-
-    } catch (err: any) {
-      console.error('Error generating invoice:', err);
-      alert(err?.message || 'Failed to generate invoice');
+      setInvoiceNumber('');
+    } catch (error) {
+      console.error('Error generating invoice:', error);
+      alert('Failed to generate invoice');
     } finally {
       setIsGenerating(false);
     }
   };
 
-  // ============================================
-  // Render Helpers
-  // ============================================
+  const openTimesheetDialog = async (record: WorkRecord) => {
+    const client = clients.find((c) => c.id === record.clientId);
+    if (!client) return;
 
-  const getClient = (clientId: string) => clients.find((c) => c.id === clientId);
+    setTimesheetRecord(record);
+    setTimesheetClient(client);
+    setTimesheetPrompt(client.timesheetPrompt || '');
+    setTimesheetError(null);
+    setExistingTimesheetId(null);
 
-  const formatMonth = (monthStr: string) => {
-    return format(parseISO(`${monthStr}-01`), 'MMMM yyyy');
+    // Check for existing timesheet config for this month
+    try {
+      const existingTimesheet = await getTimesheetByWorkRecord(record.id);
+      if (existingTimesheet) {
+        setTimesheetPrompt(existingTimesheet.prompt || client.timesheetPrompt || '');
+        setTimesheetMonthTemplate(existingTimesheet.templateBase64 || null);
+        setTimesheetMonthTemplateName(existingTimesheet.templateName || '');
+        setExistingTimesheetId(existingTimesheet.id);
+      } else {
+        setTimesheetMonthTemplate(null);
+        setTimesheetMonthTemplateName('');
+      }
+    } catch (error) {
+      console.error('Error loading timesheet config:', error);
+      setTimesheetMonthTemplate(null);
+      setTimesheetMonthTemplateName('');
+    }
+
+    setShowTimesheetDialog(true);
+  };
+
+  const handleMonthTemplateUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const base64 = evt.target?.result as string;
+      setTimesheetMonthTemplate(base64.split(',')[1]);
+      setTimesheetMonthTemplateName(file.name);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleClearMonthTemplate = () => {
+    setTimesheetMonthTemplate(null);
+    setTimesheetMonthTemplateName('');
+  };
+
+  const handleGenerateTimesheet = async () => {
+    if (!timesheetRecord || !timesheetClient) return;
+
+    setIsGeneratingTimesheet(true);
+    setTimesheetError(null);
+
+    try {
+      const workbook = new ExcelJS.Workbook();
+
+      // Determine which template to use
+      const templateToUse = timesheetMonthTemplate || timesheetClient.timesheetTemplateBase64;
+      const templateFileName = timesheetMonthTemplate
+        ? timesheetMonthTemplateName
+        : timesheetClient.timesheetTemplateFileName;
+
+      if (!templateToUse) {
+        setTimesheetError('No timesheet template available. Please upload a template in the client settings or for this specific month.');
+        setIsGeneratingTimesheet(false);
+        return;
+      }
+
+      const binaryString = atob(templateToUse);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
+
+      const worksheet = workbook.worksheets[0];
+
+      // REMOVED: Clear ALL fills. User requested to preserve template formatting.
+      // worksheet.eachRow((row) => { ... });
+
+      // Process template with AI prompt guidance
+      const workingDaysList = timesheetRecord.workingDays.map(dateStr => {
+        const date = parseISO(dateStr);
+        return {
+          date: format(date, 'dd/MM/yyyy'),
+          dayOfWeek: format(date, 'EEEE'),
+          dayOfMonth: date.getDate(),
+          month: format(date, 'MMMM'),
+          year: date.getFullYear(),
+        };
+      });
+
+      // Simple template processing - fill in dates
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          if (typeof cell.value === 'string') {
+            let value = cell.value;
+
+            // Replace placeholders
+            value = value
+              .replace(/\{\{CLIENT_NAME\}\}/g, timesheetClient.name)
+              .replace(/\{\{CLIENT_ADDRESS\}\}/g, timesheetClient.address || '')
+              .replace(/\{\{CLIENT_VAT\}\}/g, timesheetClient.vatNumber || '')
+              .replace(/\{\{MONTH\}\}/g, timesheetRecord.month)
+              .replace(/\{\{TOTAL_DAYS\}\}/g, timesheetRecord.workingDays.length.toString())
+              .replace(/\{\{TOTAL_HOURS\}\}/g, (timesheetRecord.workingDays.length * 8).toString());
+
+            cell.value = value;
+          }
+        });
+      });
+
+      // Simple approach: Only replace placeholders, don't add/remove rows or columns
+      // The template structure is preserved exactly as uploaded
+
+      // Replace placeholders throughout the worksheet
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          if (typeof cell.value === 'string') {
+            let value = cell.value;
+
+            // Replace placeholders
+            value = value
+              .replace(/\{\{CLIENT_NAME\}\}/g, timesheetClient.name)
+              .replace(/\{\{CLIENT_ADDRESS\}\}/g, timesheetClient.address || '')
+              .replace(/\{\{CLIENT_VAT\}\}/g, timesheetClient.vatNumber || '')
+              .replace(/\{\{MONTH\}\}/g, timesheetRecord.month)
+              .replace(/\{\{TOTAL_DAYS\}\}/g, timesheetRecord.workingDays.length.toString())
+              .replace(/\{\{TOTAL_HOURS\}\}/g, (timesheetRecord.workingDays.length * 8).toString());
+
+            cell.value = value;
+          }
+        });
+      });
+
+      // Fill working days only if mapping is configured
+      // This fills existing cells without creating new rows
+      if (timesheetClient.timesheetMapping) {
+        const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetClient.timesheetMapping;
+        const firstDataRow = startRow || 2;
+
+        for (let i = 0; i < workingDaysList.length; i++) {
+          const day = workingDaysList[i];
+          const rowNum = firstDataRow + i;
+
+          // Only fill if the row already exists in the template
+          const row = worksheet.getRow(rowNum);
+          if (row && !row.hidden) {
+            if (dateColumn) {
+              const dateCell = worksheet.getCell(`${dateColumn}${rowNum}`);
+              if (!dateCell.value || typeof dateCell.value === 'string' && dateCell.value.includes('{{')) {
+                dateCell.value = day.date;
+              }
+            }
+
+            if (hoursColumn) {
+              const hoursCell = worksheet.getCell(`${hoursColumn}${rowNum}`);
+              if (!hoursCell.value || typeof hoursCell.value === 'string' && hoursCell.value.includes('{{')) {
+                hoursCell.value = 8;
+              }
+            }
+
+            if (descriptionColumn) {
+              const descCell = worksheet.getCell(`${descriptionColumn}${rowNum}`);
+              if (!descCell.value || typeof descCell.value === 'string' && descCell.value.includes('{{')) {
+                descCell.value = `Working day - ${day.dayOfWeek}`;
+              }
+            }
+          }
+        }
+      }
+
+      // Parse prompt using Gemini AI (with fallback to local parsing)
+      console.log('Timesheet prompt value:', timesheetPrompt);
+      console.log('Processing prompt with Gemini AI...');
+
+      let aiResult = null;
+      try {
+        aiResult = await processTimesheetPromptSmart({
+          prompt: timesheetPrompt || '',
+          workingDays: timesheetRecord.workingDays,
+          clientName: timesheetClient.name,
+          month: timesheetRecord.month,
+        });
+        console.log('AI Config received:', JSON.stringify(aiResult, null, 2));
+      } catch (aiError) {
+        console.error('AI processing failed, will use fallback:', aiError);
+      }
+
+      // Fallback: Extract cell references and instructions from the prompt locally
+      const promptLower = (timesheetPrompt || '').toLowerCase();
+
+      // NEW: Check for explicit "Do NOT change any styles" instruction
+      const disableStyling = promptLower.includes('do not change') && (promptLower.includes('styles') || promptLower.includes('formatting'));
+
+      // Look for cell references like "cell C11", ranges like "C13 to AG13", etc.
+      const periodCellMatch = promptLower.match(/(?:period|date).*?cell\s+([a-z]+\d+)/i);
+
+      // Match cell ranges like "cells c13 to ag13" or "c13 up to ag13" or "c14 to ag14"
+      const dayNumbersRangeMatch = promptLower.match(/(?:day numbers|cells)\s+([a-z]+\d+).*?(?:to|up to)\s+([a-z]+\d+)/i);
+      // Enhanced data row match to catch "data row... cells c14 up to ag14"
+      const dataRangeMatch = promptLower.match(/(?:data row|work hours).*?\(?cells?\s+([a-z]+\d+).*?(?:to|up to)\s+([a-z]+\d+)\)?/i);
+      const hoursValueMatch = promptLower.match(/(?:place|put|fill).*?(\d+(?:\.\d+)?).*?(?:hours?|work)/i);
+
+      // Parse style row range if specified (e.g., "rows 14-20")
+      const styleRowRangeMatch = promptLower.match(/rows?\s+(\d+)(?:\s*-\s*|\s+to\s+)(\d+)/i);
+
+      // Extract values from AI result or use local parsing
+      const aiAnalysis = aiResult?.geminiAnalysis;
+
+      // Period cell (e.g., C11)
+      const periodCellValue = aiAnalysis?.periodCell || (periodCellMatch ? periodCellMatch[1] : null);
+
+      // Day numbers range (e.g., C13 to AG13)
+      const dayNumbersStart = aiAnalysis?.dayNumbersRange?.start || (dayNumbersRangeMatch ? dayNumbersRangeMatch[1] : null);
+      const dayNumbersEnd = aiAnalysis?.dayNumbersRange?.end || (dayNumbersRangeMatch ? dayNumbersRangeMatch[2] : null);
+
+      // Data range / hours range (e.g., C14 to AG14)
+      const dataRangeStart = aiAnalysis?.hoursRange?.start || (dataRangeMatch ? dataRangeMatch[1] : null);
+      const dataRangeEnd = aiAnalysis?.hoursRange?.end || (dataRangeMatch ? dataRangeMatch[2] : null);
+
+      // Style rows range (e.g., 14-20)
+      const styleStartRow = aiAnalysis?.styleRows?.start || (styleRowRangeMatch ? parseInt(styleRowRangeMatch[1]) : null);
+      const styleEndRow = aiAnalysis?.styleRows?.end || (styleRowRangeMatch ? parseInt(styleRowRangeMatch[2]) : null);
+
+      console.log('=== PROMPT PARSING RESULTS ===');
+      console.log('AI used:', aiResult !== null);
+      console.log('AI full analysis:', aiAnalysis);
+      console.log('periodCell:', periodCellValue || 'NOT FOUND');
+      console.log('dayNumbersRange:', dayNumbersStart && dayNumbersEnd ? `${dayNumbersStart} to ${dayNumbersEnd}` : 'NOT FOUND');
+      console.log('dataRange:', dataRangeStart && dataRangeEnd ? `${dataRangeStart} to ${dataRangeEnd}` : 'NOT FOUND');
+      console.log('hoursPerDay:', aiResult?.mapping?.hoursPerDay || (hoursValueMatch ? hoursValueMatch[1] : 'NOT FOUND'));
+      console.log('styleRows:', styleStartRow && styleEndRow ? `${styleStartRow}-${styleEndRow}` : 'NOT FOUND');
+
+      // Parse the work record month for period cell
+      const [year, month] = timesheetRecord.month.split('-').map(Number);
+      const daysInMonth = getDaysInMonth(new Date(year, month - 1));
+      const firstDayOfMonth = new Date(year, month - 1, 1);
+      const lastDayOfMonth = new Date(year, month - 1, daysInMonth);
+
+      // Format period as "01-January-2025 -> 31-January-2025"
+      const formatDateForPeriod = (date: Date) => {
+        const day = date.getDate().toString().padStart(2, '0');
+        const monthName = format(date, 'MMMM-yyyy');
+        return `${day}-${monthName}`;
+      };
+
+      const periodText = `${formatDateForPeriod(firstDayOfMonth)} -> ${formatDateForPeriod(lastDayOfMonth)}`;
+
+      // Update period cell if specified (e.g., C11)
+      if (periodCellValue) {
+        const periodCell = worksheet.getCell(periodCellValue.toUpperCase());
+        periodCell.value = periodText;
+        console.log(`Updated period cell ${periodCellValue.toUpperCase()} to: ${periodText}`);
+      }
+
+      // Helper function to convert column letter to number (A=1, B=2, etc.)
+      const colLetterToNumber = (col: string): number => {
+        let result = 0;
+        for (let i = 0; i < col.length; i++) {
+          result = result * 26 + (col.charCodeAt(i) - 64);
+        }
+        return result;
+      };
+
+      // Helper function to convert column number to letter (1=A, 2=B, etc.)
+      const colNumberToLetter = (num: number): string => {
+        let result = '';
+        while (num > 0) {
+          num--;
+          result = String.fromCharCode(65 + (num % 26)) + result;
+          num = Math.floor(num / 26);
+        }
+        return result;
+      };
+
+      // Update day numbers in the specified range (e.g., C13 to AG13)
+      if (dayNumbersStart && dayNumbersEnd) {
+        const startCell = dayNumbersStart.toUpperCase();
+        const endCell = dayNumbersEnd.toUpperCase();
+
+        // Extract row and columns
+        const startRow = parseInt(startCell.match(/\d+/)![0]);
+        const startCol = startCell.match(/[A-Z]+/)![0];
+        const endCol = endCell.match(/[A-Z]+/)![0];
+
+        const startColNum = colLetterToNumber(startCol);
+        const endColNum = colLetterToNumber(endCol);
+
+        console.log(`Processing day numbers in row ${startRow}, columns ${startCol}(${startColNum}) to ${endCol}(${endColNum})`);
+
+        // STEP 1: Clear ALL day number cells in the range first (handles months with < 31 days)
+        for (let colNum = startColNum; colNum <= endColNum; colNum++) {
+          const cell = worksheet.getRow(startRow).getCell(colNum);
+          if (cell) {
+            cell.value = null;
+          }
+        }
+
+        // STEP 2: Fill day numbers starting from 1, only up to daysInMonth
+        for (let colNum = startColNum, dayNum = 1; colNum <= endColNum && dayNum <= daysInMonth; colNum++, dayNum++) {
+          const cell = worksheet.getRow(startRow).getCell(colNum);
+          if (cell) {
+            cell.value = dayNum;
+          }
+        }
+        console.log(`Updated day numbers in row ${startRow}, columns ${startCol} to ${endCol}`);
+      }
+
+      // Fill hours in data row range for working days only (e.g., C14 to AG14)
+      const hoursPerDay = aiResult?.mapping?.hoursPerDay || (hoursValueMatch ? parseFloat(hoursValueMatch[1]) : 8);
+
+      // Extract style cell references from AI analysis or prompt
+      // AI returns styling info directly - we don't need to parse from text anymore
+      console.log('DEBUG: AI styling analysis:', aiAnalysis?.styling);
+      console.log('DEBUG: styleRows from AI:', aiAnalysis?.styleRows);
+
+      // Use AI-extracted style information if available, otherwise fall back to pattern detection
+      let workingDayCell: string | null = null;
+      let weekendCell: string | null = null;
+
+      // If AI has analysis with style information, use it
+      if (aiAnalysis?.styling) {
+        // AI identified working day and weekend colors/cells
+        console.log('AI detected styling configuration');
+      }
+
+      // Fallback: Parse style cells from prompt text
+      // Find all occurrences of "cell XX for" pattern
+      const allCellRefs = [...promptLower.matchAll(/cell\s+([a-z]+\d+)\s+for/gi)];
+      console.log('DEBUG: All cell references found:', allCellRefs.map(m => m[1]));
+
+      for (const match of allCellRefs) {
+        const cellRef = match[1].toUpperCase();
+        const matchIndex = match.index || 0;
+        // Look at what comes after this match (within next 50 chars) to determine type
+        const followingText = promptLower.substring(matchIndex, matchIndex + 50);
+        console.log(`Cell ${cellRef} followed by:`, followingText);
+
+        if (followingText.includes('working')) {
+          workingDayCell = cellRef;
+        } else if (followingText.includes('weekend')) {
+          weekendCell = cellRef;
+        }
+      }
+
+      // Create match-like objects for compatibility with existing code
+      const workingDayStyleMatch = workingDayCell ? [null, workingDayCell] : null;
+      const weekendStyleMatch = weekendCell ? [null, weekendCell] : null;
+
+      console.log('Style matches:', {
+        workingDayCell: workingDayStyleMatch ? workingDayStyleMatch[1] : null,
+        weekendCell: weekendStyleMatch ? weekendStyleMatch[1] : null,
+      });
+
+      if (dataRangeStart && dataRangeEnd) {
+        const startCell = dataRangeStart.toUpperCase();
+        const endCell = dataRangeEnd.toUpperCase();
+
+        // Extract row and columns
+        const dataRow = parseInt(startCell.match(/\d+/)![0]);
+        let startCol = startCell.match(/[A-Z]+/)![0];
+        let endCol = endCell.match(/[A-Z]+/)![0];
+
+        const startColNumInitial = colLetterToNumber(startCol);
+
+        console.log(`Processing hours in row ${dataRow}, columns ${startCol}(${startColNumInitial}) to ${endCol}(${colLetterToNumber(endCol)})`);
+        console.log('>>> ENTERING STYLING CODE BLOCK - dataRangeMatch was found');
+
+        // FIX: Ensure data/styling loop aligns with day numbers loop if available
+        // This prevents "shifting" of gray cells if the AI/Regex detects slightly different start columns
+        if (dayNumbersStart && typeof dayNumbersStart === 'string') {
+          try {
+            const dayStartCellUpper = dayNumbersStart.toUpperCase();
+            const dayStartColMatch = dayStartCellUpper.match(/[A-Z]+/);
+
+            if (dayStartColMatch) {
+              const dayStartCol = dayStartColMatch[0];
+              if (dayStartCol !== startCol) {
+                console.log(`Aligning data loop start column from ${startCol} to ${dayStartCol} to match day numbers.`);
+
+                // Calculate shift to adjust endCol as well
+                const oldStartNum = colLetterToNumber(startCol);
+                const newStartNum = colLetterToNumber(dayStartCol);
+                const shift = newStartNum - oldStartNum;
+
+                const oldEndNum = colLetterToNumber(endCol);
+                endCol = colNumberToLetter(oldEndNum + shift);
+                startCol = dayStartCol;
+              }
+            }
+          } catch (e) {
+            console.error('Error in column alignment logic:', e);
+            // Fallback: proceed with original startCol
+          }
+        }
+
+        const startColNum = colLetterToNumber(startCol);
+        const endColNum = colLetterToNumber(endCol);
+
+        // Capture styles from template cells if specified
+        let workingDayStyle: any = null;
+        let weekendStyle: any = null;
+
+        // Helper to capture full cell style including fill
+        const captureCellStyle = (cellAddr: string): any => {
+          const cell = worksheet.getCell(cellAddr);
+          const fill = cell.fill as any;
+          console.log(`Raw cell ${cellAddr} properties:`, {
+            fill: fill,
+            type: fill?.type,
+            pattern: fill?.pattern,
+            fgColor: fill?.fgColor,
+            bgColor: fill?.bgColor,
+          });
+          const style: any = {};
+
+          // Capture fill (background color) - this is the most important for gray/white
+          if (cell.fill) {
+            // Deep copy the fill object
+            style.fill = JSON.parse(JSON.stringify(cell.fill));
+            console.log(`  Captured fill for ${cellAddr}:`, style.fill);
+          }
+
+          // Capture font
+          if (cell.font) {
+            style.font = JSON.parse(JSON.stringify(cell.font));
+          }
+
+          // Capture border
+          if (cell.border) {
+            style.border = JSON.parse(JSON.stringify(cell.border));
+          }
+
+          // Capture alignment
+          if (cell.alignment) {
+            style.alignment = JSON.parse(JSON.stringify(cell.alignment));
+          }
+
+          // Capture number format
+          if (cell.numFmt) {
+            style.numFmt = cell.numFmt;
+          }
+
+          return style;
+        };
+
+        console.log('DEBUG: workingDayCell value:', workingDayCell);
+        console.log('DEBUG: workingDayStyleMatch:', workingDayStyleMatch);
+
+        if (workingDayStyleMatch && workingDayStyleMatch[1]) {
+          const workingDayCellRef = workingDayStyleMatch[1].toUpperCase();
+          console.log('DEBUG: About to capture from:', workingDayCellRef);
+          workingDayStyle = captureCellStyle(workingDayCellRef);
+          console.log(`CAPTURED working day style from ${workingDayCellRef}:`,
+            workingDayStyle && workingDayStyle.fill ? 'HAS FILL: ' + JSON.stringify(workingDayStyle.fill) : 'NO FILL');
+        } else {
+          console.log('DEBUG: workingDayStyleMatch is null or has no cell ref');
+        }
+
+        if (weekendStyleMatch && weekendStyleMatch[1]) {
+          const weekendCellRef = weekendStyleMatch[1].toUpperCase();
+          weekendStyle = captureCellStyle(weekendCellRef);
+          console.log(`CAPTURED weekend style from ${weekendCellRef}:`,
+            weekendStyle && weekendStyle.fill ? 'HAS FILL: ' + JSON.stringify(weekendStyle.fill) : 'NO FILL');
+        }
+
+        // Determine style row range (use AI-extracted or parsed values, default to data row)
+        const finalStyleStartRow = styleStartRow || dataRow;
+        const finalStyleEndRow = styleEndRow || dataRow;
+
+        // Convert working days to a Set for quick lookup (using day of month as number)
+        const workingDayNumbers = new Set(
+          timesheetRecord.workingDays.map(dateStr => parseInt(dateStr.split('-')[2]))
+        );
+
+        // Build a map of which day numbers are weekends
+        const weekendDayNumbers = new Set<number>();
+        for (let dayNum = 1; dayNum <= daysInMonth; dayNum++) {
+          const date = new Date(year, month - 1, dayNum);
+          const dayOfWeek = date.getDay();
+          if (dayOfWeek === 0 || dayOfWeek === 6) {
+            weekendDayNumbers.add(dayNum);
+          }
+        }
+
+        console.log('Weekend day numbers:', Array.from(weekendDayNumbers));
+        console.log('Working day numbers:', Array.from(workingDayNumbers));
+
+        // STEP 1: Clear hours cells values only (not backgrounds)
+        for (let colNum = startColNum; colNum <= endColNum; colNum++) {
+          const cell = worksheet.getRow(dataRow).getCell(colNum);
+          if (cell) {
+            cell.value = null;
+          }
+        }
+
+        // REMOVED: Apply WHITE to ALL cells. User requested to preserve template formatting.
+        /*
+        for (let colNum = startColNum; colNum <= endColNum; colNum++) {
+          const colLetter = colNumberToLetter(colNum);
+          for (let styleRow = finalStyleStartRow; styleRow <= finalStyleEndRow; styleRow++) {
+             // ...
+          }
+        }
+        */
+
+        // Extract day numbers row index if available
+        let dayNumbersRowIndex: number | null = null;
+        if (dayNumbersStart && typeof dayNumbersStart === 'string') {
+          const match = dayNumbersStart.match(/(\d+)/);
+          if (match) {
+            dayNumbersRowIndex = parseInt(match[1]);
+          }
+        }
+
+        // STEP 3: Fill hours and apply gray ONLY to weekends
+        const grayCols: string[] = [];
+        // We iterate based on the range, but we ONLY act if we find a valid day number
+        // We do typically 31 columns max
+        for (let colNum = startColNum; colNum <= endColNum; colNum++) {
+          const cell = worksheet.getRow(dataRow).getCell(colNum);
+          if (!cell) continue;
+
+          let isWeekend = false;
+          let isValidDay = false;
+          let currentDayNum = 0;
+
+          // PREFERRED: Read the actual day number from the sheet if we know the row
+          // This satisfies the user request to "check the number in line 13"
+          if (dayNumbersRowIndex) {
+            const dayNumCell = worksheet.getRow(dayNumbersRowIndex).getCell(colNum);
+            const cellValue = dayNumCell.value;
+
+            // Try to parse number from cell value
+            let parsedDayNum = -1;
+            if (typeof cellValue === 'number') {
+              parsedDayNum = cellValue;
+            } else if (typeof cellValue === 'string') {
+              parsedDayNum = parseInt(cellValue);
+            }
+
+            if (parsedDayNum > 0 && parsedDayNum <= 31) {
+              currentDayNum = parsedDayNum;
+              isValidDay = true;
+
+              // Check if THIS specific day number is a weekend
+              isWeekend = weekendDayNumbers.has(currentDayNum);
+            }
+          }
+
+          // AGGRESSIVE GRID CLEANING or JUST FILL DATA
+          // If styling is disabled, we ONLY touch the value.
+
+          if (isValidDay && workingDayNumbers.has(currentDayNum)) {
+            cell.value = hoursPerDay;
+          }
+
+          // Apply styling ONLY if not disabled
+          if (!disableStyling) {
+            const colLetter = colNumberToLetter(colNum);
+
+            for (let styleRow = finalStyleStartRow; styleRow <= finalStyleEndRow; styleRow++) {
+              const styleCell = worksheet.getCell(`${colLetter}${styleRow}`);
+
+              if (isValidDay && isWeekend) {
+                // Verified Weekend -> Paint Gray
+                grayCols.push(colLetter);
+                styleCell.fill = {
+                  type: 'pattern',
+                  pattern: 'solid',
+                  fgColor: { argb: 'FFD3D3D3' }
+                };
+              } else {
+                // Not a Weekend (Weekday OR Empty Column) -> Force Clear Fill
+                // This is necessary because the template seems to be pre-filled with gray
+                styleCell.fill = {
+                  type: 'pattern',
+                  pattern: 'none'
+                };
+              }
+            }
+          }
+        }
+      }
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+
+      const finalFileName = (timesheetFileName || `Timesheet_${timesheetClient.name.replace(/[^a-zA-Z0-9]/g, '_')}_${timesheetRecord.month.replace('-', '_')}`).trim();
+      const fileName = finalFileName.endsWith('.xlsx') ? finalFileName : `${finalFileName}.xlsx`;
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      // Save timesheet configuration
+      const timesheetData: WorkRecordTimesheetInput = {
+        clientId: timesheetClient.id!,
+        workRecordId: timesheetRecord.id,
+        month: timesheetRecord.month,
+        prompt: timesheetPrompt || null,
+        templateBase64: timesheetMonthTemplate || null,
+        templateName: timesheetMonthTemplateName || null,
+      };
+
+      await saveTimesheet(userId, timesheetData, existingTimesheetId || undefined);
+
+      setShowTimesheetDialog(false);
+      setTimesheetRecord(null);
+      setTimesheetClient(null);
+      setTimesheetPrompt('');
+      setTimesheetMonthTemplate(null);
+      setTimesheetMonthTemplateName('');
+      setExistingTimesheetId(null);
+    } catch (error: any) {
+      console.error('Error generating timesheet:', error);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      setTimesheetError(`Failed to generate timesheet: ${errorMessage}`);
+    } finally {
+      setIsGeneratingTimesheet(false);
+    }
+  };
+
+  const formatMonthYear = (monthStr: string): string => {
+    try {
+      const [year, month] = monthStr.split('-');
+      const date = new Date(parseInt(year), parseInt(month) - 1, 1);
+      return format(date, 'MMMM yyyy');
+    } catch {
+      return monthStr;
+    }
+  };
+
+  const getClientName = (clientId: string): string => {
+    return clients.find((c) => c.id === clientId)?.name || 'Unknown Client';
+  };
+
+  const getInvoiceForRecord = (recordId: string): Document | undefined => {
+    return invoices.find(
+      (inv) => inv.workRecordId === recordId && inv.type === 'invoice'
+    );
+  };
+
+  const getTimesheetForRecord = (recordId: string): Document | undefined => {
+    return invoices.find(
+      (inv) => inv.workRecordId === recordId && inv.type === 'timesheet'
+    );
   };
 
   // ============================================
   // Render
   // ============================================
 
-  if (loading) {
+  if (isLoading) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <Loader2 className="animate-spin text-indigo-600" size={48} />
+      <div className="flex items-center justify-center h-64">
+        <Loader2 size={32} className="animate-spin text-indigo-600" />
       </div>
     );
   }
 
   return (
-    <div className="p-8 max-w-7xl mx-auto">
+    <div className="h-full overflow-auto p-4 sm:p-6 lg:p-8">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div>
-          <h2 className="text-2xl font-bold text-slate-800 dark:text-white flex items-center gap-2">
-            <Briefcase className="text-indigo-600" />
+          <h1 className="text-2xl font-bold text-slate-800 dark:text-white flex items-center gap-2">
+            <Briefcase size={28} className="text-indigo-600" />
             Work Records
-          </h2>
-          <p className="text-slate-500 dark:text-slate-400 mt-1">
-            Manage your working days by client and month
+          </h1>
+          <p className="text-slate-600 dark:text-slate-400 mt-1">
+            Manage your working days and generate invoices
           </p>
         </div>
         <button
           onClick={onCreateWorkRecord}
-          className="flex items-center justify-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors"
+          className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors shadow-sm"
         >
-          <Plus size={18} />
+          <Plus size={20} />
           New Work Record
         </button>
       </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
-          <div className="text-sm text-slate-500 dark:text-slate-400">Total Records</div>
-          <div className="text-2xl font-bold text-slate-800 dark:text-white">
+      {/* Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+          <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400 text-sm mb-1">
+            <Briefcase size={16} />
+            Total Records
+          </div>
+          <div className="text-2xl font-bold text-slate-900 dark:text-white">
             {stats.totalRecords}
           </div>
         </div>
-        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
-          <div className="text-sm text-slate-500 dark:text-slate-400">Total Days Worked</div>
-          <div className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+          <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400 text-sm mb-1">
+            <Clock size={16} />
+            Total Days
+          </div>
+          <div className="text-2xl font-bold text-slate-900 dark:text-white">
             {stats.totalDays}
           </div>
         </div>
-        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
-          <div className="text-sm text-slate-500 dark:text-slate-400">Active Clients</div>
-          <div className="text-2xl font-bold text-slate-800 dark:text-white">
-            {stats.uniqueClients}
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+          <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400 text-sm mb-1">
+            <FileSpreadsheet size={16} />
+            Invoices
+          </div>
+          <div className="text-2xl font-bold text-slate-900 dark:text-white">
+            {invoices.filter((inv) => inv.type === 'invoice').length}
+          </div>
+        </div>
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
+          <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400 text-sm mb-1">
+            <Calendar size={16} />
+            Timesheets
+          </div>
+          <div className="text-2xl font-bold text-slate-900 dark:text-white">
+            {invoices.filter((inv) => inv.type === 'timesheet').length}
           </div>
         </div>
       </div>
@@ -471,18 +1100,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           />
           <input
             type="text"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search by month or client..."
-            className="w-full pl-10 pr-4 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+            placeholder="Search by client or month..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full pl-10 pr-4 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
           />
         </div>
         <select
           value={selectedClientId}
           onChange={(e) => setSelectedClientId(e.target.value)}
-          className="px-4 py-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+          className="px-4 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none min-w-[200px]"
         >
-          <option value="all">All Clients</option>
+          <option value="">All Clients</option>
           {clients.map((c) => (
             <option key={c.id} value={c.id}>
               {c.name}
@@ -491,24 +1120,22 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         </select>
       </div>
 
-      {/* Work Records List */}
+      {/* Records List */}
       {sortedMonths.length === 0 ? (
-        <div className="text-center py-16 bg-slate-50 dark:bg-slate-900 rounded-xl border-2 border-dashed border-slate-200 dark:border-slate-700">
-          <Briefcase size={48} className="mx-auto mb-4 text-slate-300 dark:text-slate-700" />
-          <p className="text-slate-500 dark:text-slate-400 text-lg mb-2">
-            {searchTerm || selectedClientId !== 'all'
-              ? 'No work records match your filters'
-              : 'No work records yet'}
+        <div className="text-center py-12 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
+          <Briefcase size={48} className="mx-auto text-slate-300 dark:text-slate-600 mb-4" />
+          <h3 className="text-lg font-medium text-slate-900 dark:text-white mb-2">
+            No work records found
+          </h3>
+          <p className="text-slate-600 dark:text-slate-400 mb-4">
+            {searchQuery || selectedClientId
+              ? 'Try adjusting your filters'
+              : 'Create your first work record to get started'}
           </p>
-          <p className="text-slate-400 dark:text-slate-500 text-sm mb-4">
-            {searchTerm || selectedClientId !== 'all'
-              ? 'Try adjusting your search or filters'
-              : 'Create your first work record to start tracking working days'}
-          </p>
-          {!searchTerm && selectedClientId === 'all' && (
+          {!searchQuery && !selectedClientId && (
             <button
               onClick={onCreateWorkRecord}
-              className="inline-flex items-center gap-2 text-indigo-600 hover:text-indigo-700 font-medium"
+              className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
             >
               <Plus size={18} />
               Create Work Record
@@ -523,15 +1150,14 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden"
             >
               {/* Month Header */}
-              <div className="px-6 py-4 bg-slate-50 dark:bg-slate-800/50 border-b border-slate-100 dark:border-slate-700">
+              <div className="px-4 sm:px-6 py-4 bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
                 <div className="flex items-center gap-2">
                   <CalendarIcon size={18} className="text-indigo-600" />
-                  <h3 className="font-semibold text-slate-800 dark:text-white">
-                    {formatMonth(month)}
+                  <h3 className="font-semibold text-slate-900 dark:text-white">
+                    {formatMonthYear(month)}
                   </h3>
                   <span className="text-sm text-slate-500 dark:text-slate-400">
-                    ({groupedByMonth[month].length} record
-                    {groupedByMonth[month].length !== 1 ? 's' : ''})
+                    ({groupedByMonth[month].length} records)
                   </span>
                 </div>
               </div>
@@ -539,97 +1165,80 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               {/* Records for this month */}
               <div className="divide-y divide-slate-100 dark:divide-slate-700">
                 {groupedByMonth[month].map((record) => {
-                  const client = getClient(record.clientId);
-                  const isDeleting = deletingId === record.id;
-                  const isGeneratingInvoice = generatingInvoiceId === record.id;
-                  
-                  // Check if invoice already exists for this work record
-                  const existingInvoice = invoices.find(
-                    inv => inv.workRecordId === record.id && inv.month === record.month
-                  );
-                  const hasExistingInvoice = !!existingInvoice;
-                  const hasOutdatedInvoice = existingInvoice?.isOutdated === true;
-                  const hasNoTemplate = !client?.templateBase64;
+                  const client = clients.find((c) => c.id === record.clientId);
+                  const invoice = getInvoiceForRecord(record.id);
+                  const timesheet = getTimesheetForRecord(record.id);
+                  const hasOutdatedInvoice = invoice?.isOutdated;
 
                   return (
                     <div
                       key={record.id}
-                      className="px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors group"
+                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group"
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-4">
-                          <div className="w-10 h-10 bg-indigo-50 dark:bg-indigo-900/30 rounded-lg flex items-center justify-center text-indigo-600 dark:text-indigo-400">
-                            <Building2 size={20} />
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        {/* Left: Client Info */}
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center flex-shrink-0">
+                            <Building2 size={20} className="text-indigo-600" />
                           </div>
                           <div>
-                            <div className="flex items-center gap-2">
-                              <h4 className="font-medium text-slate-800 dark:text-white">
-                                {client?.name || 'Unknown Client'}
-                              </h4>
-                              {hasOutdatedInvoice && (
-                                <span
-                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                                  title="Work record changed after invoice was generated"
-                                >
-                                  <AlertTriangle size={12} />
-                                  Outdated
-                                </span>
-                              )}
-                              {hasNoTemplate && (
-                                <span
-                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
-                                  title="No template uploaded for this client"
-                                >
-                                  No Template
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-3 text-sm text-slate-500 dark:text-slate-400 mt-0.5">
+                            <h4 className="font-medium text-slate-900 dark:text-white">
+                              {client?.name || 'Unknown Client'}
+                            </h4>
+                            <div className="flex items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
                               <span className="flex items-center gap-1">
                                 <Clock size={14} />
-                                {record.totalWorkingDays} days
+                                {record.workingDays.length} days
                               </span>
-                              {record.notes && (
-                                <>
-                                  <span>•</span>
-                                  <span className="italic truncate max-w-[200px]">
-                                    {record.notes}
-                                  </span>
-                                </>
+                              {invoice && (
+                                <span
+                                  className={`flex items-center gap-1 ${hasOutdatedInvoice
+                                    ? 'text-amber-600 dark:text-amber-400'
+                                    : 'text-green-600 dark:text-green-400'
+                                    }`}
+                                >
+                                  <FileSpreadsheet size={14} />
+                                  {invoice.documentNumber}
+                                  {hasOutdatedInvoice && (
+                                    <AlertTriangle size={12} />
+                                  )}
+                                </span>
+                              )}
+                              {timesheet && (
+                                <span className="flex items-center gap-1 text-blue-600 dark:text-blue-400">
+                                  <Calendar size={14} />
+                                  {timesheet.documentNumber}
+                                </span>
                               )}
                             </div>
                           </div>
                         </div>
 
+                        {/* Right: Actions */}
                         <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button
                             onClick={() => openInvoiceDialog(record)}
-                            disabled={generatingInvoiceId === record.id || hasNoTemplate}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-                              hasOutdatedInvoice
-                                ? 'bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50'
-                                : hasExistingInvoice
-                                  ? 'bg-orange-100 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400 dark:hover:bg-orange-900/50'
-                                  : 'bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400 dark:hover:bg-green-900/50'
-                            }`}
-                            title={hasNoTemplate
-                              ? 'Upload a template for this client first'
-                              : hasOutdatedInvoice
-                                ? `Regenerate Invoice ${existingInvoice.documentNumber} - Work record changed!`
-                                : hasExistingInvoice
-                                  ? `Regenerate Invoice ${existingInvoice.documentNumber}`
-                                  : 'Generate Invoice'}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${hasOutdatedInvoice
+                              ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
+                              : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400'
+                              }`}
+                            title={hasOutdatedInvoice ? 'Regenerate Invoice' : 'Generate Invoice'}
                           >
-                            {generatingInvoiceId === record.id ? (
+                            <FileSpreadsheet size={16} />
+                            {invoice ? 'Regenerate' : 'Invoice'}
+                          </button>
+                          <button
+                            onClick={() => openTimesheetDialog(record)}
+                            disabled={isGeneratingTimesheet}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Generate Timesheet"
+                          >
+                            {isGeneratingTimesheet && timesheetRecord?.id === record.id ? (
                               <Loader2 size={16} className="animate-spin" />
                             ) : (
-                              <FileSpreadsheet size={16} />
+                              <Calendar size={16} />
                             )}
-                            {generatingInvoiceId === record.id
-                              ? 'Generating...'
-                              : hasOutdatedInvoice
-                                ? 'Regenerate'
-                                : 'Invoice'}
+                            Timesheet
                           </button>
                           <button
                             onClick={() => handleEdit(record.clientId, record.month)}
@@ -732,6 +1341,165 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                 )}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Timesheet Generation Dialog */}
+      {showTimesheetDialog && timesheetRecord && timesheetClient && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-800 dark:text-white flex items-center gap-2">
+                  <Calendar size={20} className="text-blue-600" />
+                  Generate Timesheet
+                </h3>
+                <p className="text-sm text-slate-500 dark:text-slate-400 font-medium ml-7">
+                  {timesheetClient.name} • {formatMonthYear(timesheetRecord.month)}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowTimesheetDialog(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Template Source Info */}
+            <div className="mb-6 p-4 bg-slate-50 dark:bg-slate-700/50 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400 mb-2">
+                <FileSpreadsheet size={16} />
+                <span className="font-medium">Template Source:</span>
+                <span className={timesheetMonthTemplate ? 'text-amber-600 dark:text-amber-400' : 'text-green-600 dark:text-green-400'}>
+                  {timesheetMonthTemplate ? 'Month-specific template' : 'Client default template'}
+                </span>
+              </div>
+              {(timesheetClient.timesheetTemplateName || timesheetClient.timesheetTemplateFileName) && !timesheetMonthTemplate && (
+                <p className="text-xs text-slate-500 dark:text-slate-500 ml-6">
+                  Using: {timesheetClient.timesheetTemplateName || timesheetClient.timesheetTemplateFileName}
+                </p>
+              )}
+            </div>
+
+            {/* Month-specific Template Upload */}
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                Month-specific Template (Optional)
+              </label>
+              {timesheetMonthTemplate ? (
+                <div className="flex items-center gap-4">
+                  <div className="flex-1 px-3 py-2 bg-slate-100 dark:bg-slate-700/50 border border-slate-200 dark:border-slate-600 rounded-lg text-sm text-slate-600 dark:text-slate-400 flex items-center gap-2">
+                    <FileSpreadsheet size={16} />
+                    {timesheetMonthTemplateName}
+                  </div>
+                  <button
+                    onClick={handleClearMonthTemplate}
+                    className="p-2 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors"
+                    title="Clear month template"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+              ) : (
+                <label className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-lg border border-slate-300 dark:border-slate-600 transition w-fit">
+                  <Upload size={18} />
+                  <span>Upload template for {formatMonthYear(timesheetRecord.month)}</span>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    onChange={handleMonthTemplateUpload}
+                    className="hidden"
+                  />
+                </label>
+              )}
+              <p className="text-xs text-slate-500 dark:text-slate-500 mt-1">
+                Upload a different template for this specific month, or leave empty to use the client's default template
+              </p>
+            </div>
+
+            {/* Filename Customization */}
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-2">
+                <FileSpreadsheet size={16} className="text-indigo-600" />
+                Filename
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={timesheetFileName}
+                  onChange={(e) => setTimesheetFileName(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                  placeholder="Enter filename"
+                />
+                <span className="text-slate-500 dark:text-slate-400 font-mono text-sm">.xlsx</span>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-500 mt-1">
+                Customize the download filename.
+              </p>
+            </div>
+
+            {/* Error Display */}
+            {timesheetError && (
+              <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-400 text-sm">
+                {timesheetError}
+              </div>
+            )}
+
+            {/* Working Days Summary */}
+            <div className="mb-6 p-4 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg">
+              <h4 className="text-sm font-medium text-blue-900 dark:text-blue-300 mb-2">
+                Working Days Summary
+              </h4>
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <span className="text-slate-600 dark:text-slate-400">Total Working Days:</span>
+                  <span className="ml-2 font-semibold text-slate-900 dark:text-white">
+                    {timesheetRecord.workingDays.length}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-600 dark:text-slate-400">Month:</span>
+                  <span className="ml-2 font-semibold text-slate-900 dark:text-white">
+                    {formatMonthYear(timesheetRecord.month)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowTimesheetDialog(false)}
+                className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleGenerateTimesheet}
+                disabled={isGeneratingTimesheet || (!timesheetMonthTemplate && !timesheetClient.timesheetTemplateBase64)}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isGeneratingTimesheet ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Generating...
+                  </>
+                ) : (
+                  <>
+                    <Download size={16} />
+                    Generate & Download
+                  </>
+                )}
+              </button>
+            </div>
+
+            {!timesheetClient.timesheetTemplateBase64 && (
+              <p className="text-center text-sm text-amber-600 dark:text-amber-400 mt-4">
+                No timesheet template configured. Please upload a template in the client settings.
+              </p>
+            )}
           </div>
         </div>
       )}

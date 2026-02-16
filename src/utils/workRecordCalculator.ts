@@ -134,7 +134,7 @@ export function calculateWorkingDays(
     } else if (isManuallyExcluded) {
       // Manual override: force exclude (e.g., personal leave)
       isWorking = false;
-    } else if (isHolidayDay) {
+    } else if (isHolidayDay && config.useGreekHolidays) {
       // Holiday: not working (unless manually included above)
       isWorking = false;
       holidayNames[dateStr] = holidayName;

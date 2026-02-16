@@ -44,5 +44,14 @@ service cloud.firestore {
       allow update: if isAuthorized() && isOwner(resource.data.userId);
       allow delete: if isAuthorized() && isOwner(resource.data.userId);
     }
+    
+    // NEW: Timesheets collection
+    // Stores month-specific timesheet templates and prompts
+    match /timesheets/{timesheetId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+    }
   }
 }

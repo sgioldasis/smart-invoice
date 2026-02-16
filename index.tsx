@@ -44,6 +44,7 @@ import { Auth } from './Auth';
 // NEW: Work Record Components
 import { WorkRecordManager } from './src/components/WorkRecordManager';
 import { WorkRecordList } from './src/components/WorkRecordList';
+import { deleteAllClientTimesheets } from './src/services/db';
 
 // NEW: Refactored Invoice Generator
 import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/InvoiceGenerator';
@@ -77,6 +78,10 @@ interface Client {
   templateBase64?: string;
   mapping: CellMapping;
   defaultUseGreekHolidays?: boolean;
+  // Timesheet template fields
+  timesheetTemplateName?: string;
+  timesheetTemplateBase64?: string;
+  timesheetPrompt?: string;
 }
 
 interface InvoiceRecord {
@@ -489,7 +494,10 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
     dailyRate: 500,
     currency: '$',
     mapping: { date: '', invoiceNumber: '', description: '', daysWorked: '', dailyRate: '', totalAmount: '' },
-    defaultUseGreekHolidays: false
+    defaultUseGreekHolidays: false,
+    timesheetTemplateName: undefined,
+    timesheetTemplateBase64: undefined,
+    timesheetPrompt: undefined
   });
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
@@ -537,6 +545,54 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
       }
     };
     reader.readAsBinaryString(file);
+  };
+
+  const handleTimesheetFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      const bstr = evt.target?.result as string;
+      const base64 = btoa(bstr);
+      setFormData(prev => ({ ...prev, timesheetTemplateName: file.name, timesheetTemplateBase64: base64 }));
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  const handleClearDefaultTimesheetTemplate = () => {
+    const confirmed = window.confirm(
+      'Are you sure you want to remove the default timesheet template?\n\nThe client will no longer have a default template for generating timesheets.'
+    );
+    
+    if (!confirmed) return;
+    
+    setFormData(prev => ({
+      ...prev,
+      timesheetTemplateName: undefined,
+      timesheetTemplateBase64: undefined
+    }));
+  };
+
+  const handleClearAllClientTimesheets = async () => {
+    if (!client?.id || !userId) {
+      alert('Please save the client first before clearing timesheet templates.');
+      return;
+    }
+    
+    const confirmed = window.confirm(
+      `Are you sure you want to delete ALL stored timesheet templates for "${formData.name}"?\n\nThis will remove all month-specific templates from Firebase. This action cannot be undone.`
+    );
+    
+    if (!confirmed) return;
+    
+    try {
+      const deletedCount = await deleteAllClientTimesheets(userId, client.id);
+      alert(`Successfully deleted ${deletedCount} timesheet template(s) for "${formData.name}".`);
+    } catch (error: any) {
+      console.error('Error clearing timesheet templates:', error);
+      alert(`Failed to delete timesheet templates: ${error?.message || 'Unknown error'}`);
+    }
   };
 
   return (
@@ -640,15 +696,16 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
             </div>
           </div>
 
+          {/* Invoice Template Section */}
           <div className="border-t border-slate-100 dark:border-slate-700 pt-6">
             <h3 className="font-semibold text-slate-800 dark:text-slate-200 mb-4 flex items-center gap-2">
               <FileSpreadsheet className="text-green-600 dark:text-green-500" size={20} />
-              Excel Template Configuration
+              Invoice Excel Template
             </h3>
             
             <div className="flex items-center gap-4 mb-6">
               <label className="cursor-pointer bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-600 transition flex items-center gap-2">
-                <Plus size={16} /> Upload Client's Template (.xlsx)
+                <Plus size={16} /> Upload Invoice Template (.xlsx)
                 <input type="file" accept=".xlsx" className="hidden" onChange={handleFileChange} />
               </label>
               {formData.templateName && (
@@ -675,18 +732,88 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
                   <label className="block text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold mb-1">
                     {key.replace(/([A-Z])/g, ' $1').trim()} Cell
                   </label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     placeholder="e.g. B4"
                     className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-sm text-slate-900 dark:text-white focus:border-indigo-500 outline-none"
                     value={(formData.mapping as any)[key]}
                     onChange={e => setFormData({
-                      ...formData, 
+                      ...formData,
                       mapping: { ...formData.mapping, [key]: e.target.value }
                     })}
                   />
                 </div>
               ))}
+            </div>
+          </div>
+
+          {/* Timesheet Template Section */}
+          <div className="border-t border-slate-100 dark:border-slate-700 pt-6">
+            <h3 className="font-semibold text-slate-800 dark:text-slate-200 mb-4 flex items-center gap-2">
+              <CalendarIcon className="text-blue-600 dark:text-blue-500" size={20} />
+              Timesheet Excel Template
+            </h3>
+            
+            <div className="space-y-4">
+              {/* Timesheet Template Upload */}
+              <div className="flex items-center gap-4">
+                <label className="cursor-pointer bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-600 transition flex items-center gap-2">
+                  <Plus size={16} /> Upload Timesheet Template (.xlsx)
+                  <input
+                    type="file"
+                    accept=".xlsx"
+                    className="hidden"
+                    onChange={handleTimesheetFileChange}
+                  />
+                </label>
+                {formData.timesheetTemplateName && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-sm text-slate-600 dark:text-slate-300 flex items-center gap-2">
+                      <Check size={16} className="text-green-500 dark:text-green-400" />
+                      {formData.timesheetTemplateName}
+                    </span>
+                    <button
+                      onClick={handleClearDefaultTimesheetTemplate}
+                      className="p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors"
+                      title="Remove default template"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Clear All Timesheet Templates Button */}
+              {client?.id && (
+                <div className="pt-2">
+                  <button
+                    onClick={handleClearAllClientTimesheets}
+                    className="flex items-center gap-2 px-4 py-2 text-red-600 bg-red-50 dark:bg-red-900/30 hover:bg-red-100 dark:hover:bg-red-900/50 border border-red-200 dark:border-red-800 rounded-lg transition-colors text-sm"
+                  >
+                    <Trash2 size={16} />
+                    <span>Clear All Stored Timesheet Templates</span>
+                  </button>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 ml-1">
+                    Delete all month-specific timesheet templates stored for this client in Firebase
+                  </p>
+                </div>
+              )}
+
+              {/* Timesheet Prompt */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-2">
+                  <Bot size={16} /> AI Prompt Instructions
+                </label>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">
+                  Describe how to fill out the timesheet for each month. The AI will use this prompt to generate the timesheet.
+                </p>
+                <textarea
+                  value={formData.timesheetPrompt || ''}
+                  onChange={e => setFormData({...formData, timesheetPrompt: e.target.value})}
+                  placeholder="e.g., Fill in the Date column with each working day of the month. Set the Project column to 'Main Project'. Calculate Total Hours as 8 hours per working day."
+                  className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white text-sm h-24 resize-none focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+              </div>
             </div>
           </div>
         </div>

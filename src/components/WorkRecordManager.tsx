@@ -20,7 +20,13 @@ import {
   Building2,
   Loader2,
   Info,
+  FileSpreadsheet,
+  Upload,
+  X,
+  Bot,
+  Download,
 } from 'lucide-react';
+import * as ExcelJS from 'exceljs';
 import {
   format,
   startOfMonth,
@@ -32,7 +38,7 @@ import {
   subMonths,
   parseISO,
 } from 'date-fns';
-import type { Client, WorkRecord, WorkRecordInput } from '../types';
+import type { Client, WorkRecord, WorkRecordInput, WorkRecordTimesheet } from '../types';
 import {
   calculateWorkingDaysAsync,
   fetchGreekHolidays,
@@ -45,6 +51,9 @@ import {
   getWorkRecordByMonth,
   saveWorkRecord,
   markDocumentsAsOutdated,
+  getTimesheetByWorkRecord,
+  saveTimesheet,
+  saveDocument,
 } from '../services/db';
 
 interface WorkRecordManagerProps {
@@ -84,6 +93,15 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
+
+  // Timesheet state
+  const [showTimesheetDialog, setShowTimesheetDialog] = useState(false);
+  const [timesheetTemplate, setTimesheetTemplate] = useState<WorkRecordTimesheet | null>(null);
+  const [timesheetPrompt, setTimesheetPrompt] = useState('');
+  const [monthTemplateFile, setMonthTemplateFile] = useState<File | null>(null);
+  const [monthTemplateBase64, setMonthTemplateBase64] = useState<string | null>(null);
+  const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
+  const [timesheetError, setTimesheetError] = useState<string | null>(null);
 
   // ============================================
   // Derived State
@@ -180,6 +198,29 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
 
     loadWorkRecord();
   }, [userId, selectedClientId, monthStr, selectedClient]);
+
+  // Load timesheet template for this work record
+  useEffect(() => {
+    const loadTimesheet = async () => {
+      if (!existingRecord?.id) {
+        setTimesheetTemplate(null);
+        setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
+        return;
+      }
+      
+      try {
+        const ts = await getTimesheetByWorkRecord(existingRecord.id);
+        setTimesheetTemplate(ts);
+        // Use month-specific prompt if available, otherwise fall back to client's default
+        setTimesheetPrompt(ts?.prompt || selectedClient?.timesheetPrompt || '');
+      } catch (err) {
+        console.error('Error loading timesheet template:', err);
+        setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
+      }
+    };
+    
+    loadTimesheet();
+  }, [existingRecord?.id, selectedClient]);
 
   // Recalculate when config changes
   useEffect(() => {
@@ -342,6 +383,276 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
 
   const getDayStatus = (day: Date): WorkDayStatus | undefined => {
     return dayStatuses.find((s) => isSameDay(s.date, day));
+  };
+
+  // ============================================
+  // Timesheet Handlers
+  // ============================================
+  
+  const handleOpenTimesheetDialog = () => {
+    if (!existingRecord) {
+      setSaveError('Please save the work record first before generating a timesheet.');
+      return;
+    }
+    setShowTimesheetDialog(true);
+    setTimesheetError(null);
+  };
+
+  const handleMonthTemplateUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const bstr = evt.target?.result as string;
+      const base64 = btoa(bstr);
+      setMonthTemplateFile(file);
+      setMonthTemplateBase64(base64);
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  const handleClearMonthTemplate = () => {
+    setMonthTemplateFile(null);
+    setMonthTemplateBase64(null);
+  };
+
+  const handleSaveTimesheetConfig = async () => {
+    if (!existingRecord || !selectedClient) return;
+
+    try {
+      await saveTimesheet(userId, {
+        clientId: selectedClientId,
+        workRecordId: existingRecord.id,
+        month: monthStr,
+        templateName: monthTemplateFile?.name || timesheetTemplate?.templateName || null,
+        templateBase64: monthTemplateBase64 || timesheetTemplate?.templateBase64 || null,
+        prompt: timesheetPrompt || null,
+      }, timesheetTemplate?.id);
+
+      // Refresh timesheet data
+      const updated = await getTimesheetByWorkRecord(existingRecord.id);
+      setTimesheetTemplate(updated);
+      setMonthTemplateFile(null);
+      setMonthTemplateBase64(null);
+    } catch (err) {
+      console.error('Error saving timesheet config:', err);
+      setTimesheetError('Failed to save timesheet configuration');
+    }
+  };
+
+  const handleGenerateTimesheet = async () => {
+    if (!selectedClient || !existingRecord) {
+      setTimesheetError('Please save the work record first');
+      return;
+    }
+
+    // Determine which template to use: month-specific or client default
+    const templateBase64 = monthTemplateBase64 || timesheetTemplate?.templateBase64 || selectedClient.timesheetTemplateBase64;
+    const templateName = monthTemplateFile?.name || timesheetTemplate?.templateName || selectedClient.timesheetTemplateName;
+    const prompt = timesheetPrompt || selectedClient.timesheetPrompt;
+
+    if (!templateBase64) {
+      setTimesheetError('No timesheet template available. Please upload a template in the client settings or for this month.');
+      return;
+    }
+
+    setGeneratingTimesheet(true);
+    setTimesheetError(null);
+
+    try {
+      // Save the configuration first
+      await handleSaveTimesheetConfig();
+
+      // Generate the timesheet
+      const workbook = new ExcelJS.Workbook();
+      
+      // Handle base64 data
+      let base64Data = templateBase64;
+      if (base64Data.includes(',')) {
+        base64Data = base64Data.split(',')[1];
+      }
+      base64Data = base64Data.replace(/\s/g, '');
+      
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
+        throw new Error('Invalid template data format');
+      }
+      
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      await workbook.xlsx.load(bytes.buffer);
+      const worksheet = workbook.worksheets[0];
+
+      // Simple approach: Only replace placeholders, don't add/remove rows or columns
+      // The template structure is preserved exactly as uploaded
+
+      // Basic: Fill in working days information
+      const workingDaysList = workingDays.map(dateStr => {
+        const date = parseISO(dateStr);
+        return {
+          date: format(date, 'dd/MM/yyyy'),
+          dayOfWeek: format(date, 'EEEE'),
+          dayNumber: format(date, 'd'),
+        };
+      });
+
+      // Replace placeholders throughout the worksheet
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          const cellValue = cell.value;
+          if (typeof cellValue === 'string') {
+            if (cellValue.includes('{{MONTH}}')) {
+              cell.value = cellValue.replace('{{MONTH}}', format(currentDate, 'MMMM yyyy'));
+            }
+            if (cellValue.includes('{{CLIENT}}')) {
+              cell.value = cellValue.replace('{{CLIENT}}', selectedClient.name);
+            }
+            if (cellValue.includes('{{TOTAL_DAYS}}')) {
+              cell.value = cellValue.replace('{{TOTAL_DAYS}}', String(workingDays.length));
+            }
+          }
+        });
+      });
+
+      // Fill working days only if mapping is configured
+      // This fills existing cells without creating new rows
+      if (selectedClient.timesheetMapping) {
+        const { dateColumn, hoursColumn, descriptionColumn, startRow } = selectedClient.timesheetMapping;
+        const firstDataRow = startRow || 2;
+
+        for (let i = 0; i < workingDaysList.length; i++) {
+          const day = workingDaysList[i];
+          const rowNum = firstDataRow + i;
+
+          // Only fill if the row already exists in the template
+          const row = worksheet.getRow(rowNum);
+          if (row && !row.hidden) {
+            if (dateColumn) {
+              const dateCell = worksheet.getCell(`${dateColumn}${rowNum}`);
+              if (!dateCell.value || typeof dateCell.value === 'string' && dateCell.value.includes('{{')) {
+                dateCell.value = day.date;
+              }
+            }
+
+            if (hoursColumn) {
+              const hoursCell = worksheet.getCell(`${hoursColumn}${rowNum}`);
+              if (!hoursCell.value || typeof hoursCell.value === 'string' && hoursCell.value.includes('{{')) {
+                hoursCell.value = 8;
+              }
+            }
+
+            if (descriptionColumn) {
+              const descCell = worksheet.getCell(`${descriptionColumn}${rowNum}`);
+              if (!descCell.value || typeof descCell.value === 'string' && descCell.value.includes('{{')) {
+                descCell.value = `Working day - ${day.dayOfWeek}`;
+              }
+            }
+          }
+        }
+      }
+
+      // Apply AI prompt instructions if provided
+      if (prompt) {
+        console.log('Applying AI prompt:', prompt);
+        
+        // Parse prompt for column assignments
+        const promptLower = prompt.toLowerCase();
+        
+        // Extract column letters from patterns like "column A", "col B", "column C"
+        const dateColumnMatch = promptLower.match(/date(?:\s+s)?(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
+        const hoursColumnMatch = promptLower.match(/hours?(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
+        const descColumnMatch = promptLower.match(/(?:desc|description)(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
+        
+        // Extract start row
+        const startRowMatch = promptLower.match(/(?:start|begin)(?:\s+from)?\s+row\s+(\d+)/);
+        
+        // Extract hours per day
+        const hoursPerDayMatch = promptLower.match(/(\d+)\s+hours?\s+(?:per|each)\s+day/);
+        
+        const parsedMapping = {
+          dateColumn: dateColumnMatch ? dateColumnMatch[1].toUpperCase() : selectedClient.timesheetMapping?.dateColumn,
+          hoursColumn: hoursColumnMatch ? hoursColumnMatch[1].toUpperCase() : selectedClient.timesheetMapping?.hoursColumn,
+          descriptionColumn: descColumnMatch ? descColumnMatch[1].toUpperCase() : selectedClient.timesheetMapping?.descriptionColumn,
+          startRow: startRowMatch ? parseInt(startRowMatch[1]) : (selectedClient.timesheetMapping?.startRow || 2),
+          hoursPerDay: hoursPerDayMatch ? parseInt(hoursPerDayMatch[1]) : 8,
+        };
+        
+        console.log('Parsed mapping from prompt:', parsedMapping);
+        
+        // Apply the parsed mapping if columns were found in prompt
+        if (dateColumnMatch || hoursColumnMatch || descColumnMatch) {
+          const firstDataRow = parsedMapping.startRow;
+          
+          for (let i = 0; i < workingDaysList.length; i++) {
+            const day = workingDaysList[i];
+            const rowNum = firstDataRow + i;
+
+            // Only fill if the row exists in the template
+            const row = worksheet.getRow(rowNum);
+            if (row) {
+              if (parsedMapping.dateColumn) {
+                const dateCell = worksheet.getCell(`${parsedMapping.dateColumn}${rowNum}`);
+                dateCell.value = day.date;
+              }
+
+              if (parsedMapping.hoursColumn) {
+                const hoursCell = worksheet.getCell(`${parsedMapping.hoursColumn}${rowNum}`);
+                hoursCell.value = parsedMapping.hoursPerDay;
+              }
+
+              if (parsedMapping.descriptionColumn) {
+                const descCell = worksheet.getCell(`${parsedMapping.descriptionColumn}${rowNum}`);
+                descCell.value = `Working day - ${day.dayOfWeek}`;
+              }
+            }
+          }
+        }
+      }
+
+      // Generate filename
+      const monthName = format(currentDate, 'MMMM').toUpperCase();
+      const year = format(currentDate, 'yyyy');
+      const safeClientName = (selectedClient.name || 'Client').replace(/\s+/g, '_');
+      const fileName = `Timesheet-${safeClientName}-${monthName}-${year}.xlsx`;
+
+      // Download the file
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+
+      // Save document record
+      await saveDocument(userId, {
+        clientId: selectedClient.id,
+        workRecordId: existingRecord.id,
+        type: 'timesheet',
+        documentNumber: `TS-${monthStr}`,
+        month: monthStr,
+        workingDays: workingDays.length,
+        workingDaysArray: workingDays,
+        dailyRate: selectedClient.dailyRate,
+        totalAmount: workingDays.length * selectedClient.dailyRate,
+        fileName,
+      });
+
+      setShowTimesheetDialog(false);
+    } catch (err: any) {
+      console.error('Error generating timesheet:', err);
+      setTimesheetError(err?.message || 'Failed to generate timesheet');
+    } finally {
+      setGeneratingTimesheet(false);
+    }
   };
 
   // ============================================
@@ -532,7 +843,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
           <button
             onClick={handleSave}
             disabled={saving}
-            className="w-full flex items-center justify-center gap-2 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded-lg font-medium transition-colors"
+            className="w-full flex items-center justify-center gap-2 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded-lg font-medium transition-colors mb-3"
           >
             {saving ? (
               <>
@@ -546,6 +857,22 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
               </>
             )}
           </button>
+
+          {/* Timesheet Button */}
+          <button
+            onClick={handleOpenTimesheetDialog}
+            disabled={!existingRecord}
+            className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
+          >
+            <FileSpreadsheet size={18} />
+            Timesheet
+          </button>
+          
+          {!existingRecord && (
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 text-center">
+              Save the work record to generate timesheet
+            </p>
+          )}
         </div>
       </div>
 
@@ -665,6 +992,154 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
           })}
         </div>
       </div>
+
+      {/* Timesheet Dialog */}
+      {showTimesheetDialog && existingRecord && selectedClient && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex justify-between items-center">
+              <h2 className="text-xl font-bold text-slate-800 dark:text-white flex items-center gap-2">
+                <FileSpreadsheet className="text-blue-600 dark:text-blue-400" />
+                Generate Timesheet
+              </h2>
+              <button
+                onClick={() => setShowTimesheetDialog(false)}
+                className="p-2 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg text-slate-500 dark:text-slate-400"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6">
+              {/* Template Source Info */}
+              <div className="bg-blue-50 dark:bg-blue-900/20 p-4 rounded-lg">
+                <h3 className="font-medium text-blue-800 dark:text-blue-300 mb-2 flex items-center gap-2">
+                  <Info size={16} />
+                  Template Source
+                </h3>
+                <p className="text-sm text-blue-700 dark:text-blue-400">
+                  {monthTemplateFile ? (
+                    <>Using newly uploaded template: <strong>{monthTemplateFile.name}</strong></>
+                  ) : timesheetTemplate?.templateName ? (
+                    <>Using saved month-specific template: <strong>{timesheetTemplate.templateName}</strong></>
+                  ) : selectedClient.timesheetTemplateName ? (
+                    <>Using client default template: <strong>{selectedClient.timesheetTemplateName}</strong></>
+                  ) : (
+                    <span className="text-amber-600 dark:text-amber-400">No template available. Please upload one below or in client settings.</span>
+                  )}
+                </p>
+              </div>
+
+              {/* Month-Specific Template Upload */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                  Month-Specific Template (Optional)
+                </label>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                  Upload a different template for {format(currentDate, 'MMMM yyyy')} only.
+                  If not provided, the client's default template will be used.
+                </p>
+                <div className="flex items-center gap-4">
+                  <label className="cursor-pointer bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-600 transition flex items-center gap-2">
+                    <Upload size={16} /> Upload Template
+                    <input
+                      type="file"
+                      accept=".xlsx"
+                      className="hidden"
+                      onChange={handleMonthTemplateUpload}
+                    />
+                  </label>
+                  {monthTemplateFile && (
+                    <span className="text-sm text-slate-600 dark:text-slate-300 flex items-center gap-2">
+                      <Check size={16} className="text-green-500" />
+                      {monthTemplateFile.name}
+                      <button
+                        onClick={handleClearMonthTemplate}
+                        className="p-1 hover:bg-slate-200 dark:hover:bg-slate-600 rounded"
+                      >
+                        <X size={14} className="text-slate-400" />
+                      </button>
+                    </span>
+                  )}
+                  {!monthTemplateFile && timesheetTemplate?.templateName && (
+                    <span className="text-sm text-slate-600 dark:text-slate-300 flex items-center gap-2">
+                      <Check size={16} className="text-green-500" />
+                      {timesheetTemplate.templateName}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Prompt Input */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-2">
+                  <Bot size={16} />
+                  AI Prompt Instructions
+                </label>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mb-2">
+                  Describe how to fill out the timesheet. This will be saved for this month and used when generating.
+                </p>
+                <textarea
+                  value={timesheetPrompt}
+                  onChange={(e) => setTimesheetPrompt(e.target.value)}
+                  placeholder="e.g., Fill in the Date column with each working day of the month. Set the Project column to 'Main Project'. Calculate Total Hours as 8 hours per working day."
+                  className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white text-sm h-24 resize-none focus:ring-2 focus:ring-blue-500 outline-none"
+                />
+                {!timesheetPrompt && selectedClient.timesheetPrompt && (
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Client default prompt will be used if left empty.
+                  </p>
+                )}
+              </div>
+
+              {/* Error Message */}
+              {timesheetError && (
+                <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <Info size={16} className="text-red-600 dark:text-red-400 mt-0.5 flex-shrink-0" />
+                    <div className="text-red-700 dark:text-red-300 text-sm">{timesheetError}</div>
+                  </div>
+                </div>
+              )}
+
+              {/* Working Days Summary */}
+              <div className="bg-slate-50 dark:bg-slate-800/50 p-4 rounded-lg">
+                <h4 className="font-medium text-slate-700 dark:text-slate-300 mb-2">Working Days Summary</h4>
+                <p className="text-sm text-slate-600 dark:text-slate-400">
+                  {workingDays.length} working days in {format(currentDate, 'MMMM yyyy')}
+                </p>
+              </div>
+            </div>
+
+            {/* Dialog Actions */}
+            <div className="p-6 border-t border-slate-200 dark:border-slate-700 flex justify-end gap-3">
+              <button
+                onClick={() => setShowTimesheetDialog(false)}
+                className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleGenerateTimesheet}
+                disabled={generatingTimesheet || (!selectedClient.timesheetTemplateBase64 && !timesheetTemplate?.templateBase64 && !monthTemplateBase64)}
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white rounded-lg font-medium flex items-center gap-2"
+              >
+                {generatingTimesheet ? (
+                  <>
+                    <Loader2 size={18} className="animate-spin" />
+                    Generating...
+                  </>
+                ) : (
+                  <>
+                    <Download size={18} />
+                    Generate & Download
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
