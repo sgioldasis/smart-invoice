@@ -1,15 +1,48 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Only allow s.gioldasis@gmail.com to access data
-    match /clients/{clientId} {
-      allow read, write: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
-      allow create: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com' && request.resource.data.userId == request.auth.uid;
+    // Helper function to check if user is authorized
+    function isAuthorized() {
+      return request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
     }
     
+    // Helper function to check if user owns the resource
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Clients collection (existing)
+    match /clients/{clientId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+    }
+    
+    // LEGACY: Invoices collection (maintained for migration period)
     match /invoices/{invoiceId} {
-      allow read, write: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
-      allow create: if request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com' && request.resource.data.userId == request.auth.uid;
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+    }
+    
+    // NEW: Work Records collection
+    // Stores the days worked for each client/month
+    match /workRecords/{workRecordId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+    }
+    
+    // NEW: Documents collection (replaces invoices for new data)
+    // Stores generated documents (invoices, timesheets) linked to work records
+    match /documents/{documentId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
     }
   }
 }

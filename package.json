@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@dataconnect/generated": "file:src/dataconnect-generated",
     "@google/genai": "^1.41.0",
     "date-fns": "^4.1.0",
     "exceljs": "^4.4.0",

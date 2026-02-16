@@ -30,7 +30,9 @@ import {
   Eye,
   BarChart3,
   TrendingUp,
-  Users
+  Users,
+  ClipboardList,
+  Database,
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
 import { motion } from 'framer-motion';
@@ -39,6 +41,22 @@ import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
 import { format, getDaysInMonth, startOfMonth, endOfMonth, eachDayOfInterval, isWeekend, isSameDay, parseISO, addMonths, subMonths, addDays } from 'date-fns';
 import { Auth } from './Auth';
+
+// NEW: Work Record Components
+import { WorkRecordManager } from './src/components/WorkRecordManager';
+import { WorkRecordList } from './src/components/WorkRecordList';
+
+// NEW: Refactored Invoice Generator
+import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/InvoiceGenerator';
+
+// NEW: Document Manager
+import { DocumentManager } from './src/components/DocumentManager';
+
+// NEW: Migration Tool
+import { MigrationTool } from './src/components/MigrationTool';
+
+// NEW: Import WorkRecord types
+import type { WorkRecord, Document } from './src/types';
 
 // --- Types ---
 
@@ -203,6 +221,33 @@ const DB = {
       console.error('Error deleting invoice:', e);
       throw e;
     }
+  },
+  // NEW: Work Record methods
+  getWorkRecordByMonth: async (userId: string, clientId: string, month: string): Promise<WorkRecord | null> => {
+    try {
+      const q = query(
+        collection(db, 'workRecords'),
+        where('userId', '==', userId),
+        where('clientId', '==', clientId),
+        where('month', '==', month)
+      );
+      const snapshot = await getDocs(q);
+      if (snapshot.empty) return null;
+      const doc = snapshot.docs[0];
+      return { ...doc.data(), id: doc.id } as WorkRecord;
+    } catch (e) {
+      console.error('Error fetching work record:', e);
+      return null;
+    }
+  },
+  saveDocument: async (document: Document) => {
+    try {
+      const docRef = doc(db, 'documents', document.id);
+      await setDoc(docRef, document, { merge: true });
+    } catch (e) {
+      console.error('Error saving document:', e);
+      throw e;
+    }
   }
 };
 
@@ -295,7 +340,14 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
           </h1>
         </div>
         <nav className="flex-1 p-4 space-y-2">
-          <button 
+          <button
+            onClick={() => setActiveTab('workrecords')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'workrecords' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+          >
+            <ClipboardList size={20} />
+            <span>Work Records</span>
+          </button>
+          <button
             onClick={() => setActiveTab('dashboard')}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'dashboard' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
           >
@@ -310,11 +362,25 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
             <span>Invoice Generator</span>
           </button>
           <button
+             onClick={() => setActiveTab('documents')}
+             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'documents' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+          >
+            <FileText size={20} />
+            <span>Documents</span>
+          </button>
+          <button
              onClick={() => setActiveTab('analytics')}
              className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'analytics' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
           >
             <BarChart3 size={20} />
             <span>Invoice Analytics</span>
+          </button>
+          <button
+             onClick={() => setActiveTab('migration')}
+             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'migration' ? 'bg-amber-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+          >
+            <Database size={20} />
+            <span>Migration</span>
           </button>
         </nav>
         <div className="p-4 border-t border-slate-800 space-y-4">
@@ -406,7 +472,7 @@ const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
             <h3 className="text-lg font-bold text-slate-800 dark:text-white mb-1">{client.name}</h3>
             <p className="text-xs text-slate-500 mb-3">Issued by: {client.issuerName || 'Me'}</p>
             <div className="flex justify-between text-sm text-slate-500 dark:text-slate-400 mt-4 pt-4 border-t border-slate-100 dark:border-slate-700">
-              <span>Rate: {client.currency} {client.dailyRate}/day</span>
+              <span>Rate: {client.dailyRate} {client.currency}/day</span>
               <span className={client.templateBase64 ? "text-green-600 dark:text-green-400 flex items-center gap-1" : "text-amber-500 dark:text-amber-400 flex items-center gap-1"}>
                 {client.templateBase64 ? <><Check size={14} /> Template</> : "No Template"}
               </span>
@@ -681,6 +747,9 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
   
   // Holidays State
   const [holidaysMap, setHolidaysMap] = useState<Record<string, Record<string, string>>>({});
+  
+  // NEW: Work Record State
+  const [workRecord, setWorkRecord] = useState<WorkRecord | null>(null);
 
   const selectedClient = useMemo(() => clients.find(c => c.id === selectedClientId), [clients, selectedClientId]);
   const historyInvoices = useMemo(() => invoices.filter(i => i.status === 'generated').sort((a,b) => b.month.localeCompare(a.month)), [invoices]);
@@ -1175,11 +1244,11 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                  </div>
                  <div className="flex justify-between">
                    <span className="">Rate</span>
-                   <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.currency} {selectedClient?.dailyRate}</span>
+                   <span className="font-medium text-slate-900 dark:text-white">{selectedClient?.dailyRate} {selectedClient?.currency}</span>
                  </div>
                  <div className="pt-2 border-t border-slate-200 dark:border-slate-700 flex justify-between text-lg font-bold text-indigo-600 dark:text-indigo-400">
                    <span>Total</span>
-                   <span>{selectedClient?.currency} {stats.amount.toLocaleString()}</span>
+                   <span>{stats.amount.toLocaleString()} {selectedClient?.currency}</span>
                  </div>
                </div>
 
@@ -1238,7 +1307,7 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                       <div className="flex justify-between items-center mb-2">
                         <span className="font-bold text-slate-800 dark:text-white">{rec.month}</span>
                         <div className="flex items-center gap-2">
-                          <span className="font-bold text-indigo-600 dark:text-indigo-400">{selectedClient?.currency} {recStats.amount.toLocaleString()}</span>
+                          <span className="font-bold text-indigo-600 dark:text-indigo-400">{recStats.amount.toLocaleString()} {selectedClient?.currency}</span>
                         </div>
                       </div>
                       <div className="flex justify-between items-center mb-3">
@@ -1386,11 +1455,11 @@ const InvoiceGenerator = ({ userId, clientId }: { userId: string; clientId?: str
                 </span>
                 <span className="text-slate-400">×</span>
                 <span className="text-slate-600 dark:text-slate-400">
-                  {selectedClient?.currency} <span className="font-medium text-slate-800 dark:text-white">{selectedClient?.dailyRate}</span>
+                  <span className="font-medium text-slate-800 dark:text-white">{selectedClient?.dailyRate}</span> {selectedClient?.currency}
                 </span>
                 <span className="text-slate-400">=</span>
                 <span className="font-bold text-indigo-600 dark:text-indigo-400">
-                  {selectedClient?.currency} {previewStats?.amount.toLocaleString()}
+                  {previewStats?.amount.toLocaleString()} {selectedClient?.currency}
                 </span>
               </div>
             </div>
@@ -1817,7 +1886,7 @@ const Analytics = ({ userId }: { userId: string }) => {
           
           <h4 className="text-sm font-medium text-slate-400 mb-1">Total Revenue</h4>
           <p className="text-3xl font-bold text-white tracking-tight">
-            €{invoices.reduce((sum, inv) => {
+            {invoices.reduce((sum, inv) => {
               // Use stored totalAmount if available, otherwise calculate dynamically
               if (inv.totalAmount !== undefined && inv.totalAmount !== null) {
                 return sum + inv.totalAmount;
@@ -1840,7 +1909,7 @@ const Analytics = ({ userId }: { userId: string }) => {
                 }
               });
               return sum + (days * client.dailyRate + inv.manualAdjustment);
-            }, 0).toLocaleString()}
+            }, 0).toLocaleString()} EUR
           </p>
           <div className="mt-2 flex items-center gap-1 text-xs text-emerald-400">
             <TrendingUp size={14} />
@@ -1905,10 +1974,20 @@ const Analytics = ({ userId }: { userId: string }) => {
 // --- Main App ---
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard'); // dashboard | generator | analytics
+  const [activeTab, setActiveTab] = useState('workrecords'); // workrecords | dashboard | generator | analytics
+  
+  // Client state
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [viewState, setViewState] = useState<'list' | 'edit'>('list');
   const [targetClientId, setTargetClientId] = useState<string | undefined>();
+  
+  // Work Record state
+  const [workRecordView, setWorkRecordView] = useState<'list' | 'edit'>('list');
+  const [editingWorkRecordClientId, setEditingWorkRecordClientId] = useState<string | undefined>();
+  const [editingWorkRecordMonth, setEditingWorkRecordMonth] = useState<string | undefined>();
+  
+  // Invoice Generator state (for regeneration)
+  const [invoiceGenInvoiceNumber, setInvoiceGenInvoiceNumber] = useState<string | undefined>();
   
   // Auth State
   const [user, setUser] = useState<{ uid: string; email: string | null } | null>(null);
@@ -1966,6 +2045,35 @@ export default function App() {
     setActiveTab('generator');
   };
 
+  // Work Record handlers
+  const handleCreateWorkRecord = () => {
+    setEditingWorkRecordClientId(undefined);
+    setEditingWorkRecordMonth(undefined);
+    setWorkRecordView('edit');
+  };
+
+  const handleEditWorkRecord = (clientId: string, month: string) => {
+    setEditingWorkRecordClientId(clientId);
+    setEditingWorkRecordMonth(month);
+    setWorkRecordView('edit');
+  };
+
+  const handleWorkRecordSaved = () => {
+    setWorkRecordView('list');
+    setEditingWorkRecordClientId(undefined);
+    setEditingWorkRecordMonth(undefined);
+  };
+
+  const handleGenerateInvoiceFromWorkRecord = (clientId: string, month: string, existingInvoiceNumber?: string) => {
+    // Navigate to generator tab with pre-selected client and month
+    setActiveTab('generator');
+    // Store the client/month for the invoice generator to use
+    setEditingWorkRecordClientId(clientId);
+    setEditingWorkRecordMonth(month);
+    // If regenerating, store the existing invoice number to reuse
+    setInvoiceGenInvoiceNumber(existingInvoiceNumber);
+  };
+
   if (authLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-50 dark:bg-slate-950">
@@ -1982,6 +2090,7 @@ export default function App() {
       setActiveTab={(tab: string) => {
         setActiveTab(tab);
         setViewState('list');
+        setWorkRecordView('list');
       }}
       theme={theme}
       toggleTheme={toggleTheme}
@@ -2000,6 +2109,25 @@ export default function App() {
         </div>
       ) : (
         <>
+          {/* Work Records Tab */}
+          {activeTab === 'workrecords' && workRecordView === 'list' && (
+            <WorkRecordList
+              userId={user.uid}
+              onEditWorkRecord={handleEditWorkRecord}
+              onCreateWorkRecord={handleCreateWorkRecord}
+              onGenerateInvoice={handleGenerateInvoiceFromWorkRecord}
+            />
+          )}
+          
+          {activeTab === 'workrecords' && workRecordView === 'edit' && (
+            <WorkRecordManager
+              userId={user.uid}
+              initialClientId={editingWorkRecordClientId}
+              initialMonth={editingWorkRecordMonth}
+            />
+          )}
+
+          {/* Clients/Dashboard Tab */}
           {activeTab === 'dashboard' && viewState === 'list' && (
             <Dashboard
               userId={user.uid}
@@ -2017,12 +2145,43 @@ export default function App() {
             />
           )}
 
+          {/* Invoice Generator Tab */}
           {activeTab === 'generator' && (
-            <InvoiceGenerator userId={user.uid} clientId={targetClientId} />
+            <NewInvoiceGenerator
+              userId={user.uid}
+              initialClientId={editingWorkRecordClientId || targetClientId}
+              initialMonth={editingWorkRecordMonth}
+              existingInvoiceNumber={invoiceGenInvoiceNumber}
+            />
           )}
 
+          {/* Document Manager Tab */}
+          {activeTab === 'documents' && (
+            <DocumentManager
+              userId={user.uid}
+              onRegenerateDocument={(clientId, month, documentNumber) => {
+                setTargetClientId(clientId);
+                setEditingWorkRecordMonth(month);
+                setInvoiceGenInvoiceNumber(documentNumber);
+                setActiveTab('generator');
+              }}
+              onViewWorkRecord={(clientId, month) => {
+                setEditingWorkRecordClientId(clientId);
+                setEditingWorkRecordMonth(month);
+                setWorkRecordView('edit');
+                setActiveTab('workrecords');
+              }}
+            />
+          )}
+
+          {/* Analytics Tab */}
           {activeTab === 'analytics' && (
             <Analytics userId={user.uid} />
+          )}
+
+          {/* Migration Tab */}
+          {activeTab === 'migration' && (
+            <MigrationTool userId={user.uid} />
           )}
         </>
       )}
