@@ -4,7 +4,7 @@
  * Generates invoices from work records using client Excel templates.
  */
 import React, { useState, useEffect, useMemo } from 'react';
-import { format, getDaysInMonth, startOfMonth, addDays, isWeekend, parseISO } from 'date-fns';
+import { format, getDaysInMonth, startOfMonth, addDays, isWeekend, parseISO, endOfMonth } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import { FileSpreadsheet, Loader2, Calendar, ChevronLeft, ChevronRight, AlertTriangle, CheckCircle } from 'lucide-react';
 import { Client, WorkRecord, Document } from '../types';
@@ -42,6 +42,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [invoiceNumber, setInvoiceNumber] = useState(existingInvoiceNumber || '');
   const [existingDocuments, setExistingDocuments] = useState<Document[]>([]);
+  const [allInvoices, setAllInvoices] = useState<Document[]>([]);
   const [holidayNames, setHolidayNames] = useState<Record<string, string>>({});
   const [dayStatuses, setDayStatuses] = useState<WorkDayStatus[]>([]);
 
@@ -182,19 +183,35 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
     loadDocuments();
   }, [userId, selectedClientId]);
 
+  // Load ALL invoices for global numbering
+  useEffect(() => {
+    const loadAllInvoices = async () => {
+      try {
+        const docs = await getDocuments(userId, { type: 'invoice' });
+        setAllInvoices(docs.filter((d) => d.type === 'invoice'));
+      } catch (err) {
+        console.error('Error loading all invoices:', err);
+      }
+    };
+    loadAllInvoices();
+  }, [userId]);
+
   // ============================================
   // Handlers
   // ============================================
-  const getNextInvoiceNumber = (documents: Document[]): string => {
-    const prefix = format(currentDate, 'yyyy-MM');
-    const existingNumbers = documents
-      .filter((d) => d.documentNumber?.startsWith(prefix))
+  const getNextInvoiceNumber = (): string => {
+    // Extract numeric values from all invoice document numbers
+    const existingNumbers = allInvoices
       .map((d) => {
-        const match = d.documentNumber?.match(/-(\d+)$/);
-        return match ? parseInt(match[1], 10) : 0;
-      });
+        // Try to parse the document number as a number
+        const num = parseInt(d.documentNumber, 10);
+        return isNaN(num) ? 0 : num;
+      })
+      .filter(n => n > 0);
+    
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-    return `${prefix}-${String(maxNum + 1).padStart(2, '0')}`;
+    // Pad with at least 2 digits
+    return String(maxNum + 1).padStart(2, '0');
   };
 
   const isWorkingDay = (date: Date): boolean => {
@@ -278,8 +295,9 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         }
       };
 
-      // Set invoice metadata
-      setCell(mapping.date, format(new Date(), 'dd/MM/yyyy'));
+      // Set invoice metadata - date is always end of the month
+      const endOfMonthDate = endOfMonth(currentDate);
+      setCell(mapping.date, format(endOfMonthDate, 'dd/MM/yyyy'));
       setCell(mapping.invoiceNumber, invoiceNumber);
       setCell(mapping.daysWorked, stats.days);
       setCell(mapping.dailyRate, selectedClient.dailyRate);
@@ -466,13 +484,30 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
                   type="text"
                   value={invoiceNumber}
                   onChange={(e) => setInvoiceNumber(e.target.value)}
-                  placeholder={getNextInvoiceNumber(existingDocuments)}
+                  placeholder={getNextInvoiceNumber()}
                   className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
                 />
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  Suggested: {getNextInvoiceNumber(existingDocuments)}
+                  Suggested: {getNextInvoiceNumber()}
                 </p>
               </div>
+
+              {/* Generated Filename Preview */}
+              {invoiceNumber.trim() && selectedClient && (
+                <div className="mb-4">
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                    Generated Filename
+                  </label>
+                  <div className="px-3 py-2 bg-slate-100 dark:bg-slate-700/50 border border-slate-200 dark:border-slate-600 rounded-lg text-sm text-slate-600 dark:text-slate-400 font-mono break-all">
+                    {(() => {
+                      const monthName = format(currentDate, 'MMMM').toUpperCase();
+                      const year = format(currentDate, 'yyyy');
+                      const safeClientName = (selectedClient.name || 'Client').replace(/\s+/g, '_');
+                      return `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+                    })()}
+                  </div>
+                </div>
+              )}
 
               {/* Stats */}
               <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400 mb-4">

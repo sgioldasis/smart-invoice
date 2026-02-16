@@ -24,8 +24,9 @@ import {
   Search,
   FileSpreadsheet,
   AlertTriangle,
+  X,
 } from 'lucide-react';
-import { format, parseISO } from 'date-fns';
+import { format, parseISO, endOfMonth } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import type { Client, WorkRecord, Document } from '../types';
 import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument } from '../services/db';
@@ -53,6 +54,14 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [generatingInvoiceId, setGeneratingInvoiceId] = useState<string | null>(null);
+
+  // Invoice generation dialog state
+  const [showInvoiceDialog, setShowInvoiceDialog] = useState(false);
+  const [dialogRecord, setDialogRecord] = useState<WorkRecord | null>(null);
+  const [dialogClient, setDialogClient] = useState<Client | null>(null);
+  const [invoiceNumber, setInvoiceNumber] = useState('');
+  const [generatedFileName, setGeneratedFileName] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
 
   // ============================================
   // Derived State
@@ -169,19 +178,31 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     onEditWorkRecord?.(clientId, month);
   };
 
-  const getNextInvoiceNumber = (clientId: string, month: string): string => {
-    const prefix = `${month}`;
+  const getNextInvoiceNumber = (): string => {
+    // Get all invoice numbers across ALL clients
     const existingNumbers = invoices
-      .filter((d) => d.clientId === clientId && d.documentNumber?.startsWith(prefix))
       .map((d) => {
-        const match = d.documentNumber?.match(/-(\d+)$/);
-        return match ? parseInt(match[1], 10) : 0;
-      });
+        // Try to parse the document number as a number
+        const num = parseInt(d.documentNumber, 10);
+        return isNaN(num) ? 0 : num;
+      })
+      .filter(n => n > 0);
+    
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-    return `${prefix}-${String(maxNum + 1).padStart(2, '0')}`;
+    // Pad with at least 2 digits
+    return String(maxNum + 1).padStart(2, '0');
   };
 
-  const handleGenerateInvoice = async (record: WorkRecord) => {
+  // Helper to generate filename from invoice number
+  const generateFileName = (invNum: string, clientName: string, month: string): string => {
+    const monthName = format(parseISO(`${month}-01`), 'MMMM').toUpperCase();
+    const year = month.substring(0, 4);
+    const safeClientName = (clientName || 'Client').replace(/\s+/g, '_');
+    return `${invNum}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+  };
+
+  // Open invoice generation dialog
+  const openInvoiceDialog = (record: WorkRecord) => {
     const client = clients.find((c) => c.id === record.clientId);
     if (!client) {
       alert('Client not found');
@@ -193,18 +214,33 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       return;
     }
 
-    setGeneratingInvoiceId(record.id);
+    const existingInvoice = invoices.find(
+      inv => inv.workRecordId === record.id && inv.month === record.month
+    );
+
+    const initialInvoiceNumber = existingInvoice?.documentNumber || getNextInvoiceNumber();
+    const initialFileName = generateFileName(initialInvoiceNumber, client.name, record.month);
+
+    setDialogRecord(record);
+    setDialogClient(client);
+    setInvoiceNumber(initialInvoiceNumber);
+    setGeneratedFileName(initialFileName);
+    setShowInvoiceDialog(true);
+  };
+
+  const handleGenerateInvoice = async () => {
+    if (!dialogRecord || !dialogClient) return;
+
+    const record = dialogRecord;
+    const client = dialogClient;
+
+    setIsGenerating(true);
 
     try {
-      // Get existing documents for this client
-      const existingDocuments = invoices.filter((d) => d.clientId === client.id);
-      
       // Get existing invoice for this work record
       const existingInvoice = invoices.find(
         inv => inv.workRecordId === record.id && inv.month === record.month
       );
-      
-      const invoiceNumber = existingInvoice?.documentNumber || getNextInvoiceNumber(client.id, record.month);
       const stats = {
         days: record.totalWorkingDays,
         amount: record.totalWorkingDays * client.dailyRate,
@@ -262,8 +298,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
       const currentDate = parseISO(`${record.month}-01`);
 
-      // Set invoice metadata
-      setCell(mapping.date, format(new Date(), 'dd/MM/yyyy'));
+      // Set invoice metadata - date is always end of the month
+      const monthDate = parseISO(`${record.month}-01`);
+      const endOfMonthDate = endOfMonth(monthDate);
+      setCell(mapping.date, format(endOfMonthDate, 'dd/MM/yyyy'));
       setCell(mapping.invoiceNumber, invoiceNumber);
       setCell(mapping.daysWorked, stats.days);
       setCell(mapping.dailyRate, client.dailyRate);
@@ -312,11 +350,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       const a = document.createElement('a');
       a.href = url;
       
-      // Construct filename: <invoice-number>-<client_name_with_underscores>-Invoice-<MONTH>-<YEAR>
-      const monthName = format(currentDate, 'MMMM').toUpperCase();
-      const year = format(currentDate, 'yyyy');
-      const safeClientName = (client.name || 'Client').replace(/\s+/g, '_');
-      const fileName = `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+      // Use the generated filename from state
+      const fileName = generatedFileName;
       
       a.download = fileName;
       document.body.appendChild(a);
@@ -325,7 +360,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       window.URL.revokeObjectURL(url);
 
       // 4. Save document to database
-      const safeClientNameForDb = (client.name || 'Client').replace(/\s+/g, '_');
       const documentData = {
         clientId: client.id,
         workRecordId: record.id,
@@ -336,7 +370,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         workingDaysArray: record.workingDays,
         dailyRate: client.dailyRate,
         totalAmount: stats.amount,
-        fileName: `${invoiceNumber}-${safeClientNameForDb}-Invoice-${monthName}-${year}.xlsx`,
+        fileName: fileName,
         isPaid: false,
         isOutdated: false,
       };
@@ -349,11 +383,16 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       const updatedDocs = await getDocuments(userId, { type: 'invoice' });
       setInvoices(updatedDocs);
 
+      // Close dialog
+      setShowInvoiceDialog(false);
+      setDialogRecord(null);
+      setDialogClient(null);
+
     } catch (err: any) {
       console.error('Error generating invoice:', err);
       alert(err?.message || 'Failed to generate invoice');
     } finally {
-      setGeneratingInvoiceId(null);
+      setIsGenerating(false);
     }
   };
 
@@ -564,8 +603,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
                         <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button
-                            onClick={() => handleGenerateInvoice(record)}
-                            disabled={isGeneratingInvoice || hasNoTemplate}
+                            onClick={() => openInvoiceDialog(record)}
+                            disabled={generatingInvoiceId === record.id || hasNoTemplate}
                             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                               hasOutdatedInvoice
                                 ? 'bg-red-100 text-red-700 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50'
@@ -573,7 +612,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                   ? 'bg-orange-100 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400 dark:hover:bg-orange-900/50'
                                   : 'bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400 dark:hover:bg-green-900/50'
                             }`}
-                            title={hasNoTemplate 
+                            title={hasNoTemplate
                               ? 'Upload a template for this client first'
                               : hasOutdatedInvoice
                                 ? `Regenerate Invoice ${existingInvoice.documentNumber} - Work record changed!`
@@ -581,15 +620,15 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                   ? `Regenerate Invoice ${existingInvoice.documentNumber}`
                                   : 'Generate Invoice'}
                           >
-                            {isGeneratingInvoice ? (
+                            {generatingInvoiceId === record.id ? (
                               <Loader2 size={16} className="animate-spin" />
                             ) : (
                               <FileSpreadsheet size={16} />
                             )}
-                            {isGeneratingInvoice 
-                              ? 'Generating...' 
-                              : hasOutdatedInvoice 
-                                ? 'Regenerate' 
+                            {generatingInvoiceId === record.id
+                              ? 'Generating...'
+                              : hasOutdatedInvoice
+                                ? 'Regenerate'
                                 : 'Invoice'}
                           </button>
                           <button
@@ -623,6 +662,77 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Invoice Generation Dialog */}
+      {showInvoiceDialog && dialogRecord && dialogClient && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-lg w-full p-6">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-semibold text-slate-800 dark:text-white">
+                Generate Invoice
+              </h3>
+              <button
+                onClick={() => setShowInvoiceDialog(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                Invoice Number
+              </label>
+              <input
+                type="text"
+                value={invoiceNumber}
+                onChange={(e) => {
+                  const newValue = e.target.value;
+                  setInvoiceNumber(newValue);
+                  setGeneratedFileName(generateFileName(newValue, dialogClient.name, dialogRecord.month));
+                }}
+                className="w-full px-3 py-2 bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                placeholder="e.g., 2026-01-01"
+              />
+            </div>
+
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                Generated Filename
+              </label>
+              <div className="px-3 py-2 bg-slate-100 dark:bg-slate-700/50 border border-slate-200 dark:border-slate-600 rounded-lg text-sm text-slate-600 dark:text-slate-400 font-mono break-all">
+                {generatedFileName}
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowInvoiceDialog(false)}
+                className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleGenerateInvoice}
+                disabled={isGenerating || !invoiceNumber.trim()}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isGenerating ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Generating...
+                  </>
+                ) : (
+                  <>
+                    <FileSpreadsheet size={16} />
+                    Generate & Download
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
