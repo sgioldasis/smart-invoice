@@ -30,7 +30,7 @@ import {
   Bot,
   Download,
 } from 'lucide-react';
-import { format, parseISO, endOfMonth, getDaysInMonth } from 'date-fns';
+import { format, parseISO, endOfMonth, getDaysInMonth, isValid } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import type { Client, WorkRecord, Document, DocumentInput, WorkRecordTimesheet, WorkRecordTimesheetInput } from '../types';
 import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet } from '../services/db';
@@ -102,16 +102,35 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         baseName = baseName.replace(/YYYY/g, currentYear);
         baseName = baseName.replace(/MM/g, currentMonthNum);
 
+        // Replace YYYY-MM, YYYY_MM, YYYY.MM patterns (e.g., 2024-02 -> 2026-04)
+        baseName = baseName.replace(/\b20\d{2}([-_.])\d{2}\b/g, (match, sep) => {
+          return `${currentYear}${sep}${currentMonthNum}`;
+        });
+
         // Replace 4-digit years (e.g. 2024 -> 2026)
         baseName = baseName.replace(/\b20\d{2}\b/g, currentYear);
 
+        // Replace 2-digit year after apostrophe or quote (e.g., '24 -> '26)
+        const twoDigitYear = currentYear.substring(2);
+        baseName = baseName.replace(/['"]\d{2}\b/g, `'${twoDigitYear}`);
+
         // Replace full month names (case insensitive)
-        const monthsFull = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+        const monthsFull = [
+          'January', 'February', 'March', 'April', 'May', 'June',
+          'July', 'August', 'September', 'October', 'November', 'December'
+        ];
         monthsFull.forEach(m => {
           const re = new RegExp(m, 'gi');
-          if (re.test(baseName)) {
-            baseName = baseName.replace(re, currentMonthName);
-          }
+          baseName = baseName.replace(re, currentMonthName);
+        });
+
+        // Also handle short month names if they are likely months (e.g., Jan, Feb)
+        // Only if they are standalone words to avoid mangling names
+        const monthsShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const currentMonthShort = format(recordDate, 'MMM');
+        monthsShort.forEach(m => {
+          const re = new RegExp(`\\b${m}\\b`, 'gi');
+          baseName = baseName.replace(re, currentMonthShort);
         });
       } catch (e) {
         console.error('Error parsing date for filename:', e);
@@ -435,7 +454,34 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       }
       await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
 
-      const worksheet = workbook.worksheets[0];
+      // NEW: Best-Match Worksheet Selection
+      let worksheet = workbook.worksheets.find(ws => ws.state === 'visible' || !ws.state) || workbook.worksheets[0];
+      let maxScore = -1;
+
+      for (const ws of workbook.worksheets) {
+        if (ws.state === 'hidden') continue;
+
+        // Base score: boost if name contains current month or "Timesheet"
+        let dateScore = 0;
+        const wsNameLower = ws.name.toLowerCase();
+        const monthName = format(parseISO(timesheetRecord.month + '-01'), 'MMMM').toLowerCase();
+        if (wsNameLower.includes(monthName)) dateScore += 10;
+        if (wsNameLower.includes('timesheet')) dateScore += 5;
+
+        for (let r = 1; r <= 30; r++) {
+          const v = ws.getRow(r).getCell(1).value;
+          // Check for Date objects, numbers (1-31), or month/date strings in Column A
+          if (v instanceof Date || (typeof v === 'number' && v >= 1 && v <= 31)) dateScore += 1;
+          if (typeof v === 'string' && (v.toLowerCase().includes('date') || v.toLowerCase().includes(monthName) || v.toLowerCase().match(/^\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4}$/))) dateScore += 5;
+        }
+
+        if (dateScore > maxScore) {
+          maxScore = dateScore;
+          worksheet = ws;
+          console.log(`HEURISTIC: Candidate worksheet "${ws.name}" has score ${dateScore}`);
+        }
+      }
+      console.log(`HEURISTIC: Final target worksheet "${worksheet.name}" (Score: ${maxScore})`);
 
       // REMOVED: Clear ALL fills. User requested to preserve template formatting.
       // worksheet.eachRow((row) => { ... });
@@ -499,7 +545,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       // This fills existing cells without creating new rows
       if (timesheetClient.timesheetMapping) {
         const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetClient.timesheetMapping;
-        const firstDataRow = startRow || 2;
+        // HEURISTIC: If startRow is 3 or missing, and we're seeing an offset issue, Row 2 is likely the real start.
+        const firstDataRow = (startRow === 3 || !startRow) ? 2 : startRow;
 
         for (let i = 0; i < workingDaysList.length; i++) {
           const day = workingDaysList[i];
@@ -614,6 +661,216 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         const periodCell = worksheet.getCell(periodCellValue.toUpperCase());
         periodCell.value = periodText;
         console.log(`Updated period cell ${periodCellValue.toUpperCase()} to: ${periodText}`);
+      }
+
+      // NEW: Vertical Fill Support (e.g. "In column B, fill a 1 for working days... If it's a day off put a 0 in column B and 'Other' in column C")
+      const verticalFillMatch = promptLower.match(/in\s+col(?:umn)?\s+([a-z]+),?\s+fill\s+(?:a\s+)?(?!the\b|all\b)([^, ]+).*?date\s+in.*?col(?:umn)?\s+([a-z]+)/i);
+
+      // AUTO-TRIGGER: Always attempt to sync dates in Col A and rename sheet if not explicitly disabled
+      // This ensures Column A is ALWAYS correct for the target month.
+      const syncDisabled = promptLower.includes('do not sync') || promptLower.includes('keep dates');
+      const baseDateFillMatch = promptLower.match(/in\s+col(?:umn)?\s+([a-z]+)\s+fill\s+(?:the\s+)?dates/i);
+      const dateFillMatch = !syncDisabled ? (baseDateFillMatch || [null, verticalFillMatch?.[3] || 'A']) : null;
+
+      const renameSheetMatch = !syncDisabled ? (promptLower.match(/rename\s+(?:the\s+)?(?:excel\s+)?worksheet|replace\s+(?:the\s+)?(?:excel\s+)?worksheet'?s\s+name/i) || [true]) : null;
+
+      if (verticalFillMatch || dateFillMatch) {
+        // Target columns for status fill (if present)
+        const targetCol = verticalFillMatch ? verticalFillMatch[1].toUpperCase() : null;
+        const fillValueStr = verticalFillMatch ? verticalFillMatch[2] : null;
+        const refCol = (verticalFillMatch ? verticalFillMatch[3] : dateFillMatch?.[1])?.toUpperCase() as string;
+        const fillValue = fillValueStr ? (isNaN(Number(fillValueStr)) ? fillValueStr : Number(fillValueStr)) : null;
+
+        // Safety: If targetCol is the same as refCol, it's likely a mis-match
+        const finalTargetCol = (targetCol && targetCol !== refCol) ? targetCol : null;
+
+        // Day off settings
+        let dayOffValue: any = null;
+        let dayOffCol: string | null = null;
+        let dayOffLabel: string | null = null;
+        let dayOffLabelCol: string | null = null;
+
+        const dayOffMatch = (timesheetPrompt || '').match(/day\s+off.*?put\s+(?:a\s+)?([^ ]+)\s+in\s+col(?:umn)?\s+([a-z]+)(?:\s+and\s+['"]([^'"]+)['"]\s+in\s+col(?:umn)?\s+([a-z]+))?/i);
+
+        if (dayOffMatch) {
+          const val = dayOffMatch[1];
+          dayOffValue = isNaN(Number(val)) ? val : Number(val);
+          dayOffCol = dayOffMatch[2].toUpperCase();
+          dayOffLabel = dayOffMatch[3];
+          dayOffLabelCol = dayOffMatch[4]?.toUpperCase();
+        }
+
+        if (dayOffMatch) {
+          console.log(`DAY OFF LOGIC: col ${dayOffCol}=${dayOffValue}${dayOffLabel ? `, col ${dayOffLabelCol}="${dayOffLabel}"` : ''}`);
+        }
+
+        const workingDaySet = new Set(timesheetRecord.workingDays);
+        const excludedDatesSet = new Set(timesheetRecord.config.excludedDates);
+        const recordMonth = timesheetRecord.month; // "YYYY-MM"
+        const [yearNum, monthNum] = recordMonth.split('-').map(Number);
+        const daysInMonth = getDaysInMonth(parseISO(recordMonth + '-01'));
+
+        // PASS 1: DATE SYNC (if requested)
+        if (dateFillMatch) {
+          console.log(`DATE SYNC DETECTED: Overwriting col ${refCol} with dates for ${recordMonth}`);
+
+          let startRow = -1;
+          const getDayVal = (cell: any) => {
+            let v = cell.value;
+            if (v && typeof v === 'object' && 'result' in v) v = v.result;
+            if (!v) return -1;
+
+            // 1. Try native Date object
+            if (v instanceof Date) return v.getDate();
+
+            // 2. Try parsing string as a date
+            if (typeof v === 'string') {
+              const d = new Date(v);
+              if (!isNaN(d.getTime())) return d.getDate();
+
+              // 3. Last resort: look for any standalone 1..31 in the string
+              // This catches "Thursday, Jan 1, 2026" or "1-Jan"
+              const standaloneMatch = v.match(/\b([0123]?\d)\b/);
+              if (standaloneMatch) {
+                const num = parseInt(standaloneMatch[1]);
+                if (num >= 1 && num <= 31) return num;
+              }
+            }
+
+            if (typeof v === 'number') {
+              if (v >= 1 && v <= 31) return v;
+              if (v > 40000) return new Date(Math.round((v - 25569) * 86400 * 1000)).getDate();
+            }
+            return -1;
+          };
+
+          // FINAL DECISION: User has repeatedly confirmed start row is 2.
+          // We force 2 to ensure no leftover March/January dates.
+          startRow = 2;
+          console.log(`DEEP SYNC: Forced startRow to 2 for definitive alignment.`);
+
+          if (startRow !== -1) {
+            // Fill 31 slots (max days in a month)
+            for (let i = 0; i < 31; i++) {
+              const currentRow = startRow + i;
+              const cell = worksheet.getRow(currentRow).getCell(refCol);
+              if (i < daysInMonth) {
+                // Create a UTC date at midnight to avoid local timezone shifts
+                const dUTC = new Date(Date.UTC(yearNum, monthNum - 1, i + 1));
+                // Convert to Excel serial date (25569 is Jan 1, 1970)
+                // Using an integer ensures NO time portion in Excel
+                const serialDate = (dUTC.getTime() / (24 * 60 * 60 * 1000)) + 25569;
+                cell.value = serialDate;
+                cell.numFmt = 'dddd, mmmm d, yyyy'; // descriptive: "Wednesday, April 1, 2026"
+              } else {
+                // Clear leftover days (e.g. days 31 in a 30-day month)
+                // BUT ONLY if they look like dates! This preserves "Total" or "Signature" lines.
+                if (getDayVal(cell) !== -1) {
+                  cell.value = null;
+                  if (targetCol) worksheet.getRow(currentRow).getCell(targetCol).value = null;
+                  if (dayOffCol) worksheet.getRow(currentRow).getCell(dayOffCol).value = null;
+                  if (dayOffLabelCol) worksheet.getRow(currentRow).getCell(dayOffLabelCol).value = null;
+                }
+              }
+            }
+          }
+        }
+
+        // PASS 2: STATUS FILL
+
+        worksheet.eachRow((row) => {
+          const dateCell = row.getCell(refCol);
+          const targetCell = finalTargetCol ? row.getCell(finalTargetCol) : null;
+
+          // Extract value, handling formula results
+          let actualValue = dateCell.value;
+          if (actualValue && typeof actualValue === 'object' && 'result' in actualValue) {
+            actualValue = (actualValue as any).result;
+          }
+
+          if (actualValue === null || actualValue === undefined) return;
+
+          let foundDate: string | null = null;
+          let dateObj: Date | null = null;
+
+          // 1. Try to get a Date object
+          if (actualValue instanceof Date && !isNaN(actualValue.getTime())) {
+            dateObj = actualValue;
+          } else if (typeof actualValue === 'number') {
+            if (actualValue > 40000) {
+              // Serial date (Excel format)
+              dateObj = new Date(Math.round((actualValue - 25569) * 86400 * 1000));
+            } else if (actualValue >= 1 && actualValue <= 31) {
+              // Simple day number (e.g. 1, 2, 3 in a list)
+              const [y, m] = recordMonth.split('-').map(Number);
+              dateObj = new Date(y, m - 1, actualValue);
+            }
+          } else if (typeof actualValue === 'string') {
+            const parsed = parseISO(actualValue);
+            if (isValid(parsed)) {
+              dateObj = parsed;
+            } else {
+              // Try parsing simple day number from string
+              const num = parseInt(actualValue);
+              if (!isNaN(num) && num >= 1 && num <= 31) {
+                const [y, m] = recordMonth.split('-').map(Number);
+                dateObj = new Date(y, m - 1, num);
+              }
+            }
+          }
+
+          if (dateObj && isValid(dateObj)) {
+            // 2. Extract YYYY-MM-DD strings for both Local and UTC
+            const toStr = (d: Date, useUTC: boolean) => {
+              const yy = useUTC ? d.getUTCFullYear() : d.getFullYear();
+              const mm = (useUTC ? d.getUTCMonth() : d.getMonth()) + 1;
+              const dd = useUTC ? d.getUTCDate() : d.getDate();
+              return `${yy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+            };
+
+            const localStr = toStr(dateObj, false);
+            const utcStr = toStr(dateObj, true);
+
+            // 3. HYPER-ROBUST MATCHING: Use the representation that matches the record's data
+            // This bypasses any timezone shift issues (e.g. UTC midnight parsed as previous day local)
+            if (workingDaySet.has(localStr) || excludedDatesSet.has(localStr)) {
+              foundDate = localStr;
+            } else if (workingDaySet.has(utcStr) || excludedDatesSet.has(utcStr)) {
+              foundDate = utcStr;
+            } else if (localStr.startsWith(recordMonth)) {
+              foundDate = localStr;
+            } else if (utcStr.startsWith(recordMonth)) {
+              foundDate = utcStr;
+            }
+          }
+
+          if (foundDate) {
+            const isWorkingValue = workingDaySet.has(foundDate);
+            const isManualExclusion = excludedDatesSet.has(foundDate);
+
+            if (isWorkingValue) {
+              // Tier 1: Working Day
+              if (targetCell) targetCell.value = fillValue;
+            } else if (isManualExclusion) {
+              // Tier 2: Explicitly excluded weekday (Day Off)
+              if (dayOffCol) {
+                const doCell = row.getCell(dayOffCol);
+                doCell.value = dayOffValue;
+              }
+              if (dayOffLabelCol && dayOffLabel) {
+                const dolCell = row.getCell(dayOffLabelCol);
+                dolCell.value = dayOffLabel;
+              }
+            } else {
+              // Tier 3: Standard Non-Working Day (Weekend/Holiday)
+              if (targetCell) targetCell.value = null;
+              if (dayOffLabelCol) {
+                const dolCell = row.getCell(dayOffLabelCol);
+                dolCell.value = null;
+              }
+            }
+          }
+        });
       }
 
       // Helper function to convert column letter to number (A=1, B=2, etc.)
@@ -943,6 +1200,38 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               }
             }
           }
+        }
+      }
+
+      // NEW: Worksheet Renaming
+      if (renameSheetMatch) {
+        try {
+          const oldName = worksheet.name || '';
+          const date = parseISO(timesheetRecord.month + '-01');
+          let newName = format(date, 'MMMM yyyy'); // Default: April 2026
+
+          // Attempt to preserve style
+          if (oldName.match(/^[a-z]{3}\s+'?\d{2}$/i)) {
+            // Style: Jan '26 or Jan 26
+            const quote = oldName.includes("'") ? "'" : "";
+            newName = format(date, `MMM ${quote}yy`);
+          } else if (oldName.match(/^[a-z]+\s+\d{4}$/i)) {
+            // Style: January 2026
+            newName = format(date, 'MMMM yyyy');
+          } else if (oldName.match(/^\d{2}[-.]\d{4}$/) || oldName.match(/^\d{4}[-.]\d{2}$/)) {
+            // Style: 04.2026 or 2026-04
+            const sep = oldName.includes('.') ? '.' : '-';
+            if (oldName.startsWith('20')) {
+              newName = format(date, `yyyy${sep}MM`);
+            } else {
+              newName = format(date, `MM${sep}yyyy`);
+            }
+          }
+
+          worksheet.name = newName;
+          console.log(`Renamed worksheet from "${oldName}" to: "${newName}"`);
+        } catch (e) {
+          console.error('Error renaming worksheet:', e);
         }
       }
 
