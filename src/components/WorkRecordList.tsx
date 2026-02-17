@@ -696,20 +696,19 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         });
       });
 
-      // Fill working days only if mapping is configured
-      // This fills existing cells without creating new rows
-      // Use template's mapping if available, otherwise fall back to client's mapping
+      // DISABLED: Legacy mapping code that overwrites template headers
+      // The prompt-based approach (C11, C13-AG13, etc.) should be used instead
+      // This prevents dates from being written to column A when using the Tesselate template
+      /*
       const timesheetMapping = timesheetTemplate?.timesheetMapping || timesheetClient.timesheetMapping;
       if (timesheetMapping) {
         const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetMapping;
-        // HEURISTIC: If startRow is 3 or missing, and we're seeing an offset issue, Row 2 is likely the real start.
         const firstDataRow = (startRow === 3 || !startRow) ? 2 : startRow;
 
         for (let i = 0; i < workingDaysList.length; i++) {
           const day = workingDaysList[i];
           const rowNum = firstDataRow + i;
 
-          // Only fill if the row already exists in the template
           const row = worksheet.getRow(rowNum);
           if (row && !row.hidden) {
             if (dateColumn) {
@@ -735,6 +734,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           }
         }
       }
+      */
 
       // Parse prompt using Gemini AI (with fallback to local parsing)
       console.log('Timesheet prompt value:', timesheetPrompt);
@@ -823,13 +823,14 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       // NEW: Vertical Fill Support (e.g. "In column B, fill a 1 for working days... If it's a day off put a 0 in column B and 'Other' in column C")
       const verticalFillMatch = promptLower.match(/in\s+col(?:umn)?\s+([a-z]+),?\s+fill\s+(?:a\s+)?(?!the\b|all\b)([^, ]+).*?date\s+in.*?col(?:umn)?\s+([a-z]+)/i);
 
-      // AUTO-TRIGGER: Always attempt to sync dates in Col A and rename sheet if not explicitly disabled
-      // This ensures Column A is ALWAYS correct for the target month.
-      const syncDisabled = promptLower.includes('do not sync') || promptLower.includes('keep dates');
+      // ONLY sync dates when explicitly requested in the prompt
+      // Do NOT auto-trigger - this prevents overwriting template data
       const baseDateFillMatch = promptLower.match(/in\s+col(?:umn)?\s+([a-z]+)\s+fill\s+(?:the\s+)?dates/i);
-      const dateFillMatch = !syncDisabled ? (baseDateFillMatch || [null, verticalFillMatch?.[3] || 'A']) : null;
+      // Use vertical fill's date column only if vertical fill is also requested
+      const dateFillMatch = baseDateFillMatch || (verticalFillMatch ? [null, verticalFillMatch[3]] : null);
 
-      const renameSheetMatch = !syncDisabled ? (promptLower.match(/rename\s+(?:the\s+)?(?:excel\s+)?worksheet|replace\s+(?:the\s+)?(?:excel\s+)?worksheet'?s\s+name/i) || [true]) : null;
+      // Only rename worksheet if explicitly requested
+      const renameSheetMatch = promptLower.match(/rename\s+(?:the\s+)?(?:excel\s+)?worksheet|replace\s+(?:the\s+)?(?:excel\s+)?worksheet'?s\s+name/i);
 
       if (verticalFillMatch || dateFillMatch) {
         // Target columns for status fill (if present)
@@ -907,11 +908,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           console.log(`DEEP SYNC: Forced startRow to 2 for definitive alignment.`);
 
           if (startRow !== -1) {
-            // Fill 31 slots (max days in a month)
-            for (let i = 0; i < 31; i++) {
+            // Fill days only in rows that are meant for dates
+            // Only write to cells that are empty, contain placeholders, or look like existing dates
+            for (let i = 0; i < daysInMonth; i++) {
               const currentRow = startRow + i;
               const cell = worksheet.getRow(currentRow).getCell(refCol);
-              if (i < daysInMonth) {
+              
+              // Check if cell is safe to overwrite (empty, placeholder, or existing date)
+              const currentValue = cell.value;
+              const isEmpty = currentValue === null || currentValue === undefined;
+              const isPlaceholder = typeof currentValue === 'string' && currentValue.includes('{{');
+              const isExistingDate = getDayVal(cell) !== -1;
+              
+              // Only write if the cell looks like it's meant for dates
+              if (isEmpty || isPlaceholder || isExistingDate) {
                 // Create a UTC date at midnight to avoid local timezone shifts
                 const dUTC = new Date(Date.UTC(yearNum, monthNum - 1, i + 1));
                 // Convert to Excel serial date (25569 is Jan 1, 1970)
@@ -920,14 +930,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                 cell.value = serialDate;
                 cell.numFmt = 'dddd, mmmm d, yyyy'; // descriptive: "Wednesday, April 1, 2026"
               } else {
-                // Clear leftover days (e.g. days 31 in a 30-day month)
-                // BUT ONLY if they look like dates! This preserves "Total" or "Signature" lines.
-                if (getDayVal(cell) !== -1) {
-                  cell.value = null;
-                  if (targetCol) worksheet.getRow(currentRow).getCell(targetCol).value = null;
-                  if (dayOffCol) worksheet.getRow(currentRow).getCell(dayOffCol).value = null;
-                  if (dayOffLabelCol) worksheet.getRow(currentRow).getCell(dayOffLabelCol).value = null;
-                }
+                console.log(`Skipping row ${currentRow} col ${refCol} - contains non-date value:`, currentValue);
+              }
+            }
+            
+            // Clear leftover days (e.g. days 31 in a 30-day month)
+            // BUT ONLY if they look like dates! This preserves "Total" or "Signature" lines.
+            for (let i = daysInMonth; i < 31; i++) {
+              const currentRow = startRow + i;
+              const cell = worksheet.getRow(currentRow).getCell(refCol);
+              if (getDayVal(cell) !== -1) {
+                cell.value = null;
+                if (targetCol) worksheet.getRow(currentRow).getCell(targetCol).value = null;
+                if (dayOffCol) worksheet.getRow(currentRow).getCell(dayOffCol).value = null;
+                if (dayOffLabelCol) worksheet.getRow(currentRow).getCell(dayOffLabelCol).value = null;
               }
             }
           }

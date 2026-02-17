@@ -285,22 +285,76 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
     return documents.filter((doc) => {
       // Search in ID
       if (doc.id.toLowerCase().includes(query)) return true;
-      // Search in data values
-      const dataStr = JSON.stringify(doc.data).toLowerCase();
-      return dataStr.includes(query);
+      
+      // Search in document type
+      const docType = doc.data?.type;
+      if (docType && String(docType).toLowerCase().includes(query)) return true;
+      
+      // Search in document number (invoice number or timesheet number)
+      const docNumber = doc.data?.documentNumber || doc.data?.invoiceNumber || doc.data?.timesheetNumber;
+      if (docNumber && String(docNumber).toLowerCase().includes(query)) return true;
+      
+      // Search in filename
+      const fileName = doc.data?.fileName;
+      if (fileName && String(fileName).toLowerCase().includes(query)) return true;
+      
+      // Search in client name (if document has clientId)
+      const clientId = doc.data?.clientId;
+      if (clientId) {
+        const clientName = clientNames.get(String(clientId));
+        if (clientName?.toLowerCase().includes(query)) return true;
+      }
+      
+      // Search in month
+      const month = doc.data?.month;
+      if (month && String(month).toLowerCase().includes(query)) return true;
+      
+      // Search in notes/description
+      const notes = doc.data?.notes || doc.data?.description;
+      if (notes && String(notes).toLowerCase().includes(query)) return true;
+      
+      return false;
     });
-  }, [documents, searchQuery]);
+  }, [documents, searchQuery, clientNames]);
+
+  // Filter templates by search query
+  const filteredTemplates = useMemo(() => {
+    if (!searchQuery.trim()) return templates;
+
+    const query = searchQuery.toLowerCase();
+    return templates.filter((template) => {
+      // Search in template name
+      if (template.name.toLowerCase().includes(query)) return true;
+      
+      // Search in client name
+      if (template.clientName.toLowerCase().includes(query)) return true;
+      
+      // Search in type
+      if (template.type.toLowerCase().includes(query)) return true;
+      
+      // Search in filename
+      if (template.fileName?.toLowerCase().includes(query)) return true;
+      
+      return false;
+    });
+  }, [templates, searchQuery]);
 
   // ============================================
   // Stats
   // ============================================
 
   const stats = useMemo(() => {
+    if (selectedCollection === 'templates') {
+      return {
+        total: templates.length,
+        filtered: filteredTemplates.length,
+      };
+    }
     return {
       total: documents.length,
       filtered: filteredDocuments.length,
     };
-  }, [documents, filteredDocuments]);
+  }, [documents, filteredDocuments, templates, filteredTemplates, selectedCollection]);
 
   // ============================================
   // Render Helpers
@@ -448,16 +502,16 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
             </div>
           ) : selectedCollection === 'templates' ? (
             // Templates View
-            templates.length === 0 ? (
+            filteredTemplates.length === 0 ? (
               <div className="text-center py-12">
                 <LayoutTemplate size={48} className="mx-auto text-slate-300 dark:text-slate-600 mb-4" />
                 <p className="text-slate-500 dark:text-slate-400">
-                  No templates found. Upload templates in client settings.
+                  {searchQuery ? 'No templates match your search' : 'No templates found. Upload templates in client settings.'}
                 </p>
               </div>
             ) : (
               <div className="space-y-2">
-                {templates.map((template) => {
+                {filteredTemplates.map((template) => {
                   // Excel icon component for Excel files
                   const ExcelIcon = () => (
                     <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
@@ -486,8 +540,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                             </h3>
                             <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${
                               template.type === 'invoice'
-                                ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400'
-                                : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'
+                                ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
+                                : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
                             }`}>
                               {template.type === 'invoice' ? 'Invoice' : 'Timesheet'}
                             </span>
@@ -600,10 +654,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                                            `${doc.id.slice(0, 8)}...`;
                           
                           const typeColors: Record<string, string> = {
-                            invoice: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400',
-                            timesheet: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
-                            file: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
-                            document: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-400',
+                            invoice: 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200',
+                            timesheet: 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200',
+                            file: 'bg-emerald-200 text-emerald-900 dark:bg-emerald-500/30 dark:text-emerald-200',
+                            document: 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-300',
                           };
                           
                           return (
@@ -628,8 +682,17 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                         })()}
                       </div>
 
-                      {/* Actions */}
-                      <div className="flex items-center gap-2 ml-4">
+                      {/* Right side - Client tag + Actions */}
+                      <div className="flex flex-col items-end gap-2 ml-4">
+                        {/* Client Tag */}
+                        {doc.data.clientId && (
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-200 text-slate-700 dark:bg-slate-600 dark:text-slate-300">
+                            {clientNames.get(String(doc.data.clientId)) || String(doc.data.clientId).slice(0, 8) + '...'}
+                          </span>
+                        )}
+                        
+                        {/* Actions */}
+                        <div className="flex items-center gap-2">
                         <button
                           onClick={() => viewDocument(doc)}
                           className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
@@ -689,6 +752,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                             <ChevronDown size={18} className="text-slate-600 dark:text-slate-400" />
                           )}
                         </button>
+                        </div>
                       </div>
                     </div>
 
@@ -800,8 +864,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                 </label>
                 <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${
                   selectedTemplate.type === 'invoice'
-                    ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'
-                    : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300'
+                    ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
+                    : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
                 }`}>
                   {selectedTemplate.type === 'invoice' ? 'Invoice Template' : 'Timesheet Template'}
                 </span>
