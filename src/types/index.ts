@@ -25,6 +25,25 @@ export interface TimesheetMapping {
 }
 
 // ============================================
+// Template Types (NEW)
+// ============================================
+
+export interface Template {
+  id: string;
+  userId: string;
+  clientId: string;
+  type: 'invoice' | 'timesheet';
+  name: string;
+  fileName: string;
+  base64Data: string;
+  mapping?: CellMapping;          // For invoice templates
+  timesheetMapping?: TimesheetMapping;  // For timesheet templates
+  timesheetPrompt?: string;       // For timesheet templates
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ============================================
 // Client Types
 // ============================================
 
@@ -36,16 +55,19 @@ export interface Client {
   issuerDetails?: string; // Address/Tax/Bank for PDF Header/Footer
   dailyRate: number;
   currency: string;
-  templateName?: string;
-  templateBase64?: string;
   mapping: CellMapping;
   defaultUseGreekHolidays?: boolean;
-  // Timesheet template fields
+  // Template references (new structure)
+  invoiceTemplateId?: string;     // Reference to template doc
+  timesheetTemplateId?: string;   // Reference to template doc
+  // Legacy fields (kept for migration compatibility)
+  templateName?: string;
+  templateBase64?: string;
   timesheetTemplateName?: string;
   timesheetTemplateBase64?: string;
-  timesheetPrompt?: string; // AI prompt describing how to handle each month
-  timesheetMapping?: TimesheetMapping; // Column mapping for timesheet generation
-  timesheetTemplateFileName?: string; // Original filename of the uploaded template
+  timesheetPrompt?: string;
+  timesheetMapping?: TimesheetMapping;
+  timesheetTemplateFileName?: string;
 }
 
 // ============================================
@@ -63,8 +85,6 @@ export interface WorkRecordConfig {
   excludedDates: string[];
   /** Dates manually included (e.g., working weekends/holidays) */
   includedDates: string[];
-  /** Whether to automatically exclude weekends */
-  autoExcludedWeekends: boolean;
 }
 
 /**
@@ -87,6 +107,10 @@ export interface WorkRecord {
   // DISPLAY METADATA: Holiday names for UI display purposes only
   // Map of date -> holiday name (e.g., {"2024-03-25": "Independence Day"})
   holidayNames?: Record<string, string>;
+
+  // ALL weekend dates in the month (ISO date strings: YYYY-MM-DD)
+  // Stored once at creation so we don't need to recalculate
+  weekendDates: string[];
 
   // CONFIGURATION: How workingDays was calculated
   // These are INPUT parameters, not the stored fact
@@ -111,6 +135,7 @@ export interface WorkRecordInput {
   clientId: string;
   month: string;
   workingDays: string[];
+  weekendDates: string[];
   holidayNames?: Record<string, string>;
   config: WorkRecordConfig;
   notes?: string;
@@ -181,12 +206,16 @@ export interface Document {
   month: string;
   workingDays: number; // Count of days
   workingDaysArray: string[]; // Array of ISO date strings (YYYY-MM-DD) used at generation time
+  weekendDatesArray?: string[]; // Array of weekend dates in the month for outdated detection
   dailyRate: number; // Rate at time of generation
   totalAmount: number;
 
   // Document metadata
   generatedAt: string; // ISO timestamp
   fileName?: string;
+
+  // File data for download
+  fileData?: string; // Base64 encoded Excel file
 
   // Invoice-specific fields
   isPaid?: boolean;
@@ -208,35 +237,15 @@ export interface DocumentInput {
   month: string;
   workingDays: number;
   workingDaysArray: string[];
+  weekendDatesArray?: string[];
   dailyRate: number;
   totalAmount: number;
   fileName?: string;
+  fileData?: string; // Base64 encoded Excel file
   isPaid?: boolean;
   paidAt?: string;
   isOutdated?: boolean;
   outdatedAt?: string | null;
-}
-
-// ============================================
-// Legacy Types (to be deprecated)
-// ============================================
-
-/**
- * @deprecated Use WorkRecord and Document instead
- */
-export interface InvoiceRecord {
-  id: string;
-  userId: string;
-  clientId: string;
-  month: string; // YYYY-MM
-  excludedDates: string[]; // ISO strings
-  includedDates?: string[]; // ISO strings
-  useGreekHolidays: boolean;
-  manualAdjustment: number;
-  status: 'draft' | 'generated';
-  invoiceNumber?: string;
-  generatedDate?: string;
-  totalAmount?: number;
 }
 
 // ============================================

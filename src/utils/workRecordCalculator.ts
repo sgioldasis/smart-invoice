@@ -18,7 +18,6 @@ export interface WorkRecordConfig {
   useGreekHolidays: boolean;
   excludedDates: string[];   // ISO dates: YYYY-MM-DD
   includedDates: string[];   // ISO dates: YYYY-MM-DD
-  autoExcludedWeekends: boolean;
 }
 
 export interface WorkDayStatus {
@@ -138,7 +137,7 @@ export function calculateWorkingDays(
       // Holiday: not working (unless manually included above)
       isWorking = false;
       holidayNames[dateStr] = holidayName;
-    } else if (isWeekendDay && config.autoExcludedWeekends) {
+    } else if (isWeekendDay) {
       // Weekend: not working (unless manually included above)
       isWorking = false;
     } else {
@@ -237,7 +236,6 @@ export function getDefaultConfig(useGreekHolidays: boolean = false): WorkRecordC
     useGreekHolidays,
     excludedDates: [],
     includedDates: [],
-    autoExcludedWeekends: true,
   };
 }
 
@@ -259,8 +257,29 @@ export function isWorkingDay(
   if (isManuallyIncluded) return true;
   if (isManuallyExcluded) return false;
   if (isHolidayDay) return false;
-  if (isWeekendDay && config.autoExcludedWeekends) return false;
+  if (isWeekendDay) return false;
   return true;
+}
+
+/**
+ * Get all weekend dates in a given month
+ * Returns array of ISO date strings (YYYY-MM-DD)
+ */
+export function getWeekendDatesInMonth(monthStr: string): string[] {
+  const [year, month] = monthStr.split('-').map(Number);
+  const weekends: string[] = [];
+  
+  // Get the last day of the month
+  const lastDay = new Date(year, month, 0).getDate();
+  
+  for (let day = 1; day <= lastDay; day++) {
+    const date = new Date(year, month - 1, day);
+    if (isWeekend(date)) {
+      weekends.push(format(date, 'yyyy-MM-dd'));
+    }
+  }
+  
+  return weekends;
 }
 
 /**

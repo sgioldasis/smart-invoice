@@ -32,8 +32,8 @@ import {
 } from 'lucide-react';
 import { format, parseISO, endOfMonth, getDaysInMonth, isValid } from 'date-fns';
 import * as ExcelJS from 'exceljs';
-import type { Client, WorkRecord, Document, DocumentInput, WorkRecordTimesheet, WorkRecordTimesheetInput } from '../types';
-import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet } from '../services/db';
+import type { Client, WorkRecord, Document, DocumentInput, WorkRecordTimesheet, WorkRecordTimesheetInput, Template } from '../types';
+import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet, getTemplateById } from '../services/db';
 import { processTimesheetPromptSmart } from '../services/ai';
 
 interface WorkRecordListProps {
@@ -66,6 +66,9 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [generatedFileName, setGeneratedFileName] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
+  const [invoiceTemplate, setInvoiceTemplate] = useState<Template | null>(null);
+  const [loadingInvoiceTemplate, setLoadingInvoiceTemplate] = useState(false);
+  const [existingInvoiceId, setExistingInvoiceId] = useState<string | null>(null);
 
   // Timesheet dialog state
   const [showTimesheetDialog, setShowTimesheetDialog] = useState(false);
@@ -78,6 +81,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [isGeneratingTimesheet, setIsGeneratingTimesheet] = useState(false);
   const [timesheetError, setTimesheetError] = useState<string | null>(null);
   const [timesheetFileName, setTimesheetFileName] = useState('');
+  const [timesheetTemplate, setTimesheetTemplate] = useState<Template | null>(null);
+  const [loadingTimesheetTemplate, setLoadingTimesheetTemplate] = useState(false);
 
   // Update default filename when record or template changes
   useEffect(() => {
@@ -242,37 +247,76 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   };
 
   const getNextInvoiceNumber = (): string => {
-    const currentYear = new Date().getFullYear();
-    const yearPrefix = `${currentYear}-`;
-
+    // Extract numeric values from all invoice document numbers (global across all clients)
     const existingNumbers = invoices
-      .filter((inv) => inv.documentNumber?.startsWith(yearPrefix))
+      .filter((inv) => inv.type === 'invoice')
       .map((d) => {
-        const num = parseInt(d.documentNumber?.split('-')[2] || '0');
-        return num;
-      });
+        // Try to extract any numeric sequence from the document number
+        const match = d.documentNumber?.match(/\d+/);
+        const num = match ? parseInt(match[0], 10) : 0;
+        return isNaN(num) ? 0 : num;
+      })
+      .filter((n) => n > 0);
 
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-    const nextNum = (maxNum + 1).toString().padStart(2, '0');
-    return `${currentYear}-01-${nextNum}`;
+    const nextNum = maxNum + 1;
+
+    // Format: 2 digits for numbers < 100, no leading zeros for >= 100
+    return nextNum < 100 ? String(nextNum).padStart(2, '0') : String(nextNum);
   };
 
   const generateFileName = (invNum: string, clientName: string, month: string): string => {
-    const safeClientName = clientName.replace(/[^a-zA-Z0-9]/g, '_');
-    return `${invNum}_${safeClientName}_${month.replace('-', '_')}.xlsx`;
+    const safeClientName = clientName.replace(/\s+/g, '_');
+    const [year, monthNum] = month.split('-');
+    const monthName = format(new Date(parseInt(year), parseInt(monthNum) - 1), 'MMMM').toUpperCase();
+    return `${invNum}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
   };
 
-  const openInvoiceDialog = (record: WorkRecord) => {
+  const openInvoiceDialog = async (record: WorkRecord) => {
     const client = clients.find((c) => c.id === record.clientId);
     if (!client) return;
 
-    const nextNum = getNextInvoiceNumber();
-    const fileName = generateFileName(nextNum, client.name, record.month);
+    // Check for existing invoice to reuse its number and ID
+    const existingInvoice = getInvoiceForRecord(record.id);
+    const invoiceNum = existingInvoice?.documentNumber || getNextInvoiceNumber();
+    const fileName = generateFileName(invoiceNum, client.name, record.month);
 
     setDialogRecord(record);
     setDialogClient(client);
-    setInvoiceNumber(nextNum);
+    setInvoiceNumber(invoiceNum);
     setGeneratedFileName(fileName);
+    setInvoiceTemplate(null);
+    // Store existing invoice ID for updating instead of creating new
+    setExistingInvoiceId(existingInvoice?.id || null);
+
+    // Load invoice template (new structure or legacy)
+    setLoadingInvoiceTemplate(true);
+    try {
+      if (client.invoiceTemplateId) {
+        const template = await getTemplateById(client.invoiceTemplateId);
+        setInvoiceTemplate(template);
+      } else if (client.templateBase64) {
+        // Create pseudo-template from legacy data
+        setInvoiceTemplate({
+          id: 'legacy',
+          userId: client.userId,
+          clientId: client.id,
+          type: 'invoice',
+          name: client.templateName || 'Legacy Invoice Template',
+          fileName: client.templateName || 'template.xlsx',
+          base64Data: client.templateBase64,
+          mapping: client.mapping,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    } catch (err) {
+      console.error('Error loading invoice template:', err);
+      setInvoiceTemplate(null);
+    } finally {
+      setLoadingInvoiceTemplate(false);
+    }
+
     setShowInvoiceDialog(true);
   };
 
@@ -283,22 +327,105 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     try {
       const workbook = new ExcelJS.Workbook();
 
-      if (dialogClient.template) {
-        const binaryString = atob(dialogClient.template);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
-      } else {
-        workbook.addWorksheet('Invoice');
+      // Use invoice template (new structure or legacy)
+      const templateToUse = invoiceTemplate?.base64Data || dialogClient.templateBase64;
+      if (!templateToUse) {
+        alert('No invoice template uploaded for this client');
+        setIsGenerating(false);
+        return;
       }
+
+      // Handle base64 data - remove data URL prefix if present
+      let base64Data = templateToUse;
+      if (base64Data.includes(',')) {
+        base64Data = base64Data.split(',')[1];
+      }
+      
+      // Remove any whitespace that might have been added
+      base64Data = base64Data.replace(/\s/g, '');
+      
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
 
       const worksheet = workbook.worksheets[0];
 
-      const dateColumn = dialogClient.mapping?.dateColumn || 'A';
-      const hoursColumn = dialogClient.mapping?.hoursColumn || 'B';
+      // Force Excel to recalculate formulas when opened
+      (workbook.calcProperties as any).fullCalcOnLoad = true;
 
+      // Mark all formula cells for recalculation by clearing cached results
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          if (cell.type === ExcelJS.ValueType.Formula) {
+            const formulaValue = cell.value as { formula: string; result?: unknown };
+            if (formulaValue && typeof formulaValue === 'object' && 'formula' in formulaValue) {
+              cell.value = { formula: formulaValue.formula };
+            }
+          }
+        });
+      });
+
+      // Use template mapping if available, otherwise fall back to client mapping
+      const mapping = invoiceTemplate?.mapping || dialogClient.mapping;
+      const setCell = (cellAddr: string, value: any) => {
+        if (cellAddr && value !== undefined && value !== null) {
+          const cell = worksheet.getCell(cellAddr);
+          cell.value = value;
+        }
+      };
+
+      // Calculate stats - amount is days * dailyRate (not hours * hourlyRate)
+      const daysWorked = dialogRecord.workingDays.length;
+      const dailyRate = dialogClient.dailyRate || 0;
+      const totalAmount = daysWorked * dailyRate;
+
+      // Set invoice metadata - date is always end of the month
+      const monthDate = parseISO(dialogRecord.month + '-01');
+      const endOfMonthDate = endOfMonth(monthDate);
+      setCell(mapping.date, format(endOfMonthDate, 'dd/MM/yyyy'));
+      setCell(mapping.invoiceNumber, invoiceNumber);
+      setCell(mapping.daysWorked, daysWorked);
+      setCell(mapping.dailyRate, dailyRate);
+      setCell(mapping.totalAmount, totalAmount);
+
+      // Handle description cell - preserve template content and update days count
+      if (mapping.description) {
+        try {
+          const descCell = worksheet.getCell(mapping.description);
+          // Check if formula - if so, leave it alone
+          const isFormula = descCell.value && typeof descCell.value === 'object' && 'formula' in descCell.value;
+          
+          if (!isFormula) {
+            const currentDescVal = descCell.value ? descCell.value.toString() : '';
+            
+            if (!currentDescVal.trim()) {
+              // Case 1: Empty Description -> Generate standard string
+              const monthName = format(monthDate, 'MMMM');
+              const year = format(monthDate, 'yyyy');
+              
+              let newDesc = `Consulting Services for ${monthName} ${year}`;
+              // If there is no specific 'daysWorked' column mapped, we usually want the days count in description
+              if (!mapping.daysWorked) {
+                 newDesc += ` (${daysWorked} days)`;
+              }
+              descCell.value = newDesc;
+            } else {
+              // Case 2: Existing Description -> Preserve text, replace day count number if pattern exists
+              // Look for "X days", "X units/working days", etc.
+              const daysPattern = /(\d+)(\D{0,50}days?)/i;
+              if (daysPattern.test(currentDescVal)) {
+                 descCell.value = currentDescVal.replace(daysPattern, `${daysWorked}$2`);
+              }
+              // If no pattern is found, we assume the user's template text is static or doesn't include days count.
+            }
+          }
+        } catch(e) { console.warn("Invalid description cell address", e); }
+      }
+
+      // Replace placeholders throughout the worksheet
       worksheet.eachRow((row) => {
         row.eachCell((cell) => {
           if (typeof cell.value === 'string') {
@@ -307,33 +434,25 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               .replace(/\{\{CLIENT_ADDRESS\}\}/g, dialogClient.address || '')
               .replace(/\{\{CLIENT_VAT\}\}/g, dialogClient.vatNumber || '')
               .replace(/\{\{INVOICE_NUMBER\}\}/g, invoiceNumber)
-              .replace(/\{\{INVOICE_DATE\}\}/g, format(new Date(), 'dd/MM/yyyy'))
+              .replace(/\{\{INVOICE_DATE\}\}/g, format(endOfMonthDate, 'dd/MM/yyyy'))
               .replace(/\{\{MONTH\}\}/g, dialogRecord.month)
-              .replace(
-                /\{\{TOTAL_HOURS\}\}/g,
-                (dialogRecord.workingDays.length * 8).toString()
-              );
+              .replace(/\{\{TOTAL_HOURS\}\}/g, (daysWorked * 8).toString())
+              .replace(/\{\{TOTAL_DAYS\}\}/g, daysWorked.toString());
           }
         });
       });
 
-      const setCell = (cellAddr: string, value: any) => {
-        const cell = worksheet.getCell(cellAddr);
-        cell.value = value;
-      };
-
-      const workingDays = dialogRecord.workingDays
-        .map((d) => parseISO(d))
-        .sort((a, b) => a.getTime() - b.getTime());
-
-      for (let i = 0; i < workingDays.length; i++) {
-        const day = workingDays[i];
-        const rowNum = i + 1;
-        setCell(`${dateColumn}${rowNum}`, format(day, 'dd/MM/yyyy'));
-        setCell(`${hoursColumn}${rowNum}`, 8);
-      }
-
       const buffer = await workbook.xlsx.writeBuffer();
+      
+      // Convert to base64 for storage (browser-compatible)
+      const bufferBytes = new Uint8Array(buffer);
+      let bufferBinary = '';
+      for (let i = 0; i < bufferBytes.byteLength; i++) {
+        bufferBinary += String.fromCharCode(bufferBytes[i]);
+      }
+      const bufferBase64 = btoa(bufferBinary);
+      const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
+      
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -355,12 +474,16 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         month: dialogRecord.month,
         workingDays: dialogRecord.workingDays.length,
         workingDaysArray: dialogRecord.workingDays,
+        weekendDatesArray: dialogRecord.weekendDates, // Store for outdated detection
         dailyRate: dialogClient.dailyRate || 0,
-        totalAmount: (dialogRecord.workingDays.length * 8) * (dialogClient.hourlyRate || dialogClient.dailyRate || 0),
+        totalAmount: daysWorked * (dialogClient.dailyRate || 0),
         fileName: generatedFileName,
+        fileData: fileData, // Store the Excel file data for download
+        isOutdated: false,
+        outdatedAt: null,
       };
 
-      await saveDocument(userId, invoiceData);
+      await saveDocument(userId, invoiceData, existingInvoiceId || undefined);
 
       const updatedInvoices = await getDocuments(userId);
       setInvoices(updatedInvoices);
@@ -369,6 +492,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       setDialogRecord(null);
       setDialogClient(null);
       setInvoiceNumber('');
+      setExistingInvoiceId(null);
     } catch (error) {
       console.error('Error generating invoice:', error);
       alert('Failed to generate invoice');
@@ -386,6 +510,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     setTimesheetPrompt(client.timesheetPrompt || '');
     setTimesheetError(null);
     setExistingTimesheetId(null);
+    setTimesheetTemplate(null);
+
+    // Load client's timesheet template from new structure
+    if (client.timesheetTemplateId) {
+      setLoadingTimesheetTemplate(true);
+      try {
+        const template = await getTemplateById(client.timesheetTemplateId);
+        setTimesheetTemplate(template);
+      } catch (err) {
+        console.error('Error loading timesheet template:', err);
+      } finally {
+        setLoadingTimesheetTemplate(false);
+      }
+    }
 
     // Check for existing timesheet config for this month
     try {
@@ -435,11 +573,13 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     try {
       const workbook = new ExcelJS.Workbook();
 
-      // Determine which template to use
-      const templateToUse = timesheetMonthTemplate || timesheetClient.timesheetTemplateBase64;
+      // Determine which template to use (priority: month-specific > new template structure > legacy)
+      const templateToUse = timesheetMonthTemplate ||
+        timesheetTemplate?.base64Data ||
+        timesheetClient.timesheetTemplateBase64;
       const templateFileName = timesheetMonthTemplate
         ? timesheetMonthTemplateName
-        : timesheetClient.timesheetTemplateFileName;
+        : (timesheetTemplate?.fileName || timesheetClient.timesheetTemplateFileName);
 
       if (!templateToUse) {
         setTimesheetError('No timesheet template available. Please upload a template in the client settings or for this specific month.');
@@ -453,6 +593,9 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         bytes[i] = binaryString.charCodeAt(i);
       }
       await workbook.xlsx.load(bytes.buffer as ArrayBuffer);
+
+      // Force Excel to recalculate formulas when opened
+      (workbook.calcProperties as any).fullCalcOnLoad = true;
 
       // NEW: Best-Match Worksheet Selection
       let worksheet = workbook.worksheets.find(ws => ws.state === 'visible' || !ws.state) || workbook.worksheets[0];
@@ -482,6 +625,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         }
       }
       console.log(`HEURISTIC: Final target worksheet "${worksheet.name}" (Score: ${maxScore})`);
+
+      // Mark all formula cells for recalculation by clearing cached results
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          if (cell.type === ExcelJS.ValueType.Formula) {
+            const formulaValue = cell.value as { formula: string; result?: unknown };
+            if (formulaValue && typeof formulaValue === 'object' && 'formula' in formulaValue) {
+              cell.value = { formula: formulaValue.formula };
+            }
+          }
+        });
+      });
 
       // REMOVED: Clear ALL fills. User requested to preserve template formatting.
       // worksheet.eachRow((row) => { ... });
@@ -543,8 +698,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
       // Fill working days only if mapping is configured
       // This fills existing cells without creating new rows
-      if (timesheetClient.timesheetMapping) {
-        const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetClient.timesheetMapping;
+      // Use template's mapping if available, otherwise fall back to client's mapping
+      const timesheetMapping = timesheetTemplate?.timesheetMapping || timesheetClient.timesheetMapping;
+      if (timesheetMapping) {
+        const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetMapping;
         // HEURISTIC: If startRow is 3 or missing, and we're seeing an offset issue, Row 2 is likely the real start.
         const firstDataRow = (startRow === 3 || !startRow) ? 2 : startRow;
 
@@ -1236,6 +1393,16 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       }
 
       const buffer = await workbook.xlsx.writeBuffer();
+      
+      // Convert to base64 for storage (browser-compatible)
+      const bufferBytes = new Uint8Array(buffer);
+      let bufferBinary = '';
+      for (let i = 0; i < bufferBytes.byteLength; i++) {
+        bufferBinary += String.fromCharCode(bufferBytes[i]);
+      }
+      const bufferBase64 = btoa(bufferBinary);
+      const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
+      
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -1251,6 +1418,35 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
+
+      // Save document to database with fileData (so it appears in DocumentManager and can be downloaded)
+      const documentData: DocumentInput = {
+        clientId: timesheetClient.id!,
+        workRecordId: timesheetRecord.id,
+        type: 'timesheet',
+        documentNumber: `TS-${timesheetRecord.month}`,
+        month: timesheetRecord.month,
+        workingDays: timesheetRecord.workingDays.length,
+        workingDaysArray: timesheetRecord.workingDays,
+        weekendDatesArray: timesheetRecord.weekendDates, // Store for outdated detection
+        dailyRate: timesheetClient.dailyRate || 0,
+        totalAmount: (timesheetRecord.workingDays.length * (timesheetClient.dailyRate || 0)),
+        fileName: fileName,
+        fileData: fileData, // Store the Excel file data for download
+        isPaid: false,
+        isOutdated: false,
+        outdatedAt: null, // Clear the outdated timestamp when regenerating
+      };
+
+      // Check for existing document to overwrite
+      const existingDoc = invoices.find(
+        (d) => d.workRecordId === timesheetRecord.id && d.type === 'timesheet'
+      );
+      await saveDocument(userId, documentData, existingDoc?.id);
+
+      // Refresh invoices list
+      const updatedDocs = await getDocuments(userId);
+      setInvoices(updatedDocs);
 
       // Save timesheet configuration
       const timesheetData: WorkRecordTimesheetInput = {
@@ -1366,7 +1562,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             Invoices
           </div>
           <div className="text-2xl font-bold text-slate-900 dark:text-white">
-            {invoices.filter((inv) => inv.type === 'invoice').length}
+            {new Set(invoices.filter((inv) => inv.type === 'invoice').map((inv) => inv.workRecordId)).size}
           </div>
         </div>
         <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
@@ -1375,7 +1571,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             Timesheets
           </div>
           <div className="text-2xl font-bold text-slate-900 dark:text-white">
-            {invoices.filter((inv) => inv.type === 'timesheet').length}
+            {new Set(invoices.filter((inv) => inv.type === 'timesheet').map((inv) => inv.workRecordId)).size}
           </div>
         </div>
       </div>
@@ -1458,11 +1654,13 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                   const invoice = getInvoiceForRecord(record.id);
                   const timesheet = getTimesheetForRecord(record.id);
                   const hasOutdatedInvoice = invoice?.isOutdated;
+                  const hasOutdatedTimesheet = timesheet?.isOutdated;
 
                   return (
                     <div
                       key={record.id}
-                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group"
+                      onClick={() => handleEdit(record.clientId, record.month)}
+                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group cursor-pointer"
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                         {/* Left: Client Info */}
@@ -1494,9 +1692,17 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                 </span>
                               )}
                               {timesheet && (
-                                <span className="flex items-center gap-1 text-blue-600 dark:text-blue-400">
+                                <span
+                                  className={`flex items-center gap-1 ${hasOutdatedTimesheet
+                                    ? 'text-amber-600 dark:text-amber-400'
+                                    : 'text-blue-600 dark:text-blue-400'
+                                    }`}
+                                >
                                   <Calendar size={14} />
                                   {timesheet.documentNumber}
+                                  {hasOutdatedTimesheet && (
+                                    <AlertTriangle size={12} />
+                                  )}
                                 </span>
                               )}
                             </div>
@@ -1506,7 +1712,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                         {/* Right: Actions */}
                         <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                           <button
-                            onClick={() => openInvoiceDialog(record)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openInvoiceDialog(record);
+                            }}
                             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${hasOutdatedInvoice
                               ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
                               : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400'
@@ -1517,27 +1726,39 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                             {invoice ? 'Regenerate' : 'Invoice'}
                           </button>
                           <button
-                            onClick={() => openTimesheetDialog(record)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openTimesheetDialog(record);
+                            }}
                             disabled={isGeneratingTimesheet}
-                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50 disabled:opacity-50 disabled:cursor-not-allowed"
-                            title="Generate Timesheet"
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${hasOutdatedTimesheet
+                              ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
+                              : 'bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400'
+                              }`}
+                            title={hasOutdatedTimesheet ? 'Regenerate Timesheet' : 'Generate Timesheet'}
                           >
                             {isGeneratingTimesheet && timesheetRecord?.id === record.id ? (
                               <Loader2 size={16} className="animate-spin" />
                             ) : (
                               <Calendar size={16} />
                             )}
-                            Timesheet
+                            {timesheet ? 'Regenerate' : 'Timesheet'}
                           </button>
                           <button
-                            onClick={() => handleEdit(record.clientId, record.month)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleEdit(record.clientId, record.month);
+                            }}
                             className="p-2 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
                             title="Edit work record"
                           >
                             <Edit3 size={18} />
                           </button>
                           <button
-                            onClick={() => handleDelete(record)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDelete(record);
+                            }}
                             disabled={isDeleting}
                             className="p-2 text-slate-400 hover:text-red-600 dark:hover:text-red-400 transition-colors disabled:opacity-50"
                             title="Delete work record"
@@ -1605,9 +1826,34 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               </div>
             </div>
 
+            {/* Template Source Info */}
+            <div className="mb-6 p-4 bg-slate-50 dark:bg-slate-700/50 rounded-lg">
+              <div className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400 mb-2">
+                <FileSpreadsheet size={16} />
+                <span className="font-medium">Template Source:</span>
+                <span className={invoiceTemplate ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}>
+                  {invoiceTemplate ? (invoiceTemplate.id === 'legacy' ? 'Legacy template' : invoiceTemplate.name) : 'No template'}
+                </span>
+              </div>
+              {loadingInvoiceTemplate && (
+                <div className="flex items-center gap-2 text-sm text-slate-500">
+                  <Loader2 size={14} className="animate-spin" />
+                  Loading template...
+                </div>
+              )}
+              {!invoiceTemplate && !loadingInvoiceTemplate && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  No invoice template configured. A blank spreadsheet will be generated.
+                </p>
+              )}
+            </div>
+
             <div className="flex gap-3 justify-end">
               <button
-                onClick={() => setShowInvoiceDialog(false)}
+                onClick={() => {
+                  setShowInvoiceDialog(false);
+                  setExistingInvoiceId(null);
+                }}
                 className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors"
               >
                 Cancel

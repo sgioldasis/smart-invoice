@@ -44,7 +44,7 @@ import { Auth } from './Auth';
 // NEW: Work Record Components
 import { WorkRecordManager } from './src/components/WorkRecordManager';
 import { WorkRecordList } from './src/components/WorkRecordList';
-import { deleteAllClientTimesheets } from './src/services/db';
+import { deleteAllClientTimesheets, saveTemplate } from './src/services/db';
 
 // NEW: Refactored Invoice Generator
 import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/InvoiceGenerator';
@@ -53,7 +53,7 @@ import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/Invoic
 import { DocumentManager } from './src/components/DocumentManager';
 
 // NEW: Import WorkRecord types
-import type { WorkRecord, Document } from './src/types';
+import type { WorkRecord, Document, Template } from './src/types';
 
 // --- Types ---
 
@@ -439,9 +439,9 @@ const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {clients.map(client => (
-          <div 
-            key={client.id} 
-            onClick={() => onSelectClient(client)}
+          <div
+            key={client.id}
+            onClick={() => onEditClient(client)}
             className="bg-white dark:bg-slate-800 p-6 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 hover:shadow-md transition cursor-pointer group"
           >
             <div className="flex justify-between items-start mb-4">
@@ -449,11 +449,12 @@ const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
                 <Building2 size={24} />
               </div>
               <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button 
-                  onClick={(e) => { e.stopPropagation(); onEditClient(client); }}
+                <button
+                  onClick={(e) => { e.stopPropagation(); onSelectClient(client); }}
                   className="p-2 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400"
+                  title="Select for invoice"
                 >
-                  <Edit3 size={18} />
+                  <FileText size={18} />
                 </button>
                 <button 
                   onClick={(e) => handleDelete(e, client.id)}
@@ -500,6 +501,8 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
     timesheetPrompt: undefined
   });
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [invoiceTemplateId, setInvoiceTemplateId] = useState<string | null>(client?.invoiceTemplateId || null);
+  const [timesheetTemplateId, setTimesheetTemplateId] = useState<string | null>(client?.timesheetTemplateId || null);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -514,7 +517,7 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
       
       let cellDump = "";
       const range = XLSX.utils.decode_range(ws['!ref'] || "A1:Z100");
-      const maxRow = Math.min(range.e.r, 60); 
+      const maxRow = Math.min(range.e.r, 60);
       
       for(let R = range.s.r; R <= maxRow; ++R) {
         for(let C = range.s.c; C <= range.e.c; ++C) {
@@ -528,7 +531,30 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
 
       const base64 = btoa(bstr);
 
-      setFormData(prev => ({ ...prev, templateName: file.name, templateBase64: base64 }));
+      // Create and save template as separate document
+      const template: Template = {
+        id: crypto.randomUUID(),
+        userId: userId,
+        clientId: formData.id,
+        type: 'invoice',
+        name: file.name,
+        fileName: file.name,
+        base64Data: base64,
+        mapping: formData.mapping,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      try {
+        const saved = await saveTemplate(template);
+        setInvoiceTemplateId(saved.id);
+        setFormData(prev => ({ ...prev, templateName: file.name, templateBase64: base64, invoiceTemplateId: saved.id }));
+      } catch (error) {
+        console.error('Error saving invoice template:', error);
+        alert('Failed to save invoice template. Please try again.');
+        return;
+      }
+
       setIsAnalyzing(true);
       const result = await AIService.analyzeTemplate(cellDump);
       setIsAnalyzing(false);
@@ -555,7 +581,30 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
     reader.onload = async (evt) => {
       const bstr = evt.target?.result as string;
       const base64 = btoa(bstr);
-      setFormData(prev => ({ ...prev, timesheetTemplateName: file.name, timesheetTemplateBase64: base64 }));
+
+      // Create and save timesheet template as separate document
+      const template: Template = {
+        id: crypto.randomUUID(),
+        userId: userId,
+        clientId: formData.id,
+        type: 'timesheet',
+        name: file.name,
+        fileName: file.name,
+        base64Data: base64,
+        timesheetMapping: formData.timesheetMapping,
+        timesheetPrompt: formData.timesheetPrompt,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      try {
+        const saved = await saveTemplate(template);
+        setTimesheetTemplateId(saved.id);
+        setFormData(prev => ({ ...prev, timesheetTemplateName: file.name, timesheetTemplateBase64: base64, timesheetTemplateId: saved.id }));
+      } catch (error) {
+        console.error('Error saving timesheet template:', error);
+        alert('Failed to save timesheet template. Please try again.');
+      }
     };
     reader.readAsBinaryString(file);
   };
@@ -567,10 +616,12 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
     
     if (!confirmed) return;
     
+    setTimesheetTemplateId(null);
     setFormData(prev => ({
       ...prev,
       timesheetTemplateName: undefined,
-      timesheetTemplateBase64: undefined
+      timesheetTemplateBase64: undefined,
+      timesheetTemplateId: undefined
     }));
   };
 
@@ -820,8 +871,8 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
 
         <div className="p-6 bg-slate-50 dark:bg-slate-800/50 border-t border-slate-200 dark:border-slate-700 flex justify-end gap-3">
           <button onClick={onCancel} className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200">Cancel</button>
-          <button 
-            onClick={() => onSave(formData)}
+          <button
+            onClick={() => onSave({ ...formData, invoiceTemplateId, timesheetTemplateId })}
             className="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-medium"
           >
             Save Client
@@ -2101,6 +2152,7 @@ export default function App() {
   const [workRecordView, setWorkRecordView] = useState<'list' | 'edit'>('list');
   const [editingWorkRecordClientId, setEditingWorkRecordClientId] = useState<string | undefined>();
   const [editingWorkRecordMonth, setEditingWorkRecordMonth] = useState<string | undefined>();
+  const [workRecordListKey, setWorkRecordListKey] = useState(0);
   
   // Invoice Generator state (for regeneration)
   const [invoiceGenInvoiceNumber, setInvoiceGenInvoiceNumber] = useState<string | undefined>();
@@ -2178,6 +2230,8 @@ export default function App() {
     setWorkRecordView('list');
     setEditingWorkRecordClientId(undefined);
     setEditingWorkRecordMonth(undefined);
+    // Force WorkRecordList to refresh by updating the key
+    setWorkRecordListKey(prev => prev + 1);
   };
 
   const handleGenerateInvoiceFromWorkRecord = (clientId: string, month: string, existingInvoiceNumber?: string) => {
@@ -2228,6 +2282,7 @@ export default function App() {
           {/* Work Records Tab */}
           {activeTab === 'workrecords' && workRecordView === 'list' && (
             <WorkRecordList
+              key={workRecordListKey}
               userId={user.uid}
               onEditWorkRecord={handleEditWorkRecord}
               onCreateWorkRecord={handleCreateWorkRecord}
@@ -2240,6 +2295,7 @@ export default function App() {
               userId={user.uid}
               initialClientId={editingWorkRecordClientId}
               initialMonth={editingWorkRecordMonth}
+              onSave={handleWorkRecordSaved}
             />
           )}
 

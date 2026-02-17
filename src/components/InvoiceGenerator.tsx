@@ -7,8 +7,8 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { format, getDaysInMonth, startOfMonth, addDays, isWeekend, parseISO, endOfMonth } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import { FileSpreadsheet, Loader2, Calendar, ChevronLeft, ChevronRight, AlertTriangle, CheckCircle } from 'lucide-react';
-import { Client, WorkRecord, Document } from '../types';
-import { getWorkRecordByMonth, saveDocument, getDocuments, getClients } from '../services/db';
+import { Client, WorkRecord, Document, Template } from '../types';
+import { getWorkRecordByMonth, saveDocument, getDocuments, getClients, getTemplateById } from '../services/db';
 import { fetchGreekHolidays, WorkDayStatus } from '../utils/workRecordCalculator';
 
 interface InvoiceGeneratorProps {
@@ -41,10 +41,13 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [invoiceNumber, setInvoiceNumber] = useState(existingInvoiceNumber || '');
+  const [customFileName, setCustomFileName] = useState('');
   const [existingDocuments, setExistingDocuments] = useState<Document[]>([]);
   const [allInvoices, setAllInvoices] = useState<Document[]>([]);
   const [holidayNames, setHolidayNames] = useState<Record<string, string>>({});
   const [dayStatuses, setDayStatuses] = useState<WorkDayStatus[]>([]);
+  const [invoiceTemplate, setInvoiceTemplate] = useState<Template | null>(null);
+  const [loadingTemplate, setLoadingTemplate] = useState(false);
 
   const selectedClient = useMemo(
     () => clients.find((c) => c.id === selectedClientId),
@@ -196,22 +199,71 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
     loadAllInvoices();
   }, [userId]);
 
+  // Load invoice template when selected client changes
+  useEffect(() => {
+    const loadInvoiceTemplate = async () => {
+      if (!selectedClient) {
+        setInvoiceTemplate(null);
+        return;
+      }
+
+      // Try new structure first (template reference)
+      if (selectedClient.invoiceTemplateId) {
+        setLoadingTemplate(true);
+        try {
+          const template = await getTemplateById(selectedClient.invoiceTemplateId);
+          setInvoiceTemplate(template);
+        } catch (err) {
+          console.error('Error loading invoice template:', err);
+          setInvoiceTemplate(null);
+        } finally {
+          setLoadingTemplate(false);
+        }
+        return;
+      }
+
+      // Fallback to legacy structure (embedded base64)
+      if (selectedClient.templateBase64) {
+        // Create a pseudo-template from legacy data
+        setInvoiceTemplate({
+          id: 'legacy',
+          userId: selectedClient.userId,
+          clientId: selectedClient.id,
+          type: 'invoice',
+          name: selectedClient.templateName || 'Legacy Invoice Template',
+          fileName: selectedClient.templateName || 'template.xlsx',
+          base64Data: selectedClient.templateBase64,
+          mapping: selectedClient.mapping,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        setInvoiceTemplate(null);
+      }
+    };
+
+    loadInvoiceTemplate();
+  }, [selectedClient]);
+
   // ============================================
   // Handlers
   // ============================================
   const getNextInvoiceNumber = (): string => {
-    // Extract numeric values from all invoice document numbers
+    // Extract numeric values from all invoice document numbers (global across all clients)
     const existingNumbers = allInvoices
       .map((d) => {
-        // Try to parse the document number as a number
-        const num = parseInt(d.documentNumber, 10);
+        // Try to extract any numeric sequence from the document number
+        const match = d.documentNumber?.match(/\d+/);
+        const num = match ? parseInt(match[0], 10) : 0;
         return isNaN(num) ? 0 : num;
       })
-      .filter(n => n > 0);
-    
+      .filter((n) => n > 0);
+
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
-    // Pad with at least 2 digits
-    return String(maxNum + 1).padStart(2, '0');
+    const nextNum = maxNum + 1;
+
+    // Format: 2 digits for numbers < 100, no leading zeros for >= 100
+    return nextNum < 100 ? String(nextNum).padStart(2, '0') : String(nextNum);
   };
 
   const isWorkingDay = (date: Date): boolean => {
@@ -230,7 +282,9 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       return;
     }
 
-    if (!selectedClient.templateBase64) {
+    // Check for template in new structure (invoiceTemplate) or legacy (templateBase64)
+    const templateBase64 = invoiceTemplate?.base64Data || selectedClient.templateBase64;
+    if (!templateBase64) {
       setError('No template uploaded for this client');
       return;
     }
@@ -249,7 +303,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       const workbook = new ExcelJS.Workbook();
       
       // Handle base64 data - remove data URL prefix if present
-      let base64Data = selectedClient.templateBase64;
+      let base64Data = templateBase64;
       if (base64Data.includes(',')) {
         base64Data = base64Data.split(',')[1];
       }
@@ -286,8 +340,8 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         });
       });
 
-      // 2. Map data to cells based on client mapping
-      const mapping = selectedClient.mapping;
+      // 2. Map data to cells based on template mapping or client mapping
+      const mapping = invoiceTemplate?.mapping || selectedClient.mapping;
       const setCell = (cellAddr: string, value: any) => {
         if (cellAddr && value !== undefined && value !== null) {
           const cell = worksheet.getCell(cellAddr);
@@ -337,8 +391,19 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         } catch(e) { console.warn("Invalid description cell address", e); }
       }
 
-      // 3. Generate buffer and download
+      // 3. Generate buffer for download and storage
       const buffer = await workbook.xlsx.writeBuffer();
+      
+      // Convert to base64 for storage (browser-compatible)
+      const bufferBytes = new Uint8Array(buffer);
+      let bufferBinary = '';
+      for (let i = 0; i < bufferBytes.byteLength; i++) {
+        bufferBinary += String.fromCharCode(bufferBytes[i]);
+      }
+      const bufferBase64 = btoa(bufferBinary);
+      const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
+      
+      // Download the file
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -350,7 +415,10 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       const monthName = format(currentDate, 'MMMM').toUpperCase();
       const year = format(currentDate, 'yyyy');
       const safeClientName = (selectedClient.name || 'Client').replace(/\s+/g, '_');
-      const fileName = `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+      const defaultFileName = `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+      const fileName = customFileName.trim()
+        ? (customFileName.trim().endsWith('.xlsx') ? customFileName.trim() : `${customFileName.trim()}.xlsx`)
+        : defaultFileName;
       
       a.download = fileName;
       document.body.appendChild(a);
@@ -358,8 +426,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
 
-      // 4. Save document to database
-      const safeClientNameForDb = (selectedClient.name || 'Client').replace(/\s+/g, '_');
+      // 4. Save document to database with fileData
       const documentData = {
         clientId: selectedClient.id,
         workRecordId: workRecord.id,
@@ -368,9 +435,11 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         month: monthStr,
         workingDays: stats.days,
         workingDaysArray: workRecord.workingDays, // Save the actual dates used
+        weekendDatesArray: workRecord.weekendDates, // Store for outdated detection
         dailyRate: selectedClient.dailyRate,
         totalAmount: stats.amount,
-        fileName: `${invoiceNumber}-${safeClientNameForDb}-Invoice-${monthName}-${year}.xlsx`,
+        fileName: fileName, // Use the same filename used for download
+        fileData: fileData, // Store the Excel file data for download
         isPaid: false,
         isOutdated: false, // Clear outdated flag on regenerate
       };
@@ -492,20 +561,31 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
                 </p>
               </div>
 
-              {/* Generated Filename Preview */}
+              {/* Filename Input */}
               {invoiceNumber.trim() && selectedClient && (
                 <div className="mb-4">
-                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-                    Generated Filename
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-2">
+                    <FileSpreadsheet size={16} className="text-indigo-600" />
+                    Filename
                   </label>
-                  <div className="px-3 py-2 bg-slate-100 dark:bg-slate-700/50 border border-slate-200 dark:border-slate-600 rounded-lg text-sm text-slate-600 dark:text-slate-400 font-mono break-all">
-                    {(() => {
-                      const monthName = format(currentDate, 'MMMM').toUpperCase();
-                      const year = format(currentDate, 'yyyy');
-                      const safeClientName = (selectedClient.name || 'Client').replace(/\s+/g, '_');
-                      return `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
-                    })()}
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={customFileName}
+                      onChange={(e) => setCustomFileName(e.target.value)}
+                      placeholder={(() => {
+                        const monthName = format(currentDate, 'MMMM').toUpperCase();
+                        const year = format(currentDate, 'yyyy');
+                        const safeClientName = (selectedClient.name || 'Client').replace(/\s+/g, '_');
+                        return `${invoiceNumber}-${safeClientName}-Invoice-${monthName}-${year}`;
+                      })()}
+                      className="flex-1 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                    />
+                    <span className="text-slate-500 dark:text-slate-400 font-mono text-sm">.xlsx</span>
                   </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Customize the download filename or leave empty to use the default.
+                  </p>
                 </div>
               )}
 

@@ -1,11 +1,12 @@
 /**
  * Database Service
- * 
+ *
  * Firestore operations for:
- * - Clients (existing)
- * - Work Records (new)
- * - Documents (new - replaces invoices)
- * - Invoices (legacy, for migration)
+ * - Clients
+ * - Work Records
+ * - Documents (invoices & timesheets)
+ * - Timesheets (configuration)
+ * - Templates
  */
 
 import {
@@ -20,6 +21,7 @@ import {
   Timestamp,
   DocumentReference,
   DocumentSnapshot,
+  deleteField,
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 import type {
@@ -28,9 +30,9 @@ import type {
   WorkRecordInput,
   Document,
   DocumentInput,
-  InvoiceRecord,
   WorkRecordTimesheet,
   WorkRecordTimesheetInput,
+  Template,
 } from '../types';
 
 // ============================================
@@ -41,8 +43,8 @@ const COLLECTIONS = {
   CLIENTS: 'clients',
   WORK_RECORDS: 'workRecords',
   DOCUMENTS: 'documents',
-  INVOICES: 'invoices', // Legacy
-  TIMESHEETS: 'timesheets', // Work record specific timesheet templates
+  TIMESHEETS: 'timesheets',
+  TEMPLATES: 'templates',
 } as const;
 
 // ============================================
@@ -73,9 +75,14 @@ export async function saveClient(client: Client): Promise<void> {
       ...client,
       issuerName: client.issuerName ?? null,
       issuerDetails: client.issuerDetails ?? null,
+      mapping: client.mapping ?? null,
+      defaultUseGreekHolidays: client.defaultUseGreekHolidays ?? null,
+      // Template references (new structure)
+      invoiceTemplateId: client.invoiceTemplateId ?? null,
+      timesheetTemplateId: client.timesheetTemplateId ?? null,
+      // Legacy fields (kept for migration compatibility)
       templateName: client.templateName ?? null,
       templateBase64: client.templateBase64 ?? null,
-      defaultUseGreekHolidays: client.defaultUseGreekHolidays ?? null,
       timesheetTemplateName: client.timesheetTemplateName ?? null,
       timesheetTemplateBase64: client.timesheetTemplateBase64 ?? null,
       timesheetPrompt: client.timesheetPrompt ?? null,
@@ -108,16 +115,96 @@ export async function deleteClient(id: string): Promise<void> {
       await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
 
       // Delete the work record
-      await deleteDoc(wrDoc.ref);
-    }
-
-    // Also delete legacy invoices
-    const invoicesSnapshot = await getDocs(
-      query(collection(db, COLLECTIONS.INVOICES), where('clientId', '==', id))
-    );
-    await Promise.all(invoicesSnapshot.docs.map(d => deleteDoc(d.ref)));
-  } catch (e) {
+        await deleteDoc(wrDoc.ref);
+      }
+    } catch (e) {
     console.error('Error deleting client:', e);
+    throw e;
+  }
+}
+
+// ============================================
+// Template Operations (NEW)
+// ============================================
+
+export async function getTemplates(userId: string): Promise<Template[]> {
+  try {
+    const q = query(
+      collection(db, COLLECTIONS.TEMPLATES),
+      where('userId', '==', userId)
+    );
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Template));
+  } catch (e) {
+    console.error('Error fetching templates:', e);
+    return [];
+  }
+}
+
+export async function getTemplatesByClient(userId: string, clientId: string): Promise<Template[]> {
+  try {
+    const q = query(
+      collection(db, COLLECTIONS.TEMPLATES),
+      where('userId', '==', userId),
+      where('clientId', '==', clientId)
+    );
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Template));
+  } catch (e) {
+    console.error('Error fetching templates by client:', e);
+    return [];
+  }
+}
+
+export async function getTemplateById(id: string): Promise<Template | null> {
+  try {
+    const docRef = doc(db, COLLECTIONS.TEMPLATES, id);
+    const snapshot = await getDoc(docRef);
+
+    if (!snapshot.exists()) return null;
+
+    return { ...snapshot.data(), id: snapshot.id } as Template;
+  } catch (e) {
+    console.error('Error fetching template:', e);
+    return null;
+  }
+}
+
+export async function saveTemplate(template: Template): Promise<Template> {
+  try {
+    const now = new Date().toISOString();
+    const isNew = !template.id || template.id === '';
+    const id = isNew ? crypto.randomUUID() : template.id;
+
+    const templateData = {
+      userId: template.userId,
+      clientId: template.clientId,
+      type: template.type,
+      name: template.name,
+      fileName: template.fileName,
+      base64Data: template.base64Data,
+      mapping: template.mapping ?? null,
+      timesheetMapping: template.timesheetMapping ?? null,
+      timesheetPrompt: template.timesheetPrompt ?? null,
+      createdAt: isNew ? now : (template.createdAt || now),
+      updatedAt: now,
+    };
+
+    const templateRef = doc(db, COLLECTIONS.TEMPLATES, id);
+    await setDoc(templateRef, templateData, { merge: true });
+
+    return { ...templateData, id };
+  } catch (e) {
+    console.error('Error saving template:', e);
+    throw e;
+  }
+}
+
+export async function deleteTemplate(id: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, COLLECTIONS.TEMPLATES, id));
+  } catch (e) {
+    console.error('Error deleting template:', e);
     throw e;
   }
 }
@@ -271,12 +358,16 @@ export async function getDocuments(
       constraints.push(where('type', '==', filters.type));
     }
 
+    // Fetch from new documents collection
+    console.log('[getDocuments] Fetching documents with constraints:', constraints);
     const q = query(collection(db, COLLECTIONS.DOCUMENTS), ...constraints);
     const snapshot = await getDocs(q);
+    const documents = snapshot.docs.map((doc) => ({
+      ...doc.data(),
+      id: doc.id,
+    } as Document));
 
-    return snapshot.docs
-      .map((doc) => ({ ...doc.data(), id: doc.id } as Document))
-      .sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime());
+    return documents.sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime());
   } catch (e) {
     console.error('Error fetching documents:', e);
     return [];
@@ -305,25 +396,40 @@ export async function saveDocument(
   try {
     const id = existingId || crypto.randomUUID();
 
-    const documentData: Omit<Document, 'id'> = {
-      ...document,
+    // Build document data, handling null values for outdatedAt to properly clear them
+    const { outdatedAt, ...otherFields } = document;
+    
+    const documentData: any = {
+      ...otherFields,
       userId,
       generatedAt: new Date().toISOString(),
     };
+    
+    // Handle outdatedAt specially - if explicitly set to null, use deleteField()
+    // Otherwise include the value
+    if (outdatedAt === null) {
+      // When outdatedAt is null, we want to delete the field from Firestore
+      documentData.outdatedAt = deleteField();
+    } else if (outdatedAt !== undefined) {
+      documentData.outdatedAt = outdatedAt;
+    }
 
     const documentRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     await setDoc(documentRef, documentData, { merge: true });
 
-    return { ...documentData, id };
+    return { ...document, userId, generatedAt: documentData.generatedAt, id };
   } catch (e) {
     console.error('Error saving document:', e);
     throw e;
   }
 }
 
-export async function deleteDocument(id: string): Promise<void> {
+export async function deleteDocument(id: string, sourceCollection?: 'documents' | 'invoices'): Promise<void> {
   try {
-    await deleteDoc(doc(db, COLLECTIONS.DOCUMENTS, id));
+    // If source collection is specified (for legacy invoices), use it
+    // Otherwise default to documents collection
+    const collectionName = sourceCollection || COLLECTIONS.DOCUMENTS;
+    await deleteDoc(doc(db, collectionName, id));
   } catch (e) {
     console.error('Error deleting document:', e);
     throw e;
@@ -356,7 +462,8 @@ export async function markDocumentAsPaid(
  */
 export async function markDocumentsAsOutdated(
   workRecordId: string,
-  currentWorkingDays: string[]
+  currentWorkingDays: string[],
+  currentWeekendDates?: string[]
 ): Promise<void> {
   try {
     const q = query(
@@ -367,12 +474,14 @@ export async function markDocumentsAsOutdated(
     const snapshot = await getDocs(q);
     const now = new Date().toISOString();
 
-    // Sort current working days for comparison
-    const sortedCurrent = [...currentWorkingDays].sort();
+    // Sort current arrays for comparison
+    const sortedCurrentWorkingDays = [...currentWorkingDays].sort();
+    const sortedCurrentWeekendDates = currentWeekendDates ? [...currentWeekendDates].sort() : null;
 
     const updatePromises = snapshot.docs.map((docSnapshot) => {
       const docData = docSnapshot.data() as Document;
       const savedDays = docData.workingDaysArray || [];
+      const savedWeekendDates = docData.weekendDatesArray || [];
 
       // Skip if already marked as outdated
       if (docData.isOutdated) {
@@ -381,9 +490,16 @@ export async function markDocumentsAsOutdated(
 
       // Compare working days arrays
       // If savedDays is empty (migrated document), mark as outdated to be safe
-      const isOutdated = savedDays.length === 0 ||
-        savedDays.length !== sortedCurrent.length ||
-        savedDays.slice().sort().some((day, index) => day !== sortedCurrent[index]);
+      let isOutdated = savedDays.length === 0 ||
+        savedDays.length !== sortedCurrentWorkingDays.length ||
+        savedDays.slice().sort().some((day, index) => day !== sortedCurrentWorkingDays[index]);
+
+      // Also compare weekend dates if provided
+      if (!isOutdated && sortedCurrentWeekendDates) {
+        const sortedSavedWeekendDates = [...savedWeekendDates].sort();
+        isOutdated = savedWeekendDates.length !== sortedCurrentWeekendDates.length ||
+          sortedSavedWeekendDates.some((day, index) => day !== sortedCurrentWeekendDates![index]);
+      }
 
       if (isOutdated) {
         return setDoc(
@@ -400,7 +516,6 @@ export async function markDocumentsAsOutdated(
     });
 
     await Promise.all(updatePromises);
-    console.log(`Checked documents for work record ${workRecordId}, marked as outdated where needed`);
   } catch (e) {
     console.error('Error marking documents as outdated:', e);
     throw e;
@@ -418,7 +533,7 @@ export async function clearDocumentOutdatedFlag(id: string): Promise<void> {
       documentRef,
       {
         isOutdated: false,
-        outdatedAt: null,
+        outdatedAt: deleteField(),
       },
       { merge: true }
     );
@@ -538,53 +653,74 @@ export async function deleteAllClientTimesheets(userId: string, clientId: string
 }
 
 // ============================================
-// Legacy Invoice Operations (for migration)
+// Firestore Browser - Raw Collection Access
 // ============================================
 
-/**
- * @deprecated Use getDocuments instead
- */
-export async function getInvoices(
-  userId: string,
-  clientId?: string
-): Promise<InvoiceRecord[]> {
-  try {
-    const constraints: any[] = [where('userId', '==', userId)];
-    if (clientId) {
-      constraints.push(where('clientId', '==', clientId));
-    }
+export type CollectionType = 'clients' | 'workRecords' | 'documents' | 'timesheets' | 'templates';
 
-    const q = query(collection(db, COLLECTIONS.INVOICES), ...constraints);
+export interface FirestoreDocument {
+  id: string;
+  collection: CollectionType;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Get all documents from a specific collection (for Firestore browser)
+ */
+export async function getCollectionData(
+  collectionName: CollectionType,
+  userId: string
+): Promise<FirestoreDocument[]> {
+  try {
+    const q = query(collection(db, collectionName), where('userId', '==', userId));
     const snapshot = await getDocs(q);
 
-    return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as InvoiceRecord));
+    return snapshot.docs.map((docSnapshot) => ({
+      id: docSnapshot.id,
+      collection: collectionName,
+      data: docSnapshot.data() as Record<string, unknown>,
+    }));
   } catch (e) {
-    console.error('Error fetching invoices:', e);
+    console.error(`Error fetching ${collectionName}:`, e);
     return [];
   }
 }
 
 /**
- * @deprecated Use saveDocument instead
+ * Delete a document from any collection by ID
  */
-export async function saveInvoice(invoice: InvoiceRecord): Promise<void> {
+export async function deleteDocumentById(
+  collectionName: CollectionType,
+  id: string
+): Promise<void> {
   try {
-    const invoiceRef = doc(db, COLLECTIONS.INVOICES, invoice.id);
-    await setDoc(invoiceRef, invoice, { merge: true });
+    await deleteDoc(doc(db, collectionName, id));
   } catch (e) {
-    console.error('Error saving invoice:', e);
+    console.error(`Error deleting document from ${collectionName}:`, e);
     throw e;
   }
 }
 
 /**
- * @deprecated Use deleteDocument instead
+ * Get a single document from any collection
  */
-export async function deleteInvoice(id: string): Promise<void> {
+export async function getDocumentByCollectionAndId(
+  collectionName: CollectionType,
+  id: string
+): Promise<FirestoreDocument | null> {
   try {
-    await deleteDoc(doc(db, COLLECTIONS.INVOICES, id));
+    const docRef = doc(db, collectionName, id);
+    const snapshot = await getDoc(docRef);
+
+    if (!snapshot.exists()) return null;
+
+    return {
+      id: snapshot.id,
+      collection: collectionName,
+      data: snapshot.data() as Record<string, unknown>,
+    };
   } catch (e) {
-    console.error('Error deleting invoice:', e);
-    throw e;
+    console.error(`Error fetching document from ${collectionName}:`, e);
+    return null;
   }
 }

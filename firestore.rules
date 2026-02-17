@@ -53,5 +53,14 @@ service cloud.firestore {
       allow update: if isAuthorized() && isOwner(resource.data.userId);
       allow delete: if isAuthorized() && isOwner(resource.data.userId);
     }
+    
+    // NEW: Templates collection
+    // Stores invoice and timesheet templates as standalone documents
+    match /templates/{templateId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
+      allow update: if isAuthorized() && isOwner(resource.data.userId);
+      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+    }
   }
 }

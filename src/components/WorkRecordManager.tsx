@@ -38,11 +38,12 @@ import {
   subMonths,
   parseISO,
 } from 'date-fns';
-import type { Client, WorkRecord, WorkRecordInput, WorkRecordTimesheet } from '../types';
+import type { Client, WorkRecord, WorkRecordInput, WorkRecordTimesheet, Template } from '../types';
 import {
   calculateWorkingDaysAsync,
   fetchGreekHolidays,
   getDefaultConfig,
+  getWeekendDatesInMonth,
   WorkDayStatus,
   WorkRecordConfig,
 } from '../utils/workRecordCalculator';
@@ -54,18 +55,21 @@ import {
   getTimesheetByWorkRecord,
   saveTimesheet,
   saveDocument,
+  getTemplateById,
 } from '../services/db';
 
 interface WorkRecordManagerProps {
   userId: string;
   initialClientId?: string;
   initialMonth?: string;
+  onSave?: () => void;
 }
 
 export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   userId,
   initialClientId,
   initialMonth,
+  onSave,
 }) => {
   // ============================================
   // State
@@ -87,6 +91,8 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   const [dayStatuses, setDayStatuses] = useState<WorkDayStatus[]>([]);
 
   const [existingRecord, setExistingRecord] = useState<WorkRecord | null>(null);
+  const [originalWorkingDays, setOriginalWorkingDays] = useState<string[]>([]);
+  const [originalNotes, setOriginalNotes] = useState('');
   const [notes, setNotes] = useState('');
 
   const [loading, setLoading] = useState(true);
@@ -102,6 +108,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   const [monthTemplateBase64, setMonthTemplateBase64] = useState<string | null>(null);
   const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
   const [timesheetError, setTimesheetError] = useState<string | null>(null);
+  const [clientTimesheetTemplate, setClientTimesheetTemplate] = useState<Template | null>(null);
 
   // ============================================
   // Derived State
@@ -123,6 +130,14 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       end: endOfMonth(currentDate),
     });
   }, [currentDate]);
+
+  // Check if any changes were made to the work record
+  const hasChanges = useMemo(() => {
+    if (!existingRecord) return true; // New record always has changes (can save)
+    const workingDaysChanged = JSON.stringify(workingDays.sort()) !== JSON.stringify(originalWorkingDays.sort());
+    const notesChanged = notes !== originalNotes;
+    return workingDaysChanged || notesChanged;
+  }, [existingRecord, workingDays, originalWorkingDays, notes, originalNotes]);
 
   // ============================================
   // Effects
@@ -171,8 +186,10 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
           setExistingRecord(existing);
           setConfig(existing.config);
           setWorkingDays(existing.workingDays);
+          setOriginalWorkingDays(existing.workingDays);
           setHolidayNames(existing.holidayNames || {});
           setNotes(existing.notes || '');
+          setOriginalNotes(existing.notes || '');
         } else {
           // Create new with default config based on client preferences
           const defaultUseGreekHolidays =
@@ -181,10 +198,12 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
           setConfig(newConfig);
           setExistingRecord(null);
           setNotes('');
+          setOriginalNotes('');
 
           // Calculate initial working days
           const result = await calculateWorkingDaysAsync(monthStr, newConfig);
           setWorkingDays(result.workingDays);
+          setOriginalWorkingDays(result.workingDays);
           setHolidayNames(result.holidayNames);
           setDayStatuses(result.dayStatuses);
         }
@@ -250,8 +269,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       // Determine default status
       let defaultIsWorking = true;
       if (isHolidayDay) defaultIsWorking = false;
-      else if (isWeekendDay && config.autoExcludedWeekends)
-        defaultIsWorking = false;
+      else if (isWeekendDay) defaultIsWorking = false;
 
       // Apply manual overrides to get current status
       let isWorking = defaultIsWorking;
@@ -317,6 +335,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
         clientId: selectedClientId,
         month: monthStr,
         workingDays,
+        weekendDates: getWeekendDatesInMonth(monthStr),
         holidayNames,
         config,
         notes: notes.trim() || undefined,
@@ -334,7 +353,9 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       // If updating an existing work record, check and mark outdated documents
       if (existingRecord?.id) {
         try {
-          await markDocumentsAsOutdated(existingRecord.id, workingDays);
+          // Pass both working days and weekend dates for comparison
+          const weekendDates = getWeekendDatesInMonth(monthStr);
+          await markDocumentsAsOutdated(existingRecord.id, workingDays, weekendDates);
           console.log('Checked and marked outdated documents');
         } catch (outdatedErr) {
           console.error('Failed to mark documents as outdated:', outdatedErr);
@@ -344,7 +365,13 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
 
       console.log('Work record saved successfully:', saved);
       setExistingRecord(saved);
+      // Update original values after successful save
+      setOriginalWorkingDays(saved.workingDays);
+      setOriginalNotes(saved.notes || '');
       setSaveSuccess(true);
+
+      // Notify parent component that save was successful
+      onSave?.();
 
       // Clear success message after 3 seconds
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -447,10 +474,16 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       return;
     }
 
-    // Determine which template to use: month-specific or client default
-    const templateBase64 = monthTemplateBase64 || timesheetTemplate?.templateBase64 || selectedClient.timesheetTemplateBase64;
-    const templateName = monthTemplateFile?.name || timesheetTemplate?.templateName || selectedClient.timesheetTemplateName;
-    const prompt = timesheetPrompt || selectedClient.timesheetPrompt;
+    // Determine which template to use: month-specific > new template structure > legacy
+    const templateBase64 = monthTemplateBase64 ||
+      timesheetTemplate?.templateBase64 ||
+      clientTimesheetTemplate?.base64Data ||
+      selectedClient.timesheetTemplateBase64;
+    const templateName = monthTemplateFile?.name ||
+      timesheetTemplate?.templateName ||
+      clientTimesheetTemplate?.fileName ||
+      selectedClient.timesheetTemplateName;
+    const prompt = timesheetPrompt || clientTimesheetTemplate?.timesheetPrompt || selectedClient.timesheetPrompt;
 
     if (!templateBase64) {
       setTimesheetError('No timesheet template available. Please upload a template in the client settings or for this month.');
@@ -486,11 +519,26 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       await workbook.xlsx.load(bytes.buffer);
       const worksheet = workbook.worksheets[0];
 
+      // Force Excel to recalculate formulas when opened
+      (workbook.calcProperties as any).fullCalcOnLoad = true;
+
+      // Mark all formula cells for recalculation by clearing cached results
+      worksheet.eachRow((row) => {
+        row.eachCell((cell) => {
+          if (cell.type === ExcelJS.ValueType.Formula) {
+            const formulaValue = cell.value as { formula: string; result?: unknown };
+            if (formulaValue && typeof formulaValue === 'object' && 'formula' in formulaValue) {
+              cell.value = { formula: formulaValue.formula };
+            }
+          }
+        });
+      });
+
       // Simple approach: Only replace placeholders, don't add/remove rows or columns
       // The template structure is preserved exactly as uploaded
 
       // Basic: Fill in working days information
-      const workingDaysList = workingDays.map(dateStr => {
+      const workingDaysList = existingRecord.workingDays.map(dateStr => {
         const date = parseISO(dateStr);
         return {
           date: format(date, 'dd/MM/yyyy'),
@@ -511,7 +559,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
               cell.value = cellValue.replace('{{CLIENT}}', selectedClient.name);
             }
             if (cellValue.includes('{{TOTAL_DAYS}}')) {
-              cell.value = cellValue.replace('{{TOTAL_DAYS}}', String(workingDays.length));
+              cell.value = cellValue.replace('{{TOTAL_DAYS}}', String(existingRecord.workingDays.length));
             }
           }
         });
@@ -519,8 +567,10 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
 
       // Fill working days only if mapping is configured
       // This fills existing cells without creating new rows
-      if (selectedClient.timesheetMapping) {
-        const { dateColumn, hoursColumn, descriptionColumn, startRow } = selectedClient.timesheetMapping;
+      // Use template's mapping if available, otherwise fall back to client's mapping
+      const timesheetMapping = clientTimesheetTemplate?.timesheetMapping || selectedClient.timesheetMapping;
+      if (timesheetMapping) {
+        const { dateColumn, hoursColumn, descriptionColumn, startRow } = timesheetMapping;
         const firstDataRow = startRow || 2;
 
         for (let i = 0; i < workingDaysList.length; i++) {
@@ -632,17 +682,18 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
 
-      // Save document record
+      // Save document record with all relevant data from work record
       await saveDocument(userId, {
         clientId: selectedClient.id,
         workRecordId: existingRecord.id,
         type: 'timesheet',
         documentNumber: `TS-${monthStr}`,
         month: monthStr,
-        workingDays: workingDays.length,
-        workingDaysArray: workingDays,
+        workingDays: existingRecord.workingDays.length,
+        workingDaysArray: existingRecord.workingDays,
+        weekendDatesArray: existingRecord.weekendDates, // Store for outdated detection
         dailyRate: selectedClient.dailyRate,
-        totalAmount: workingDays.length * selectedClient.dailyRate,
+        totalAmount: existingRecord.workingDays.length * selectedClient.dailyRate,
         fileName,
       });
 
@@ -749,36 +800,6 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
             </button>
           </div>
 
-          {config.useGreekHolidays && (
-            <p className="text-xs text-slate-500 dark:text-slate-400 italic">
-              Fetching data from Public Holidays API
-            </p>
-          )}
-
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-slate-600 dark:text-slate-400">
-              Auto-exclude Weekends
-            </span>
-            <button
-              onClick={() =>
-                setConfig((prev) => ({
-                  ...prev,
-                  autoExcludedWeekends: !prev.autoExcludedWeekends,
-                }))
-              }
-              className={`w-10 h-6 rounded-full transition-colors relative ${
-                config.autoExcludedWeekends
-                  ? 'bg-indigo-600'
-                  : 'bg-slate-300 dark:bg-slate-600'
-              }`}
-            >
-              <div
-                className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
-                  config.autoExcludedWeekends ? 'left-5' : 'left-1'
-                }`}
-              />
-            </button>
-          </div>
         </div>
 
         {/* Notes */}
@@ -795,19 +816,6 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
         </div>
 
         {/* Status Messages */}
-        {existingRecord && (
-          <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
-            <div className="flex items-center gap-2 text-blue-700 dark:text-blue-300 text-sm">
-              <Info size={16} />
-              <span>Editing existing record</span>
-            </div>
-            <p className="text-xs text-blue-600 dark:text-blue-400 mt-1">
-              Last updated:{' '}
-              {format(parseISO(existingRecord.updatedAt), 'dd/MM/yyyy HH:mm')}
-            </p>
-          </div>
-        )}
-
         {saveError && (
           <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
             <div className="flex items-start gap-2">
@@ -828,51 +836,17 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
           </div>
         )}
 
-        {/* Summary & Save */}
+        {/* Summary */}
         <div className="mt-auto bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
           <h3 className="font-semibold text-slate-800 dark:text-slate-200 mb-3">
             Summary
           </h3>
-          <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400 mb-4">
+          <div className="space-y-2 text-sm text-slate-600 dark:text-slate-400">
             <div className="flex justify-between text-lg font-bold text-indigo-600 dark:text-indigo-400">
               <span>Working Days</span>
               <span>{workingDays.length}</span>
             </div>
           </div>
-
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="w-full flex items-center justify-center gap-2 py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-400 text-white rounded-lg font-medium transition-colors mb-3"
-          >
-            {saving ? (
-              <>
-                <Loader2 size={18} className="animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Save size={18} />
-                {existingRecord ? 'Update Work Record' : 'Save Work Record'}
-              </>
-            )}
-          </button>
-
-          {/* Timesheet Button */}
-          <button
-            onClick={handleOpenTimesheetDialog}
-            disabled={!existingRecord}
-            className="w-full flex items-center justify-center gap-2 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors"
-          >
-            <FileSpreadsheet size={18} />
-            Timesheet
-          </button>
-          
-          {!existingRecord && (
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 text-center">
-              Save the work record to generate timesheet
-            </p>
-          )}
         </div>
       </div>
 
@@ -887,19 +861,52 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
               Click on any day to toggle it as working or non-working
             </p>
           </div>
-          <div className="flex items-center gap-4 text-sm">
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded" />
-              <span className="text-slate-600 dark:text-slate-400">Working</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 bg-slate-100 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded" />
-              <span className="text-slate-600 dark:text-slate-400">Non-working</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="w-4 h-4 bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-700 rounded" />
-              <span className="text-slate-600 dark:text-slate-400">Manual Override</span>
-            </div>
+          <div className="flex items-center gap-3">
+            {/* Update/Cancel Buttons for existing records */}
+            {existingRecord && (
+              <>
+                <button
+                  onClick={onSave}
+                  className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition"
+                >
+                  <X size={18} />
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || !hasChanges}
+                  className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-600 transition"
+                  title={!hasChanges ? 'No changes to save' : ''}
+                >
+                  {saving ? (
+                    <Loader2 size={18} className="animate-spin" />
+                  ) : (
+                    <Save size={18} />
+                  )}
+                  Update
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Legend */}
+        <div className="flex items-center gap-4 text-sm mb-6">
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 bg-white dark:bg-slate-800 border-2 border-green-300 dark:border-green-600 rounded" />
+            <span className="text-slate-600 dark:text-slate-400">Working</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 bg-slate-100 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded" />
+            <span className="text-slate-600 dark:text-slate-400">Non-working</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 bg-white dark:bg-slate-800 border-2 border-blue-300 dark:border-blue-600 rounded" />
+            <span className="text-slate-600 dark:text-slate-400">Holiday</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-4 h-4 bg-white dark:bg-slate-800 border-2 border-amber-300 dark:border-amber-500 rounded" />
+            <span className="text-slate-600 dark:text-slate-400">Manual Override</span>
           </div>
         </div>
 
@@ -939,16 +946,15 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
                 onClick={() => handleToggleDay(day)}
                 disabled={loading}
                 className={`
-                  h-24 rounded-xl border flex flex-col items-start p-3 transition-all relative
-                  ${
-                    isWorking
-                      ? 'bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 shadow-sm hover:border-indigo-300 dark:hover:border-indigo-500 hover:shadow-md'
-                      : 'bg-slate-100 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800'
-                  }
+                  h-24 rounded-xl border-2 flex flex-col items-start p-3 transition-all relative
                   ${
                     isManuallyOverridden
-                      ? 'ring-2 ring-green-200 dark:ring-green-900/50 bg-green-50 dark:bg-green-900/10'
-                      : ''
+                      ? 'bg-white dark:bg-slate-800 border-amber-300 dark:border-amber-500 shadow-sm hover:border-amber-400 dark:hover:border-amber-400'
+                      : isHolidayDay
+                        ? 'bg-white dark:bg-slate-800 border-blue-300 dark:border-blue-600 shadow-sm hover:border-blue-400 dark:hover:border-blue-500'
+                        : isWorking
+                          ? 'bg-white dark:bg-slate-800 border-green-300 dark:border-green-600 shadow-sm hover:border-green-400 dark:hover:border-green-500 hover:shadow-md'
+                          : 'bg-slate-100 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800'
                   }
                 `}
               >
