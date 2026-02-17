@@ -226,7 +226,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
         setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
         return;
       }
-      
+
       try {
         const ts = await getTimesheetByWorkRecord(existingRecord.id);
         setTimesheetTemplate(ts);
@@ -237,7 +237,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
         setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
       }
     };
-    
+
     loadTimesheet();
   }, [existingRecord?.id, selectedClient]);
 
@@ -380,10 +380,10 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       console.error('Error code:', err?.code);
       console.error('Error message:', err?.message);
       console.error('Full error object:', JSON.stringify(err, null, 2));
-      
+
       // Provide user-friendly error messages
       let errorMessage = 'Failed to save work record.';
-      
+
       if (err?.code === 'permission-denied') {
         errorMessage = `Permission denied. This usually means:
 1. You're not logged in (try refreshing the page)
@@ -397,7 +397,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       } else if (err?.message) {
         errorMessage += ` Error: ${err.message}`;
       }
-      
+
       setSaveError(errorMessage);
     } finally {
       setSaving(false);
@@ -415,7 +415,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
   // ============================================
   // Timesheet Handlers
   // ============================================
-  
+
   const handleOpenTimesheetDialog = () => {
     if (!existingRecord) {
       setSaveError('Please save the work record first before generating a timesheet.');
@@ -499,18 +499,18 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
 
       // Generate the timesheet
       const workbook = new ExcelJS.Workbook();
-      
+
       // Handle base64 data
       let base64Data = templateBase64;
       if (base64Data.includes(',')) {
         base64Data = base64Data.split(',')[1];
       }
       base64Data = base64Data.replace(/\s/g, '');
-      
+
       if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
         throw new Error('Invalid template data format');
       }
-      
+
       const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
@@ -607,21 +607,21 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       // Apply AI prompt instructions if provided
       if (prompt) {
         console.log('Applying AI prompt:', prompt);
-        
+
         // Parse prompt for column assignments
         const promptLower = prompt.toLowerCase();
-        
+
         // Extract column letters from patterns like "column A", "col B", "column C"
         const dateColumnMatch = promptLower.match(/date(?:\s+s)?(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
         const hoursColumnMatch = promptLower.match(/hours?(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
         const descColumnMatch = promptLower.match(/(?:desc|description)(?:\s+in)?\s+(?:col(?:umn)?\s+)?([a-z])\b/);
-        
+
         // Extract start row
         const startRowMatch = promptLower.match(/(?:start|begin)(?:\s+from)?\s+row\s+(\d+)/);
-        
+
         // Extract hours per day
         const hoursPerDayMatch = promptLower.match(/(\d+)\s+hours?\s+(?:per|each)\s+day/);
-        
+
         const parsedMapping = {
           dateColumn: dateColumnMatch ? dateColumnMatch[1].toUpperCase() : selectedClient.timesheetMapping?.dateColumn,
           hoursColumn: hoursColumnMatch ? hoursColumnMatch[1].toUpperCase() : selectedClient.timesheetMapping?.hoursColumn,
@@ -629,13 +629,13 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
           startRow: startRowMatch ? parseInt(startRowMatch[1]) : (selectedClient.timesheetMapping?.startRow || 2),
           hoursPerDay: hoursPerDayMatch ? parseInt(hoursPerDayMatch[1]) : 8,
         };
-        
+
         console.log('Parsed mapping from prompt:', parsedMapping);
-        
+
         // Apply the parsed mapping if columns were found in prompt
         if (dateColumnMatch || hoursColumnMatch || descColumnMatch) {
           const firstDataRow = parsedMapping.startRow;
-          
+
           for (let i = 0; i < workingDaysList.length; i++) {
             const day = workingDaysList[i];
             const rowNum = firstDataRow + i;
@@ -786,16 +786,14 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
             </span>
             <button
               onClick={handleToggleGreekHolidays}
-              className={`w-10 h-6 rounded-full transition-colors relative ${
-                config.useGreekHolidays
+              className={`w-10 h-6 rounded-full transition-colors relative ${config.useGreekHolidays
                   ? 'bg-indigo-600'
                   : 'bg-slate-300 dark:bg-slate-600'
-              }`}
+                }`}
             >
               <div
-                className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${
-                  config.useGreekHolidays ? 'left-5' : 'left-1'
-                }`}
+                className={`absolute top-1 w-4 h-4 bg-white rounded-full transition-transform ${config.useGreekHolidays ? 'left-5' : 'left-1'
+                  }`}
               />
             </button>
           </div>
@@ -862,31 +860,29 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
             </p>
           </div>
           <div className="flex items-center gap-3">
-            {/* Update/Cancel Buttons for existing records */}
-            {existingRecord && (
-              <>
-                <button
-                  onClick={onSave}
-                  className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition"
-                >
-                  <X size={18} />
-                  Cancel
-                </button>
-                <button
-                  onClick={handleSave}
-                  disabled={saving || !hasChanges}
-                  className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-600 transition"
-                  title={!hasChanges ? 'No changes to save' : ''}
-                >
-                  {saving ? (
-                    <Loader2 size={18} className="animate-spin" />
-                  ) : (
-                    <Save size={18} />
-                  )}
-                  Update
-                </button>
-              </>
-            )}
+            {/* Cancel/Save Buttons */}
+            <button
+              onClick={onSave}
+              className="flex items-center gap-2 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 px-4 py-2 rounded-lg hover:bg-slate-300 dark:hover:bg-slate-600 transition"
+            >
+              <X size={18} />
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={saving || (!!existingRecord && !hasChanges)}
+              className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 disabled:bg-slate-300 dark:disabled:bg-slate-600 transition"
+              title={existingRecord && !hasChanges ? 'No changes to save' : ''}
+            >
+              {saving ? (
+                <Loader2 size={18} className="animate-spin" />
+              ) : existingRecord ? (
+                <Save size={18} />
+              ) : (
+                <Check size={18} />
+              )}
+              {existingRecord ? 'Update' : 'Save'}
+            </button>
           </div>
         </div>
 
@@ -947,23 +943,21 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
                 disabled={loading}
                 className={`
                   h-24 rounded-xl border-2 flex flex-col items-start p-3 transition-all relative
-                  ${
-                    isManuallyOverridden
-                      ? 'bg-white dark:bg-slate-800 border-amber-300 dark:border-amber-500 shadow-sm hover:border-amber-400 dark:hover:border-amber-400'
-                      : isHolidayDay
-                        ? 'bg-white dark:bg-slate-800 border-blue-300 dark:border-blue-600 shadow-sm hover:border-blue-400 dark:hover:border-blue-500'
-                        : isWorking
-                          ? 'bg-white dark:bg-slate-800 border-green-300 dark:border-green-600 shadow-sm hover:border-green-400 dark:hover:border-green-500 hover:shadow-md'
-                          : 'bg-slate-100 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800'
+                  ${isManuallyOverridden
+                    ? 'bg-white dark:bg-slate-800 border-amber-300 dark:border-amber-500 shadow-sm hover:border-amber-400 dark:hover:border-amber-400'
+                    : isHolidayDay
+                      ? 'bg-white dark:bg-slate-800 border-blue-300 dark:border-blue-600 shadow-sm hover:border-blue-400 dark:hover:border-blue-500'
+                      : isWorking
+                        ? 'bg-white dark:bg-slate-800 border-green-300 dark:border-green-600 shadow-sm hover:border-green-400 dark:hover:border-green-500 hover:shadow-md'
+                        : 'bg-slate-100 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800'
                   }
                 `}
               >
                 <span
-                  className={`font-medium text-lg ${
-                    isWorking
+                  className={`font-medium text-lg ${isWorking
                       ? 'text-slate-700 dark:text-slate-200'
                       : 'text-slate-400 dark:text-slate-600'
-                  }`}
+                    }`}
                 >
                   {format(day, 'd')}
                 </span>
