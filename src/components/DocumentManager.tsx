@@ -275,14 +275,194 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
   };
 
   // ============================================
+  // Render Helpers (defined before use)
+  // ============================================
+
+  const getDocumentTitle = (doc: FirestoreDocument): string => {
+    const data = doc.data;
+    const clientName = data.clientId ? clientNames.get(String(data.clientId)) : null;
+    const clientPart = clientName ? `${clientName}` : (data.clientId ? String(data.clientId).slice(0, 8) : null);
+    
+    // Build prefix: [YYYY-MM Client Name] or [YYYY-MM] or [Client Name]
+    const prefixParts: string[] = [];
+    if (data.month) prefixParts.push(String(data.month));
+    if (clientPart) prefixParts.push(clientPart);
+    const titlePrefix = prefixParts.length > 0 ? `[${prefixParts.join(' ')}] • ` : '';
+    
+    // Collection-specific descriptive titles
+    switch (selectedCollection) {
+      case 'documents': {
+        // For documents (invoices/timesheets) - use filename as title with prefix
+        if (data.fileName) {
+          return `${titlePrefix}${data.fileName}`;
+        }
+        // Fallback to type + document number if no filename
+        const type = data.type === 'invoice' ? 'Invoice' : data.type === 'timesheet' ? 'Timesheet' : 'Document';
+        if (data.documentNumber) {
+          return `${titlePrefix}${type} #${data.documentNumber}`;
+        }
+        return `${titlePrefix}${String(data.name || doc.id.slice(0, 8) + '...')}`;
+      }
+      
+      case 'workRecords': {
+        // For work records with prefix
+        if (data.month) {
+          try {
+            const [year, monthNum] = String(data.month).split('-');
+            const date = new Date(parseInt(year), parseInt(monthNum) - 1);
+            const monthName = format(date, 'MMMM yyyy');
+            return `${titlePrefix}Work Record • ${monthName}`;
+          } catch {
+            return `${titlePrefix}Work Record • ${data.month}`;
+          }
+        }
+        return `${titlePrefix}Work Record`;
+      }
+      
+      case 'clients': {
+        // For clients (no prefix, just name)
+        return String(data.name || 'Unnamed Client');
+      }
+      
+      case 'timesheets': {
+        // For timesheet configs with prefix
+        return `${titlePrefix}Timesheet Config`;
+      }
+      
+      default:
+        // Fallback with prefix
+        if (data.name) return `${titlePrefix}${String(data.name)}`;
+        if (data.documentNumber) return `${titlePrefix}${String(data.documentNumber)}`;
+        if (data.month) return String(data.month);
+        if (clientPart) return clientPart;
+        return doc.id.slice(0, 8) + '...';
+    }
+  };
+
+  const getDocumentSubtitle = (doc: FirestoreDocument): string => {
+    const data = doc.data;
+    const parts: string[] = [];
+    
+    // Determine document type
+    const docType = data.type || (data.invoiceNumber ? 'invoice' : null);
+    
+    // Collection-specific subtitle content
+    switch (selectedCollection) {
+      case 'documents': {
+        // Add month as first element for all documents
+        if (data.month) {
+          parts.push(String(data.month));
+        }
+        
+        if (docType === 'invoice') {
+          // Invoice-specific info
+          if (data.workingDays !== undefined) {
+            parts.push(`${data.workingDays} working days`);
+          }
+          if (data.totalAmount !== undefined) {
+            const currency = data.currency || '€';
+            parts.push(`Total: ${currency} ${data.totalAmount}`);
+          }
+          if (data.dailyRate !== undefined) {
+            const currency = data.currency || '€';
+            parts.push(`${currency} ${data.dailyRate}/day`);
+          }
+          // Payment status for invoices
+          if (data.isPaid) {
+            parts.push('✓ Paid');
+          } else {
+            parts.push('Unpaid');
+          }
+        } else if (docType === 'timesheet') {
+          // Timesheet-specific info (no amounts/rates)
+          if (data.workingDays !== undefined) {
+            parts.push(`${data.workingDays} working days`);
+          }
+          // Timesheets don't show daily rate or total amount
+        }
+        break;
+      }
+      
+      case 'workRecords': {
+        // Add month as first element for work records
+        if (data.month) {
+          parts.push(String(data.month));
+        }
+        // Work record info
+        if (data.workingDays && Array.isArray(data.workingDays)) {
+          parts.push(`${data.workingDays.length} working days`);
+        }
+        if (data.dailyRate !== undefined) {
+          const currency = data.currency || '€';
+          parts.push(`${currency} ${data.dailyRate}/day`);
+        }
+        break;
+      }
+      
+      case 'clients': {
+        // Client info
+        if (data.dailyRate !== undefined) {
+          const currency = data.currency || '€';
+          parts.push(`${currency} ${data.dailyRate}/day`);
+        }
+        break;
+      }
+      
+      default:
+        // Generic fallback
+        if (data.workingDays !== undefined) {
+          parts.push(`${Array.isArray(data.workingDays) ? data.workingDays.length : data.workingDays} working days`);
+        }
+        if (data.totalAmount !== undefined) {
+          const currency = data.currency || '€';
+          parts.push(`Total: ${currency} ${data.totalAmount}`);
+        }
+    }
+    
+    // Show outdated status (applies to all types)
+    if (data.isOutdated) {
+      parts.push('⚠ Outdated');
+    }
+    
+    // Show generation/creation date
+    if (data.generatedAt) {
+      try {
+        parts.push(`Generated ${format(new Date(String(data.generatedAt)), 'MMM d, yyyy')}`);
+      } catch {
+        parts.push(String(data.generatedAt));
+      }
+    } else if (data.createdAt) {
+      try {
+        parts.push(`Created ${format(new Date(String(data.createdAt)), 'MMM d, yyyy')}`);
+      } catch {
+        parts.push(String(data.createdAt));
+      }
+    }
+    
+    return parts.join(' • ') || 'No additional info';
+  };
+
+  // ============================================
   // Filtering
   // ============================================
 
   const filteredDocuments = useMemo(() => {
-    if (!searchQuery.trim()) return documents;
+    // First, sort all documents by title descending (newest month first)
+    const sortedDocuments = [...documents].sort((a, b) => {
+      const titleA = getDocumentTitle(a);
+      const titleB = getDocumentTitle(b);
+      // Sort descending (Z to A, so newer dates come first)
+      return titleB.localeCompare(titleA);
+    });
+    
+    if (!searchQuery.trim()) return sortedDocuments;
 
     const query = searchQuery.toLowerCase();
-    return documents.filter((doc) => {
+    return sortedDocuments.filter((doc) => {
+      // Search in descriptive title (includes collection type, client name, etc.)
+      const title = getDocumentTitle(doc).toLowerCase();
+      if (title.includes(query)) return true;
+      
       // Search in ID
       if (doc.id.toLowerCase().includes(query)) return true;
       
@@ -315,7 +495,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
       
       return false;
     });
-  }, [documents, searchQuery, clientNames]);
+  }, [documents, searchQuery, clientNames, selectedCollection]);
 
   // Filter templates by search query
   const filteredTemplates = useMemo(() => {
@@ -355,48 +535,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
       filtered: filteredDocuments.length,
     };
   }, [documents, filteredDocuments, templates, filteredTemplates, selectedCollection]);
-
-  // ============================================
-  // Render Helpers
-  // ============================================
-
-  const getDocumentTitle = (doc: FirestoreDocument): string => {
-    const data = doc.data;
-    // Try to find a meaningful name/identifier
-    if (data.name) return String(data.name);
-    if (data.documentNumber) return String(data.documentNumber);
-    if (data.month) return String(data.month);
-    if (data.invoiceNumber) return String(data.invoiceNumber);
-    return doc.id.slice(0, 8) + '...';
-  };
-
-  const getDocumentSubtitle = (doc: FirestoreDocument): string => {
-    const data = doc.data;
-    const parts: string[] = [];
-    
-    if (data.month) parts.push(String(data.month));
-    if (data.clientId) {
-      const clientId = String(data.clientId);
-      const clientName = clientNames.get(clientId);
-      parts.push(`Client: ${clientName || clientId.slice(0, 8) + '...'}`);
-    }
-    if (data.generatedAt) {
-      try {
-        parts.push(format(new Date(String(data.generatedAt)), 'MMM d, yyyy'));
-      } catch {
-        parts.push(String(data.generatedAt));
-      }
-    }
-    if (data.createdAt) {
-      try {
-        parts.push(format(new Date(String(data.createdAt)), 'MMM d, yyyy'));
-      } catch {
-        parts.push(String(data.createdAt));
-      }
-    }
-    
-    return parts.join(' • ') || 'No additional info';
-  };
 
   // ============================================
   // Render
@@ -543,7 +681,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                                 ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
                                 : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
                             }`}>
-                              {template.type === 'invoice' ? 'Invoice' : 'Timesheet'}
+                              {template.type === 'invoice' ? 'Invoice Template' : 'Timesheet Template'}
                             </span>
                           </div>
                           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
@@ -616,7 +754,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                         {(() => {
                           // Determine document type from various fields
                           const type = doc.data.type ||
-                            (doc.data.documentNumber?.toString().startsWith('INV') ? 'invoice' :
+                            (selectedCollection === 'workRecords' ? 'workRecord' :
+                             doc.data.documentNumber?.toString().startsWith('INV') ? 'invoice' :
                              doc.data.documentNumber?.toString().startsWith('TMS') ? 'timesheet' :
                              doc.data.invoiceNumber ? 'invoice' :
                              doc.data.fileName?.includes('Timesheet') ? 'timesheet' :
@@ -625,6 +764,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                           // Get file icon based on type
                           const FileIcon = type === 'invoice' ? FileText :
                                            type === 'timesheet' ? FileSpreadsheet :
+                                           type === 'workRecord' ? Briefcase :
                                            type === 'file' ? FileText : FileText;
                           
                           // Excel icon component for Excel files - Official Excel logo style
@@ -640,24 +780,23 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                             </svg>
                           );
                           
-                          // Determine if it's an Excel file
-                          const isExcel = type === 'timesheet' ||
+                          // Determine if it's an Excel file (work records are never Excel files)
+                          const isExcel = type !== 'workRecord' && (
+                                          type === 'timesheet' ||
                                           doc.data.fileName?.toLowerCase().endsWith('.xlsx') ||
                                           doc.data.fileName?.toLowerCase().endsWith('.xls') ||
                                           doc.data.fileData?.includes('spreadsheet') ||
-                                          doc.data.excelBase64;
+                                          doc.data.excelBase64);
                           
-                          // Get file name
-                          const fileName = doc.data.fileName ||
-                                           doc.data.documentNumber ||
-                                           doc.data.invoiceNumber ||
-                                           `${doc.id.slice(0, 8)}...`;
+                          // Get display title using the descriptive title function
+                          const displayTitle = getDocumentTitle(doc);
                           
                           const typeColors: Record<string, string> = {
                             invoice: 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200',
                             timesheet: 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200',
                             file: 'bg-emerald-200 text-emerald-900 dark:bg-emerald-500/30 dark:text-emerald-200',
                             document: 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-300',
+                            workRecord: 'bg-amber-200 text-amber-900 dark:bg-amber-500/30 dark:text-amber-200',
                           };
                           
                           return (
@@ -665,10 +804,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                               <div className="flex items-center gap-2">
                                 {isExcel ? <ExcelIcon /> : <FileIcon size={20} className="text-slate-500 dark:text-slate-400 shrink-0" />}
                                 <h3 className="font-semibold text-slate-800 dark:text-white truncate">
-                                  {String(fileName)}
+                                  {displayTitle}
                                 </h3>
                                 <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${typeColors[type] || typeColors.document}`}>
-                                  {type.charAt(0).toUpperCase() + type.slice(1)}
+                                  {type === 'workRecord' ? 'Work Record' : type.charAt(0).toUpperCase() + type.slice(1)}
                                 </span>
                               </div>
                               <p className="text-sm text-slate-500 dark:text-slate-400 truncate mt-1">

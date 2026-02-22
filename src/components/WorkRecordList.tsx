@@ -226,7 +226,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   // ============================================
 
   const handleDelete = async (record: WorkRecord) => {
-    if (!confirm('Are you sure you want to delete this work record?')) {
+    // Check for associated documents
+    const invoice = getInvoiceForRecord(record.id);
+    const timesheet = getTimesheetForRecord(record.id);
+    
+    const associatedDocs: string[] = [];
+    if (invoice) associatedDocs.push(`Invoice (${invoice.documentNumber || 'unnamed'})`);
+    if (timesheet) associatedDocs.push(`Timesheet (${timesheet.documentNumber || 'unnamed'})`);
+    
+    let confirmMessage = 'Are you sure you want to delete this work record?';
+    if (associatedDocs.length > 0) {
+      confirmMessage = `⚠️ Warning: This work record has associated documents that will also be deleted:\n\n${associatedDocs.map(d => `• ${d}`).join('\n')}\n\nAre you sure you want to delete this work record and all its associated documents?`;
+    }
+    
+    if (!confirm(confirmMessage)) {
       return;
     }
 
