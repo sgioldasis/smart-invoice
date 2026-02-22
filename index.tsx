@@ -493,9 +493,7 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
         }
       }
 
-      const base64 = btoa(bstr);
-
-      // Create and save template as separate document
+      // Create and save template as separate document (upload file to Storage)
       const template: Template = {
         id: crypto.randomUUID(),
         userId: userId,
@@ -503,16 +501,17 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
         type: 'invoice',
         name: file.name,
         fileName: file.name,
-        base64Data: base64,
+        storagePath: '', // Will be set by saveTemplate after upload
+        downloadUrl: '', // Will be set by saveTemplate after upload
         mapping: formData.mapping,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
       try {
-        const saved = await saveTemplate(template);
+        const saved = await saveTemplate(template, file);
         setInvoiceTemplateId(saved.id);
-        setFormData(prev => ({ ...prev, templateName: file.name, templateBase64: base64, invoiceTemplateId: saved.id }));
+        setFormData(prev => ({ ...prev, templateName: file.name, invoiceTemplateFileName: file.name, invoiceTemplateId: saved.id }));
       } catch (error) {
         console.error('Error saving invoice template:', error);
         alert('Failed to save invoice template. Please try again.');
@@ -543,10 +542,7 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
 
     const reader = new FileReader();
     reader.onload = async (evt) => {
-      const bstr = evt.target?.result as string;
-      const base64 = btoa(bstr);
-
-      // Create and save timesheet template as separate document
+      // Create and save timesheet template as separate document (upload file to Storage)
       const template: Template = {
         id: crypto.randomUUID(),
         userId: userId,
@@ -554,7 +550,8 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
         type: 'timesheet',
         name: file.name,
         fileName: file.name,
-        base64Data: base64,
+        storagePath: '', // Will be set by saveTemplate after upload
+        downloadUrl: '', // Will be set by saveTemplate after upload
         timesheetMapping: formData.timesheetMapping,
         timesheetPrompt: formData.timesheetPrompt,
         createdAt: new Date().toISOString(),
@@ -562,9 +559,9 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
       };
 
       try {
-        const saved = await saveTemplate(template);
+        const saved = await saveTemplate(template, file);
         setTimesheetTemplateId(saved.id);
-        setFormData(prev => ({ ...prev, timesheetTemplateName: file.name, timesheetTemplateBase64: base64, timesheetTemplateId: saved.id }));
+        setFormData(prev => ({ ...prev, timesheetTemplateFileName: file.name, timesheetTemplateId: saved.id }));
       } catch (error) {
         console.error('Error saving timesheet template:', error);
         alert('Failed to save timesheet template. Please try again.');

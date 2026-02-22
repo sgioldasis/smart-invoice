@@ -1,0 +1,283 @@
+/**
+ * Migration Script: Move base64 files from Firestore to Firebase Storage
+ *
+ * This script migrates existing templates and documents that have base64 data
+ * stored in Firestore to use Firebase Storage instead.
+ *
+ * Usage:
+ *   import { migrateAllToStorage } from './migrateToStorage';
+ *   await migrateAllToStorage(userId);
+ */
+
+import { collection, getDocs, query, where, doc, updateDoc } from 'firebase/firestore';
+import { db } from '../../firebase';
+import {
+  uploadTemplate,
+  uploadDocument,
+  getTemplateDownloadUrl,
+  getDocumentDownloadUrl,
+} from './storage';
+
+const COLLECTIONS = {
+  TEMPLATES: 'templates',
+  DOCUMENTS: 'documents',
+} as const;
+
+/**
+ * Migrate a single template to Firebase Storage
+ */
+export async function migrateTemplateToStorage(
+  userId: string,
+  templateId: string,
+  clientId: string,
+  fileName: string,
+  base64Data: string
+): Promise<{ success: boolean; storagePath?: string; downloadUrl?: string; error?: string }> {
+  try {
+    // Upload to Storage
+    const uploadResult = await uploadTemplate(
+      userId,
+      clientId,
+      templateId,
+      fileName,
+      base64Data
+    );
+
+    // Update Firestore document with storage info
+    const templateRef = doc(db, COLLECTIONS.TEMPLATES, templateId);
+    await updateDoc(templateRef, {
+      storagePath: uploadResult.storagePath,
+      downloadUrl: uploadResult.downloadUrl,
+      // Optionally clear base64Data after successful migration:
+      // base64Data: null,
+    });
+
+    return {
+      success: true,
+      storagePath: uploadResult.storagePath,
+      downloadUrl: uploadResult.downloadUrl,
+    };
+  } catch (error) {
+    console.error(`Error migrating template ${templateId}:`, error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Migrate a single document to Firebase Storage
+ */
+export async function migrateDocumentToStorage(
+  userId: string,
+  documentId: string,
+  clientId: string,
+  fileName: string,
+  fileData: string
+): Promise<{ success: boolean; storagePath?: string; downloadUrl?: string; error?: string }> {
+  try {
+    // Upload to Storage
+    const uploadResult = await uploadDocument(
+      userId,
+      clientId,
+      documentId,
+      fileName || 'document.xlsx',
+      fileData
+    );
+
+    // Update Firestore document with storage info
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    await updateDoc(documentRef, {
+      storagePath: uploadResult.storagePath,
+      downloadUrl: uploadResult.downloadUrl,
+      // Optionally clear fileData after successful migration:
+      // fileData: null,
+    });
+
+    return {
+      success: true,
+      storagePath: uploadResult.storagePath,
+      downloadUrl: uploadResult.downloadUrl,
+    };
+  } catch (error) {
+    console.error(`Error migrating document ${documentId}:`, error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Migrate all templates for a user to Firebase Storage
+ */
+export async function migrateUserTemplates(userId: string): Promise<{
+  total: number;
+  migrated: number;
+  failed: number;
+  errors: Array<{ id: string; error: string }>;
+}> {
+  const result = {
+    total: 0,
+    migrated: 0,
+    failed: 0,
+    errors: [] as Array<{ id: string; error: string }>,
+  };
+
+  try {
+    // Get all templates for the user that have base64Data but no storagePath
+    const q = query(
+      collection(db, COLLECTIONS.TEMPLATES),
+      where('userId', '==', userId)
+    );
+    const snapshot = await getDocs(q);
+
+    const templatesToMigrate = snapshot.docs.filter(
+      (doc) => doc.data().base64Data && !doc.data().storagePath
+    );
+
+    result.total = templatesToMigrate.length;
+
+    for (const templateDoc of templatesToMigrate) {
+      const data = templateDoc.data();
+      const migrationResult = await migrateTemplateToStorage(
+        userId,
+        templateDoc.id,
+        data.clientId,
+        data.fileName,
+        data.base64Data
+      );
+
+      if (migrationResult.success) {
+        result.migrated++;
+      } else {
+        result.failed++;
+        result.errors.push({
+          id: templateDoc.id,
+          error: migrationResult.error || 'Unknown error',
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error migrating templates:', error);
+  }
+
+  return result;
+}
+
+/**
+ * Migrate all documents for a user to Firebase Storage
+ */
+export async function migrateUserDocuments(userId: string): Promise<{
+  total: number;
+  migrated: number;
+  failed: number;
+  errors: Array<{ id: string; error: string }>;
+}> {
+  const result = {
+    total: 0,
+    migrated: 0,
+    failed: 0,
+    errors: [] as Array<{ id: string; error: string }>,
+  };
+
+  try {
+    // Get all documents for the user that have fileData but no storagePath
+    const q = query(
+      collection(db, COLLECTIONS.DOCUMENTS),
+      where('userId', '==', userId)
+    );
+    const snapshot = await getDocs(q);
+
+    const documentsToMigrate = snapshot.docs.filter(
+      (doc) => doc.data().fileData && !doc.data().storagePath
+    );
+
+    result.total = documentsToMigrate.length;
+
+    for (const documentDoc of documentsToMigrate) {
+      const data = documentDoc.data();
+      const migrationResult = await migrateDocumentToStorage(
+        userId,
+        documentDoc.id,
+        data.clientId,
+        data.fileName,
+        data.fileData
+      );
+
+      if (migrationResult.success) {
+        result.migrated++;
+      } else {
+        result.failed++;
+        result.errors.push({
+          id: documentDoc.id,
+          error: migrationResult.error || 'Unknown error',
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error migrating documents:', error);
+  }
+
+  return result;
+}
+
+/**
+ * Migrate all templates and documents for a user to Firebase Storage
+ */
+export async function migrateAllToStorage(userId: string): Promise<{
+  templates: { total: number; migrated: number; failed: number; errors: Array<{ id: string; error: string }> };
+  documents: { total: number; migrated: number; failed: number; errors: Array<{ id: string; error: string }> };
+}> {
+  console.log(`Starting migration for user ${userId}...`);
+
+  const [templatesResult, documentsResult] = await Promise.all([
+    migrateUserTemplates(userId),
+    migrateUserDocuments(userId),
+  ]);
+
+  console.log('Migration complete:');
+  console.log(`  Templates: ${templatesResult.migrated}/${templatesResult.total} migrated, ${templatesResult.failed} failed`);
+  console.log(`  Documents: ${documentsResult.migrated}/${documentsResult.total} migrated, ${documentsResult.failed} failed`);
+
+  return {
+    templates: templatesResult,
+    documents: documentsResult,
+  };
+}
+
+/**
+ * Check migration status for a user
+ */
+export async function checkMigrationStatus(userId: string): Promise<{
+  templates: { total: number; migrated: number; pending: number };
+  documents: { total: number; migrated: number; pending: number };
+}> {
+  const templatesQuery = query(
+    collection(db, COLLECTIONS.TEMPLATES),
+    where('userId', '==', userId)
+  );
+  const templatesSnapshot = await getDocs(templatesQuery);
+  const templates = templatesSnapshot.docs.map((d) => d.data());
+
+  const documentsQuery = query(
+    collection(db, COLLECTIONS.DOCUMENTS),
+    where('userId', '==', userId)
+  );
+  const documentsSnapshot = await getDocs(documentsQuery);
+  const documents = documentsSnapshot.docs.map((d) => d.data());
+
+  return {
+    templates: {
+      total: templates.length,
+      migrated: templates.filter((t) => t.storagePath).length,
+      pending: templates.filter((t) => t.base64Data && !t.storagePath).length,
+    },
+    documents: {
+      total: documents.length,
+      migrated: documents.filter((d) => d.storagePath).length,
+      pending: documents.filter((d) => d.fileData && !d.storagePath).length,
+    },
+  };
+}

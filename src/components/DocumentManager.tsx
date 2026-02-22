@@ -35,6 +35,10 @@ import {
   type CollectionType,
   type FirestoreDocument,
 } from '../services/db';
+import {
+  downloadDocument as downloadFromStorage,
+  downloadTemplate as downloadTemplateFromStorage,
+} from '../services/storage';
 import type { Template } from '../types';
 
 interface DocumentManagerProps {
@@ -58,7 +62,8 @@ interface TemplateDoc {
   fileName: string;
   hasTemplate: boolean;
   size?: string;
-  data?: string;
+  storagePath?: string;
+  downloadUrl?: string;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -105,7 +110,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
         const clientMap = new Map(clientsData.map(c => [c.id, String(c.data.name || 'Unknown')]));
 
         const extractedTemplates: TemplateDoc[] = templatesData.map((template: Template) => {
-          const size = estimateBase64Size(template.base64Data);
           return {
             id: template.id,
             clientId: template.clientId,
@@ -113,9 +117,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
             type: template.type,
             name: template.name,
             fileName: template.fileName,
-            hasTemplate: true,
-            size,
-            data: template.base64Data,
+            hasTemplate: !!template.storagePath,
+            size: 'Storage',
+            storagePath: template.storagePath,
+            downloadUrl: template.downloadUrl,
             createdAt: template.createdAt,
             updatedAt: template.updatedAt,
           };
@@ -224,31 +229,59 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
     setShowDetail(true);
   };
 
-  const downloadDocument = (doc: FirestoreDocument) => {
+  const downloadDocument = async (doc: FirestoreDocument) => {
     const data = doc.data;
+    const fileName = String(data.fileName || `${data.documentNumber || doc.id}.xlsx`);
     
-    // Check if document has file data
+    // Priority 1: Use Firebase Storage download URL if available
+    if (data.downloadUrl && typeof data.downloadUrl === 'string') {
+      const link = document.createElement('a');
+      link.href = data.downloadUrl;
+      link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
+      link.target = '_blank';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+    
+    // Priority 2: Download from Firebase Storage using storagePath
+    if (data.storagePath && typeof data.storagePath === 'string') {
+      try {
+        const blob = await downloadFromStorage(data.storagePath);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        return;
+      } catch (error) {
+        console.error('Error downloading from Storage:', error);
+        // Fall through to legacy methods
+      }
+    }
+    
+    // Priority 3: Check if document has base64 file data (legacy)
     if (data.fileData && typeof data.fileData === 'string') {
-      // fileData might be a data URL or just base64
-      const fileName = String(data.fileName || `${data.documentNumber || doc.id}.xlsx`);
-      
       // Create proper data URL if it's just base64
-      const fileData = data.fileData.startsWith('data:')
+      const fileDataStr = data.fileData.startsWith('data:')
         ? data.fileData
         : `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${data.fileData}`;
       
-      // Create download link
       const link = document.createElement('a');
-      link.href = fileData;
+      link.href = fileDataStr;
       link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-    } else if (data.excelBase64 && typeof data.excelBase64 === 'string') {
-      // Legacy support for excelBase64 field
-      const fileName = String(data.fileName || `${data.documentNumber || doc.id}.xlsx`);
-      
-      // Create proper data URL if it's just base64
+      return;
+    }
+    
+    // Priority 4: Legacy support for excelBase64 field
+    if (data.excelBase64 && typeof data.excelBase64 === 'string') {
       const excelData = data.excelBase64.startsWith('data:')
         ? data.excelBase64
         : `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${data.excelBase64}`;
@@ -702,23 +735,28 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                           </button>
                           
                           <button
-                            onClick={() => {
-                              // Download template - create proper Excel data URL
-                              if (template.data) {
-                                const base64Data = template.data;
-                                const mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-                                const dataUrl = `data:${mimeType};base64,${base64Data}`;
-                                const link = document.createElement('a');
-                                link.href = dataUrl;
-                                link.download = template.name.endsWith('.xlsx') ? template.name : `${template.name}.xlsx`;
-                                document.body.appendChild(link);
-                                link.click();
-                                document.body.removeChild(link);
+                            onClick={async () => {
+                              // Download template from Firebase Storage
+                              if (template.storagePath) {
+                                try {
+                                  const blob = await downloadTemplateFromStorage(template.storagePath);
+                                  const url = URL.createObjectURL(blob);
+                                  const link = document.createElement('a');
+                                  link.href = url;
+                                  link.download = template.fileName.endsWith('.xlsx') ? template.fileName : `${template.fileName}.xlsx`;
+                                  document.body.appendChild(link);
+                                  link.click();
+                                  document.body.removeChild(link);
+                                  URL.revokeObjectURL(url);
+                                } catch (err) {
+                                  console.error('Error downloading template:', err);
+                                  alert('Failed to download template');
+                                }
                               }
                             }}
-                            disabled={!template.data}
+                            disabled={!template.storagePath}
                             className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            title={template.data ? "Download template" : "No download available"}
+                            title={template.storagePath ? "Download template" : "No download available"}
                           >
                             <Download size={18} className="text-slate-600 dark:text-slate-400" />
                           </button>
@@ -840,7 +878,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
                           <Eye size={18} className="text-slate-600 dark:text-slate-400" />
                         </button>
 
-                        {(doc.data.fileData || doc.data.excelBase64) && (
+                        {(doc.data.fileData || doc.data.excelBase64 || doc.data.storagePath || doc.data.downloadUrl) && (
                           <button
                             onClick={() => downloadDocument(doc)}
                             className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"

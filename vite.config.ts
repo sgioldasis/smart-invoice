@@ -8,6 +8,14 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        proxy: {
+          // Proxy Firebase Storage requests to avoid CORS in dev
+          '/storage': {
+            target: 'https://firebasestorage.googleapis.com',
+            changeOrigin: true,
+            rewrite: (path) => path.replace(/^\/storage/, ''),
+          },
+        },
       },
       plugins: [react()],
       define: {

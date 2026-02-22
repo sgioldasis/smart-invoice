@@ -57,6 +57,7 @@ import {
   saveDocument,
   getTemplateById,
 } from '../services/db';
+import { downloadTemplateAsArrayBuffer } from '../services/storage';
 
 interface WorkRecordManagerProps {
   userId: string;
@@ -105,7 +106,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   const [timesheetTemplate, setTimesheetTemplate] = useState<WorkRecordTimesheet | null>(null);
   const [timesheetPrompt, setTimesheetPrompt] = useState('');
   const [monthTemplateFile, setMonthTemplateFile] = useState<File | null>(null);
-  const [monthTemplateBase64, setMonthTemplateBase64] = useState<string | null>(null);
+  const [monthTemplateStoragePath, setMonthTemplateStoragePath] = useState<string | null>(null);
   const [generatingTimesheet, setGeneratingTimesheet] = useState(false);
   const [timesheetError, setTimesheetError] = useState<string | null>(null);
   const [clientTimesheetTemplate, setClientTimesheetTemplate] = useState<Template | null>(null);
@@ -221,6 +222,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   // Load timesheet template for this work record
   useEffect(() => {
     const loadTimesheet = async () => {
+      // Always use client prompt, ignore saved timesheet prompt
       if (!existingRecord?.id) {
         setTimesheetTemplate(null);
         setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
@@ -230,8 +232,8 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       try {
         const ts = await getTimesheetByWorkRecord(existingRecord.id);
         setTimesheetTemplate(ts);
-        // Use month-specific prompt if available, otherwise fall back to client's default
-        setTimesheetPrompt(ts?.prompt || selectedClient?.timesheetPrompt || '');
+        // Always use client prompt, ignore saved timesheet prompt
+        setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
       } catch (err) {
         console.error('Error loading timesheet template:', err);
         setTimesheetPrompt(selectedClient?.timesheetPrompt || '');
@@ -429,39 +431,51 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      const bstr = evt.target?.result as string;
-      const base64 = btoa(bstr);
+    // Upload file to Firebase Storage immediately
+    if (!existingRecord || !selectedClient) return;
+
+    try {
+      // Import uploadTemplate dynamically to avoid circular dependency
+      const { uploadTemplate } = await import('../services/storage');
+      const result = await uploadTemplate(
+        userId,
+        selectedClientId,
+        `month-template-${existingRecord.id}`,
+        file.name,
+        file
+      );
       setMonthTemplateFile(file);
-      setMonthTemplateBase64(base64);
-    };
-    reader.readAsBinaryString(file);
+      setMonthTemplateStoragePath(result.storagePath);
+    } catch (err) {
+      console.error('Error uploading month template:', err);
+      setSaveError('Failed to upload month template');
+    }
   };
 
   const handleClearMonthTemplate = () => {
     setMonthTemplateFile(null);
-    setMonthTemplateBase64(null);
+    setMonthTemplateStoragePath(null);
   };
 
   const handleSaveTimesheetConfig = async () => {
     if (!existingRecord || !selectedClient) return;
 
     try {
+      // NOTE: Prompt always comes from client configuration, don't save it in timesheet
       await saveTimesheet(userId, {
         clientId: selectedClientId,
         workRecordId: existingRecord.id,
         month: monthStr,
         templateName: monthTemplateFile?.name || timesheetTemplate?.templateName || null,
-        templateBase64: monthTemplateBase64 || timesheetTemplate?.templateBase64 || null,
-        prompt: timesheetPrompt || null,
+        templateStoragePath: monthTemplateStoragePath || timesheetTemplate?.templateStoragePath || null,
+        prompt: null, // Always use client prompt, don't save here
       }, timesheetTemplate?.id);
 
       // Refresh timesheet data
       const updated = await getTimesheetByWorkRecord(existingRecord.id);
       setTimesheetTemplate(updated);
       setMonthTemplateFile(null);
-      setMonthTemplateBase64(null);
+      setMonthTemplateStoragePath(null);
     } catch (err) {
       console.error('Error saving timesheet config:', err);
       setTimesheetError('Failed to save timesheet configuration');
@@ -474,18 +488,18 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       return;
     }
 
-    // Determine which template to use: month-specific > new template structure > legacy
-    const templateBase64 = monthTemplateBase64 ||
-      timesheetTemplate?.templateBase64 ||
-      clientTimesheetTemplate?.base64Data ||
-      selectedClient.timesheetTemplateBase64;
+    // Determine which template to use: month-specific > client default template
+    const storagePath = monthTemplateStoragePath ||
+      timesheetTemplate?.templateStoragePath ||
+      clientTimesheetTemplate?.storagePath ||
+      selectedClient.timesheetTemplateStoragePath;
     const templateName = monthTemplateFile?.name ||
       timesheetTemplate?.templateName ||
       clientTimesheetTemplate?.fileName ||
-      selectedClient.timesheetTemplateName;
+      selectedClient.timesheetTemplateFileName;
     const prompt = timesheetPrompt || clientTimesheetTemplate?.timesheetPrompt || selectedClient.timesheetPrompt;
 
-    if (!templateBase64) {
+    if (!storagePath) {
       setTimesheetError('No timesheet template available. Please upload a template in the client settings or for this month.');
       return;
     }
@@ -500,23 +514,10 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       // Generate the timesheet
       const workbook = new ExcelJS.Workbook();
 
-      // Handle base64 data
-      let base64Data = templateBase64;
-      if (base64Data.includes(',')) {
-        base64Data = base64Data.split(',')[1];
-      }
-      base64Data = base64Data.replace(/\s/g, '');
-
-      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
-        throw new Error('Invalid template data format');
-      }
-
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      await workbook.xlsx.load(bytes.buffer);
+      // Load template from Firebase Storage
+      console.log('Loading timesheet template from Firebase Storage:', storagePath);
+      const arrayBuffer = await downloadTemplateAsArrayBuffer(storagePath);
+      await workbook.xlsx.load(arrayBuffer);
       const worksheet = workbook.worksheets[0];
 
       // Force Excel to recalculate formulas when opened
@@ -695,7 +696,9 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
         dailyRate: selectedClient.dailyRate,
         totalAmount: existingRecord.workingDays.length * selectedClient.dailyRate,
         fileName,
-      });
+        storagePath: '', // Will be set by saveDocument after upload
+        downloadUrl: '', // Will be set by saveDocument after upload
+      }, undefined, blob);
 
       setShowTimesheetDialog(false);
     } catch (err: any) {
@@ -1022,6 +1025,8 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
                     <>Using newly uploaded template: <strong>{monthTemplateFile.name}</strong></>
                   ) : timesheetTemplate?.templateName ? (
                     <>Using saved month-specific template: <strong>{timesheetTemplate.templateName}</strong></>
+                  ) : clientTimesheetTemplate?.storagePath || selectedClient.timesheetTemplateStoragePath ? (
+                    <>Using template from Firebase Storage: <strong>{clientTimesheetTemplate?.fileName || selectedClient.timesheetTemplateName || 'Stored Template'}</strong></>
                   ) : selectedClient.timesheetTemplateName ? (
                     <>Using client default template: <strong>{selectedClient.timesheetTemplateName}</strong></>
                   ) : (
@@ -1121,7 +1126,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
               </button>
               <button
                 onClick={handleGenerateTimesheet}
-                disabled={generatingTimesheet || (!selectedClient.timesheetTemplateBase64 && !timesheetTemplate?.templateBase64 && !monthTemplateBase64)}
+                disabled={generatingTimesheet || (!clientTimesheetTemplate?.storagePath && !selectedClient.timesheetTemplateStoragePath && !timesheetTemplate?.templateStoragePath && !monthTemplateStoragePath)}
                 className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white rounded-lg font-medium flex items-center gap-2"
               >
                 {generatingTimesheet ? (

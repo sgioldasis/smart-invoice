@@ -202,7 +202,18 @@ ${request.prompt}`;
       geminiAnalysis: parsedResponse,
     };
   } catch (error) {
-    console.error('Error calling Gemini API:', error);
+    // Check if this is a quota/rate limit error (429)
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const isQuotaError = errorMessage.includes('429') ||
+                         errorMessage.includes('quota') ||
+                         errorMessage.includes('RESOURCE_EXHAUSTED') ||
+                         errorMessage.includes('rate limit');
+    
+    if (isQuotaError) {
+      console.warn('Gemini API quota exceeded. Falling back to local parsing. Please check your billing plan.');
+    } else {
+      console.error('Error calling Gemini API:', error);
+    }
     // Fall back to local parsing
     const localResult = parseTimesheetPromptLocally(request.prompt, request.existingMapping);
     return {

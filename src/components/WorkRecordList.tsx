@@ -231,12 +231,12 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     const timesheet = getTimesheetForRecord(record.id);
     
     const associatedDocs: string[] = [];
-    if (invoice) associatedDocs.push(`Invoice (${invoice.documentNumber || 'unnamed'})`);
-    if (timesheet) associatedDocs.push(`Timesheet (${timesheet.documentNumber || 'unnamed'})`);
+    if (invoice) associatedDocs.push(`Invoice: ${invoice.fileName || invoice.documentNumber || 'unnamed'}`);
+    if (timesheet) associatedDocs.push(`Timesheet: ${timesheet.fileName || timesheet.documentNumber || 'unnamed'}`);
     
     let confirmMessage = 'Are you sure you want to delete this work record?';
     if (associatedDocs.length > 0) {
-      confirmMessage = `⚠️ Warning: This work record has associated documents that will also be deleted:\n\n${associatedDocs.map(d => `• ${d}`).join('\n')}\n\nAre you sure you want to delete this work record and all its associated documents?`;
+      confirmMessage = `\n⚠️ Warning: This work record has associated documents that will also be deleted:\n\n${associatedDocs.map(d => `  • ${d}`).join('\n')}\n\nAre you sure you want to delete this work record and all its associated documents?\n`;
     }
     
     if (!confirm(confirmMessage)) {
@@ -487,16 +487,17 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         month: dialogRecord.month,
         workingDays: dialogRecord.workingDays.length,
         workingDaysArray: dialogRecord.workingDays,
-        weekendDatesArray: dialogRecord.weekendDates, // Store for outdated detection
+        weekendDatesArray: dialogRecord.weekendDates,
         dailyRate: dialogClient.dailyRate || 0,
         totalAmount: daysWorked * (dialogClient.dailyRate || 0),
         fileName: generatedFileName,
-        fileData: fileData, // Store the Excel file data for download
+        storagePath: '', // Will be set by saveDocument after upload
+        downloadUrl: '', // Will be set by saveDocument after upload
         isOutdated: false,
         outdatedAt: null,
       };
 
-      await saveDocument(userId, invoiceData, existingInvoiceId || undefined);
+      await saveDocument(userId, invoiceData, existingInvoiceId || undefined, blob);
 
       const updatedInvoices = await getDocuments(userId);
       setInvoices(updatedInvoices);
@@ -543,7 +544,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       const existingTimesheet = await getTimesheetByWorkRecord(record.id);
       if (existingTimesheet) {
         setTimesheetPrompt(existingTimesheet.prompt || client.timesheetPrompt || '');
-        setTimesheetMonthTemplate(existingTimesheet.templateBase64 || null);
+        setTimesheetMonthTemplate(existingTimesheet.templateStoragePath || null);
         setTimesheetMonthTemplateName(existingTimesheet.templateName || '');
         setExistingTimesheetId(existingTimesheet.id);
       } else {
@@ -634,10 +635,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         if (dateScore > maxScore) {
           maxScore = dateScore;
           worksheet = ws;
-          console.log(`HEURISTIC: Candidate worksheet "${ws.name}" has score ${dateScore}`);
         }
       }
-      console.log(`HEURISTIC: Final target worksheet "${worksheet.name}" (Score: ${maxScore})`);
 
       // Mark all formula cells for recalculation by clearing cached results
       worksheet.eachRow((row) => {
@@ -750,9 +749,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       */
 
       // Parse prompt using Gemini AI (with fallback to local parsing)
-      console.log('Timesheet prompt value:', timesheetPrompt);
-      console.log('Processing prompt with Gemini AI...');
-
       let aiResult = null;
       try {
         aiResult = await processTimesheetPromptSmart({
@@ -761,16 +757,12 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           clientName: timesheetClient.name,
           month: timesheetRecord.month,
         });
-        console.log('AI Config received:', JSON.stringify(aiResult, null, 2));
       } catch (aiError) {
         console.error('AI processing failed, will use fallback:', aiError);
       }
 
       // Fallback: Extract cell references and instructions from the prompt locally
       const promptLower = (timesheetPrompt || '').toLowerCase();
-
-      // NEW: Check for explicit "Do NOT change any styles" instruction
-      const disableStyling = promptLower.includes('do not change') && (promptLower.includes('styles') || promptLower.includes('formatting'));
 
       // Look for cell references like "cell C11", ranges like "C13 to AG13", etc.
       const periodCellMatch = promptLower.match(/(?:period|date).*?cell\s+([a-z]+\d+)/i);
@@ -780,9 +772,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       // Enhanced data row match to catch "data row... cells c14 up to ag14"
       const dataRangeMatch = promptLower.match(/(?:data row|work hours).*?\(?cells?\s+([a-z]+\d+).*?(?:to|up to)\s+([a-z]+\d+)\)?/i);
       const hoursValueMatch = promptLower.match(/(?:place|put|fill).*?(\d+(?:\.\d+)?).*?(?:hours?|work)/i);
-
-      // Parse style row range if specified (e.g., "rows 14-20")
-      const styleRowRangeMatch = promptLower.match(/rows?\s+(\d+)(?:\s*-\s*|\s+to\s+)(\d+)/i);
 
       // Extract values from AI result or use local parsing
       const aiAnalysis = aiResult?.geminiAnalysis;
@@ -798,18 +787,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       const dataRangeStart = aiAnalysis?.hoursRange?.start || (dataRangeMatch ? dataRangeMatch[1] : null);
       const dataRangeEnd = aiAnalysis?.hoursRange?.end || (dataRangeMatch ? dataRangeMatch[2] : null);
 
-      // Style rows range (e.g., 14-20)
-      const styleStartRow = aiAnalysis?.styleRows?.start || (styleRowRangeMatch ? parseInt(styleRowRangeMatch[1]) : null);
-      const styleEndRow = aiAnalysis?.styleRows?.end || (styleRowRangeMatch ? parseInt(styleRowRangeMatch[2]) : null);
 
-      console.log('=== PROMPT PARSING RESULTS ===');
-      console.log('AI used:', aiResult !== null);
-      console.log('AI full analysis:', aiAnalysis);
-      console.log('periodCell:', periodCellValue || 'NOT FOUND');
-      console.log('dayNumbersRange:', dayNumbersStart && dayNumbersEnd ? `${dayNumbersStart} to ${dayNumbersEnd}` : 'NOT FOUND');
-      console.log('dataRange:', dataRangeStart && dataRangeEnd ? `${dataRangeStart} to ${dataRangeEnd}` : 'NOT FOUND');
-      console.log('hoursPerDay:', aiResult?.mapping?.hoursPerDay || (hoursValueMatch ? hoursValueMatch[1] : 'NOT FOUND'));
-      console.log('styleRows:', styleStartRow && styleEndRow ? `${styleStartRow}-${styleEndRow}` : 'NOT FOUND');
 
       // Parse the work record month for period cell
       const [year, month] = timesheetRecord.month.split('-').map(Number);
@@ -830,7 +808,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       if (periodCellValue) {
         const periodCell = worksheet.getCell(periodCellValue.toUpperCase());
         periodCell.value = periodText;
-        console.log(`Updated period cell ${periodCellValue.toUpperCase()} to: ${periodText}`);
       }
 
       // NEW: Vertical Fill Support (e.g. "In column B, fill a 1 for working days... If it's a day off put a 0 in column B and 'Other' in column C")
@@ -872,7 +849,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         }
 
         if (dayOffMatch) {
-          console.log(`DAY OFF LOGIC: col ${dayOffCol}=${dayOffValue}${dayOffLabel ? `, col ${dayOffLabelCol}="${dayOffLabel}"` : ''}`);
+          // Day off logic configured
         }
 
         const workingDaySet = new Set(timesheetRecord.workingDays);
@@ -883,7 +860,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
         // PASS 1: DATE SYNC (if requested)
         if (dateFillMatch) {
-          console.log(`DATE SYNC DETECTED: Overwriting col ${refCol} with dates for ${recordMonth}`);
 
           let startRow = -1;
           const getDayVal = (cell: any) => {
@@ -918,7 +894,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           // FINAL DECISION: User has repeatedly confirmed start row is 2.
           // We force 2 to ensure no leftover March/January dates.
           startRow = 2;
-          console.log(`DEEP SYNC: Forced startRow to 2 for definitive alignment.`);
 
           if (startRow !== -1) {
             // Fill days only in rows that are meant for dates
@@ -942,8 +917,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                 const serialDate = (dUTC.getTime() / (24 * 60 * 60 * 1000)) + 25569;
                 cell.value = serialDate;
                 cell.numFmt = 'dddd, mmmm d, yyyy'; // descriptive: "Wednesday, April 1, 2026"
-              } else {
-                console.log(`Skipping row ${currentRow} col ${refCol} - contains non-date value:`, currentValue);
               }
             }
             
@@ -1109,54 +1082,11 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             cell.value = dayNum;
           }
         }
-        console.log(`Updated day numbers in row ${startRow}, columns ${startCol} to ${endCol}`);
+
       }
 
       // Fill hours in data row range for working days only (e.g., C14 to AG14)
       const hoursPerDay = aiResult?.mapping?.hoursPerDay || (hoursValueMatch ? parseFloat(hoursValueMatch[1]) : 8);
-
-      // Extract style cell references from AI analysis or prompt
-      // AI returns styling info directly - we don't need to parse from text anymore
-      console.log('DEBUG: AI styling analysis:', aiAnalysis?.styling);
-      console.log('DEBUG: styleRows from AI:', aiAnalysis?.styleRows);
-
-      // Use AI-extracted style information if available, otherwise fall back to pattern detection
-      let workingDayCell: string | null = null;
-      let weekendCell: string | null = null;
-
-      // If AI has analysis with style information, use it
-      if (aiAnalysis?.styling) {
-        // AI identified working day and weekend colors/cells
-        console.log('AI detected styling configuration');
-      }
-
-      // Fallback: Parse style cells from prompt text
-      // Find all occurrences of "cell XX for" pattern
-      const allCellRefs = [...promptLower.matchAll(/cell\s+([a-z]+\d+)\s+for/gi)];
-      console.log('DEBUG: All cell references found:', allCellRefs.map(m => m[1]));
-
-      for (const match of allCellRefs) {
-        const cellRef = match[1].toUpperCase();
-        const matchIndex = match.index || 0;
-        // Look at what comes after this match (within next 50 chars) to determine type
-        const followingText = promptLower.substring(matchIndex, matchIndex + 50);
-        console.log(`Cell ${cellRef} followed by:`, followingText);
-
-        if (followingText.includes('working')) {
-          workingDayCell = cellRef;
-        } else if (followingText.includes('weekend')) {
-          weekendCell = cellRef;
-        }
-      }
-
-      // Create match-like objects for compatibility with existing code
-      const workingDayStyleMatch = workingDayCell ? [null, workingDayCell] : null;
-      const weekendStyleMatch = weekendCell ? [null, weekendCell] : null;
-
-      console.log('Style matches:', {
-        workingDayCell: workingDayStyleMatch ? workingDayStyleMatch[1] : null,
-        weekendCell: weekendStyleMatch ? weekendStyleMatch[1] : null,
-      });
 
       if (dataRangeStart && dataRangeEnd) {
         const startCell = dataRangeStart.toUpperCase();
@@ -1169,9 +1099,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
         const startColNumInitial = colLetterToNumber(startCol);
 
-        console.log(`Processing hours in row ${dataRow}, columns ${startCol}(${startColNumInitial}) to ${endCol}(${colLetterToNumber(endCol)})`);
-        console.log('>>> ENTERING STYLING CODE BLOCK - dataRangeMatch was found');
-
         // FIX: Ensure data/styling loop aligns with day numbers loop if available
         // This prevents "shifting" of gray cells if the AI/Regex detects slightly different start columns
         if (dayNumbersStart && typeof dayNumbersStart === 'string') {
@@ -1182,8 +1109,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             if (dayStartColMatch) {
               const dayStartCol = dayStartColMatch[0];
               if (dayStartCol !== startCol) {
-                console.log(`Aligning data loop start column from ${startCol} to ${dayStartCol} to match day numbers.`);
-
                 // Calculate shift to adjust endCol as well
                 const oldStartNum = colLetterToNumber(startCol);
                 const newStartNum = colLetterToNumber(dayStartCol);
@@ -1203,94 +1128,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         const startColNum = colLetterToNumber(startCol);
         const endColNum = colLetterToNumber(endCol);
 
-        // Capture styles from template cells if specified
-        let workingDayStyle: any = null;
-        let weekendStyle: any = null;
-
-        // Helper to capture full cell style including fill
-        const captureCellStyle = (cellAddr: string): any => {
-          const cell = worksheet.getCell(cellAddr);
-          const fill = cell.fill as any;
-          console.log(`Raw cell ${cellAddr} properties:`, {
-            fill: fill,
-            type: fill?.type,
-            pattern: fill?.pattern,
-            fgColor: fill?.fgColor,
-            bgColor: fill?.bgColor,
-          });
-          const style: any = {};
-
-          // Capture fill (background color) - this is the most important for gray/white
-          if (cell.fill) {
-            // Deep copy the fill object
-            style.fill = JSON.parse(JSON.stringify(cell.fill));
-            console.log(`  Captured fill for ${cellAddr}:`, style.fill);
-          }
-
-          // Capture font
-          if (cell.font) {
-            style.font = JSON.parse(JSON.stringify(cell.font));
-          }
-
-          // Capture border
-          if (cell.border) {
-            style.border = JSON.parse(JSON.stringify(cell.border));
-          }
-
-          // Capture alignment
-          if (cell.alignment) {
-            style.alignment = JSON.parse(JSON.stringify(cell.alignment));
-          }
-
-          // Capture number format
-          if (cell.numFmt) {
-            style.numFmt = cell.numFmt;
-          }
-
-          return style;
-        };
-
-        console.log('DEBUG: workingDayCell value:', workingDayCell);
-        console.log('DEBUG: workingDayStyleMatch:', workingDayStyleMatch);
-
-        if (workingDayStyleMatch && workingDayStyleMatch[1]) {
-          const workingDayCellRef = workingDayStyleMatch[1].toUpperCase();
-          console.log('DEBUG: About to capture from:', workingDayCellRef);
-          workingDayStyle = captureCellStyle(workingDayCellRef);
-          console.log(`CAPTURED working day style from ${workingDayCellRef}:`,
-            workingDayStyle && workingDayStyle.fill ? 'HAS FILL: ' + JSON.stringify(workingDayStyle.fill) : 'NO FILL');
-        } else {
-          console.log('DEBUG: workingDayStyleMatch is null or has no cell ref');
-        }
-
-        if (weekendStyleMatch && weekendStyleMatch[1]) {
-          const weekendCellRef = weekendStyleMatch[1].toUpperCase();
-          weekendStyle = captureCellStyle(weekendCellRef);
-          console.log(`CAPTURED weekend style from ${weekendCellRef}:`,
-            weekendStyle && weekendStyle.fill ? 'HAS FILL: ' + JSON.stringify(weekendStyle.fill) : 'NO FILL');
-        }
-
-        // Determine style row range (use AI-extracted or parsed values, default to data row)
-        const finalStyleStartRow = styleStartRow || dataRow;
-        const finalStyleEndRow = styleEndRow || dataRow;
-
         // Convert working days to a Set for quick lookup (using day of month as number)
         const workingDayNumbers = new Set(
           timesheetRecord.workingDays.map(dateStr => parseInt(dateStr.split('-')[2]))
         );
-
-        // Build a map of which day numbers are weekends
-        const weekendDayNumbers = new Set<number>();
-        for (let dayNum = 1; dayNum <= daysInMonth; dayNum++) {
-          const date = new Date(year, month - 1, dayNum);
-          const dayOfWeek = date.getDay();
-          if (dayOfWeek === 0 || dayOfWeek === 6) {
-            weekendDayNumbers.add(dayNum);
-          }
-        }
-
-        console.log('Weekend day numbers:', Array.from(weekendDayNumbers));
-        console.log('Working day numbers:', Array.from(workingDayNumbers));
 
         // STEP 1: Clear hours cells values only (not backgrounds)
         for (let colNum = startColNum; colNum <= endColNum; colNum++) {
@@ -1299,16 +1140,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             cell.value = null;
           }
         }
-
-        // REMOVED: Apply WHITE to ALL cells. User requested to preserve template formatting.
-        /*
-        for (let colNum = startColNum; colNum <= endColNum; colNum++) {
-          const colLetter = colNumberToLetter(colNum);
-          for (let styleRow = finalStyleStartRow; styleRow <= finalStyleEndRow; styleRow++) {
-             // ...
-          }
-        }
-        */
 
         // Extract day numbers row index if available
         let dayNumbersRowIndex: number | null = null;
@@ -1319,20 +1150,17 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           }
         }
 
-        // STEP 3: Fill hours and apply gray ONLY to weekends
-        const grayCols: string[] = [];
+        // STEP 3: Fill hours
         // We iterate based on the range, but we ONLY act if we find a valid day number
         // We do typically 31 columns max
         for (let colNum = startColNum; colNum <= endColNum; colNum++) {
           const cell = worksheet.getRow(dataRow).getCell(colNum);
           if (!cell) continue;
 
-          let isWeekend = false;
           let isValidDay = false;
           let currentDayNum = 0;
 
           // PREFERRED: Read the actual day number from the sheet if we know the row
-          // This satisfies the user request to "check the number in line 13"
           if (dayNumbersRowIndex) {
             const dayNumCell = worksheet.getRow(dayNumbersRowIndex).getCell(colNum);
             const cellValue = dayNumCell.value;
@@ -1348,43 +1176,11 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             if (parsedDayNum > 0 && parsedDayNum <= 31) {
               currentDayNum = parsedDayNum;
               isValidDay = true;
-
-              // Check if THIS specific day number is a weekend
-              isWeekend = weekendDayNumbers.has(currentDayNum);
             }
           }
-
-          // AGGRESSIVE GRID CLEANING or JUST FILL DATA
-          // If styling is disabled, we ONLY touch the value.
 
           if (isValidDay && workingDayNumbers.has(currentDayNum)) {
             cell.value = hoursPerDay;
-          }
-
-          // Apply styling ONLY if not disabled
-          if (!disableStyling) {
-            const colLetter = colNumberToLetter(colNum);
-
-            for (let styleRow = finalStyleStartRow; styleRow <= finalStyleEndRow; styleRow++) {
-              const styleCell = worksheet.getCell(`${colLetter}${styleRow}`);
-
-              if (isValidDay && isWeekend) {
-                // Verified Weekend -> Paint Gray
-                grayCols.push(colLetter);
-                styleCell.fill = {
-                  type: 'pattern',
-                  pattern: 'solid',
-                  fgColor: { argb: 'FFD3D3D3' }
-                };
-              } else {
-                // Not a Weekend (Weekday OR Empty Column) -> Force Clear Fill
-                // This is necessary because the template seems to be pre-filled with gray
-                styleCell.fill = {
-                  type: 'pattern',
-                  pattern: 'none'
-                };
-              }
-            }
           }
         }
       }
@@ -1415,7 +1211,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           }
 
           worksheet.name = newName;
-          console.log(`Renamed worksheet from "${oldName}" to: "${newName}"`);
         } catch (e) {
           console.error('Error renaming worksheet:', e);
         }
@@ -1457,21 +1252,22 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         month: timesheetRecord.month,
         workingDays: timesheetRecord.workingDays.length,
         workingDaysArray: timesheetRecord.workingDays,
-        weekendDatesArray: timesheetRecord.weekendDates, // Store for outdated detection
+        weekendDatesArray: timesheetRecord.weekendDates,
         dailyRate: timesheetClient.dailyRate || 0,
         totalAmount: (timesheetRecord.workingDays.length * (timesheetClient.dailyRate || 0)),
         fileName: fileName,
-        fileData: fileData, // Store the Excel file data for download
+        storagePath: '', // Will be set by saveDocument after upload
+        downloadUrl: '', // Will be set by saveDocument after upload
         isPaid: false,
         isOutdated: false,
-        outdatedAt: null, // Clear the outdated timestamp when regenerating
+        outdatedAt: null,
       };
 
       // Check for existing document to overwrite
       const existingDoc = invoices.find(
         (d) => d.workRecordId === timesheetRecord.id && d.type === 'timesheet'
       );
-      await saveDocument(userId, documentData, existingDoc?.id);
+      await saveDocument(userId, documentData, existingDoc?.id, blob);
 
       // Refresh invoices list
       const updatedDocs = await getDocuments(userId);
@@ -1483,7 +1279,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         workRecordId: timesheetRecord.id,
         month: timesheetRecord.month,
         prompt: timesheetPrompt || null,
-        templateBase64: timesheetMonthTemplate || null,
+        templateStoragePath: timesheetMonthTemplate || null,
         templateName: timesheetMonthTemplateName || null,
       };
 

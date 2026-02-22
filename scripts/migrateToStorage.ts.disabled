@@ -1,0 +1,397 @@
+/**
+ * Node.js Migration Script: Move base64 files from Firestore to Firebase Storage
+ *
+ * This script runs from the command line using Firebase Admin SDK.
+ *
+ * Prerequisites:
+ *   1. Install Firebase Admin SDK: npm install firebase-admin
+ *   2. Set up service account credentials (see below)
+ *
+ * Usage:
+ *   npx tsx scripts/migrateToStorage.ts <userId>
+ *
+ * Or with npm script:
+ *   npm run migrate:storage <userId>
+ *
+ * Service Account Setup:
+ *   1. Go to Firebase Console → Project Settings → Service Accounts
+ *   2. Click "Generate new private key"
+ *   3. Save the JSON file and set the path:
+ *      export GOOGLE_APPLICATION_CREDENTIALS="/path/to/serviceAccountKey.json"
+ */
+
+import { initializeApp, cert, getApps } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+import { getStorage } from 'firebase-admin/storage';
+
+// Initialize Firebase Admin
+if (getApps().length === 0) {
+  initializeApp({
+    storageBucket: 'smart-invoice-16f95.firebasestorage.app',
+  });
+}
+
+const db = getFirestore();
+const storage = getStorage();
+const bucket = storage.bucket();
+
+const COLLECTIONS = {
+  TEMPLATES: 'templates',
+  DOCUMENTS: 'documents',
+} as const;
+
+interface MigrationResult {
+  total: number;
+  migrated: number;
+  failed: number;
+  errors: Array<{ id: string; error: string }>;
+}
+
+/**
+ * Migrate a single template to Firebase Storage
+ */
+async function migrateTemplateToStorage(
+  userId: string,
+  templateId: string,
+  clientId: string,
+  fileName: string,
+  base64Data: string
+): Promise<{ success: boolean; storagePath?: string; downloadUrl?: string; error?: string }> {
+  try {
+    // Remove data URL prefix if present
+    const base64 = base64Data.replace(/^data:[^;]+;base64,/, '');
+
+    // Build storage path
+    const storagePath = `users/${userId}/templates/${clientId}/${templateId}/${fileName}`;
+
+    // Upload to Storage
+    const buffer = Buffer.from(base64, 'base64');
+    const file = bucket.file(storagePath);
+
+    await file.save(buffer, {
+      metadata: {
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        metadata: {
+          userId,
+          clientId,
+          templateId,
+          originalCollection: 'templates',
+        },
+      },
+    });
+
+    // Make file publicly accessible (or use signed URLs)
+    await file.makePublic();
+    const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+
+    // Update Firestore document with storage info
+    const templateRef = db.collection(COLLECTIONS.TEMPLATES).doc(templateId);
+    await templateRef.update({
+      storagePath,
+      downloadUrl,
+      // Optionally clear base64Data after successful migration:
+      // base64Data: admin.firestore.FieldValue.delete(),
+    });
+
+    console.log(`  ✓ Template ${templateId} migrated: ${storagePath}`);
+
+    return { success: true, storagePath, downloadUrl };
+  } catch (error) {
+    console.error(`  ✗ Error migrating template ${templateId}:`, error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Migrate a single document to Firebase Storage
+ */
+async function migrateDocumentToStorage(
+  userId: string,
+  documentId: string,
+  clientId: string,
+  fileName: string,
+  fileData: string
+): Promise<{ success: boolean; storagePath?: string; downloadUrl?: string; error?: string }> {
+  try {
+    // Remove data URL prefix if present
+    const base64 = fileData.replace(/^data:[^;]+;base64,/, '');
+
+    // Build storage path
+    const storagePath = `users/${userId}/documents/${clientId}/${documentId}/${fileName}`;
+
+    // Upload to Storage
+    const buffer = Buffer.from(base64, 'base64');
+    const file = bucket.file(storagePath);
+
+    await file.save(buffer, {
+      metadata: {
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        metadata: {
+          userId,
+          clientId,
+          documentId,
+          originalCollection: 'documents',
+        },
+      },
+    });
+
+    // Make file publicly accessible (or use signed URLs)
+    await file.makePublic();
+    const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+
+    // Update Firestore document with storage info
+    const documentRef = db.collection(COLLECTIONS.DOCUMENTS).doc(documentId);
+    await documentRef.update({
+      storagePath,
+      downloadUrl,
+      // Optionally clear fileData after successful migration:
+      // fileData: admin.firestore.FieldValue.delete(),
+    });
+
+    console.log(`  ✓ Document ${documentId} migrated: ${storagePath}`);
+
+    return { success: true, storagePath, downloadUrl };
+  } catch (error) {
+    console.error(`  ✗ Error migrating document ${documentId}:`, error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * Migrate all templates for a user
+ */
+async function migrateUserTemplates(userId: string): Promise<MigrationResult> {
+  const result: MigrationResult = {
+    total: 0,
+    migrated: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  console.log(`\n📋 Migrating templates for user ${userId}...`);
+
+  try {
+    const snapshot = await db
+      .collection(COLLECTIONS.TEMPLATES)
+      .where('userId', '==', userId)
+      .get();
+
+    const templatesToMigrate = snapshot.docs.filter(
+      (doc) => doc.data().base64Data && !doc.data().storagePath
+    );
+
+    result.total = templatesToMigrate.length;
+    console.log(`  Found ${result.total} templates to migrate`);
+
+    for (const templateDoc of templatesToMigrate) {
+      const data = templateDoc.data();
+      const migrationResult = await migrateTemplateToStorage(
+        userId,
+        templateDoc.id,
+        data.clientId,
+        data.fileName,
+        data.base64Data
+      );
+
+      if (migrationResult.success) {
+        result.migrated++;
+      } else {
+        result.failed++;
+        result.errors.push({
+          id: templateDoc.id,
+          error: migrationResult.error || 'Unknown error',
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error migrating templates:', error);
+  }
+
+  return result;
+}
+
+/**
+ * Migrate all documents for a user
+ */
+async function migrateUserDocuments(userId: string): Promise<MigrationResult> {
+  const result: MigrationResult = {
+    total: 0,
+    migrated: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  console.log(`\n📄 Migrating documents for user ${userId}...`);
+
+  try {
+    const snapshot = await db
+      .collection(COLLECTIONS.DOCUMENTS)
+      .where('userId', '==', userId)
+      .get();
+
+    const documentsToMigrate = snapshot.docs.filter(
+      (doc) => doc.data().fileData && !doc.data().storagePath
+    );
+
+    result.total = documentsToMigrate.length;
+    console.log(`  Found ${result.total} documents to migrate`);
+
+    for (const documentDoc of documentsToMigrate) {
+      const data = documentDoc.data();
+      const migrationResult = await migrateDocumentToStorage(
+        userId,
+        documentDoc.id,
+        data.clientId,
+        data.fileName || 'document.xlsx',
+        data.fileData
+      );
+
+      if (migrationResult.success) {
+        result.migrated++;
+      } else {
+        result.failed++;
+        result.errors.push({
+          id: documentDoc.id,
+          error: migrationResult.error || 'Unknown error',
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error migrating documents:', error);
+  }
+
+  return result;
+}
+
+/**
+ * Check migration status for a user
+ */
+async function checkMigrationStatus(userId: string): Promise<void> {
+  console.log(`\n📊 Migration status for user ${userId}:`);
+
+  try {
+    const templatesSnapshot = await db
+      .collection(COLLECTIONS.TEMPLATES)
+      .where('userId', '==', userId)
+      .get();
+    const templates = templatesSnapshot.docs.map((d) => d.data());
+
+    const documentsSnapshot = await db
+      .collection(COLLECTIONS.DOCUMENTS)
+      .where('userId', '==', userId)
+      .get();
+    const documents = documentsSnapshot.docs.map((d) => d.data());
+
+    console.log(`  Templates:`);
+    console.log(`    Total: ${templates.length}`);
+    console.log(`    Migrated (has storagePath): ${templates.filter((t) => t.storagePath).length}`);
+    console.log(`    Pending (has base64Data, no storagePath): ${templates.filter((t) => t.base64Data && !t.storagePath).length}`);
+
+    console.log(`  Documents:`);
+    console.log(`    Total: ${documents.length}`);
+    console.log(`    Migrated (has storagePath): ${documents.filter((d) => d.storagePath).length}`);
+    console.log(`    Pending (has fileData, no storagePath): ${documents.filter((d) => d.fileData && !d.storagePath).length}`);
+  } catch (error) {
+    console.error('Error checking migration status:', error);
+  }
+}
+
+/**
+ * Main migration function
+ */
+async function migrateAll(userId: string): Promise<void> {
+  console.log(`\n🚀 Starting migration for user ${userId}...\n`);
+
+  const startTime = Date.now();
+
+  const [templatesResult, documentsResult] = await Promise.all([
+    migrateUserTemplates(userId),
+    migrateUserDocuments(userId),
+  ]);
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+
+  console.log(`\n✅ Migration complete in ${duration}s`);
+  console.log(`\n📈 Summary:`);
+  console.log(`  Templates: ${templatesResult.migrated}/${templatesResult.total} migrated, ${templatesResult.failed} failed`);
+  console.log(`  Documents: ${documentsResult.migrated}/${documentsResult.total} migrated, ${documentsResult.failed} failed`);
+
+  if (templatesResult.errors.length > 0 || documentsResult.errors.length > 0) {
+    console.log(`\n❌ Errors encountered:`);
+    [...templatesResult.errors, ...documentsResult.errors].forEach((err) => {
+      console.log(`    - ${err.id}: ${err.error}`);
+    });
+    process.exit(1);
+  }
+}
+
+/**
+ * Main entry point
+ */
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const command = args[0];
+  const userId = args[1];
+
+  if (!command) {
+    console.log(`
+Usage:
+  npx tsx scripts/migrateToStorage.ts <command> <userId>
+
+Commands:
+  status    Check migration status for a user
+  migrate   Run the migration for a user
+
+Examples:
+  npx tsx scripts/migrateToStorage.ts status abc123xyz
+  npx tsx scripts/migrateToStorage.ts migrate abc123xyz
+`);
+    process.exit(1);
+  }
+
+  if (!userId) {
+    console.error('Error: userId is required');
+    process.exit(1);
+  }
+
+  // Check for service account credentials
+  const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (!credentialsPath) {
+    console.warn(`
+⚠️  Warning: GOOGLE_APPLICATION_CREDENTIALS environment variable is not set.
+   Using default application credentials. If this fails, set the path to your
+   service account key file:
+
+   export GOOGLE_APPLICATION_CREDENTIALS="/path/to/serviceAccountKey.json"
+`);
+  } else {
+    console.log(`✓ Using credentials: ${credentialsPath}`);
+  }
+
+  try {
+    switch (command) {
+      case 'status':
+        await checkMigrationStatus(userId);
+        break;
+      case 'migrate':
+        await migrateAll(userId);
+        break;
+      default:
+        console.error(`Unknown command: ${command}`);
+        process.exit(1);
+    }
+  } catch (error) {
+    console.error('Migration failed:', error);
+    process.exit(1);
+  }
+
+  process.exit(0);
+}
+
+main();

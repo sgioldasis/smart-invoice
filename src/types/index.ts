@@ -35,7 +35,10 @@ export interface Template {
   type: 'invoice' | 'timesheet';
   name: string;
   fileName: string;
-  base64Data: string;
+  /** Firebase Storage path to the file */
+  storagePath: string;
+  /** Public download URL for the file */
+  downloadUrl: string;
   mapping?: CellMapping;          // For invoice templates
   timesheetMapping?: TimesheetMapping;  // For timesheet templates
   timesheetPrompt?: string;       // For timesheet templates
@@ -60,14 +63,11 @@ export interface Client {
   // Template references (new structure)
   invoiceTemplateId?: string;     // Reference to template doc
   timesheetTemplateId?: string;   // Reference to template doc
-  // Legacy fields (kept for migration compatibility)
-  templateName?: string;
-  templateBase64?: string;
-  timesheetTemplateName?: string;
-  timesheetTemplateBase64?: string;
+  // Template metadata (for display purposes only)
+  invoiceTemplateFileName?: string;
+  timesheetTemplateFileName?: string;
   timesheetPrompt?: string;
   timesheetMapping?: TimesheetMapping;
-  timesheetTemplateFileName?: string;
 }
 
 // ============================================
@@ -159,7 +159,8 @@ export interface WorkRecordTimesheet {
   
   // Month-specific template (optional - falls back to client's default)
   templateName?: string;
-  templateBase64?: string;
+  /** Firebase Storage path to the month-specific template */
+  templateStoragePath?: string;
   
   // Month-specific prompt (optional - falls back to client's default)
   prompt?: string;
@@ -177,7 +178,7 @@ export interface WorkRecordTimesheetInput {
   workRecordId: string;
   month: string;
   templateName?: string | null;
-  templateBase64?: string | null;
+  templateStoragePath?: string | null;
   prompt?: string | null;
 }
 
@@ -214,8 +215,11 @@ export interface Document {
   generatedAt: string; // ISO timestamp
   fileName?: string;
 
-  // File data for download
-  fileData?: string; // Base64 encoded Excel file
+  // Firebase Storage references (required)
+  /** Firebase Storage path to the generated file */
+  storagePath: string;
+  /** Public download URL for the generated file */
+  downloadUrl: string;
 
   // Invoice-specific fields
   isPaid?: boolean;
@@ -241,7 +245,10 @@ export interface DocumentInput {
   dailyRate: number;
   totalAmount: number;
   fileName?: string;
-  fileData?: string; // Base64 encoded Excel file
+  /** Firebase Storage path to the generated file (required) */
+  storagePath: string;
+  /** Public download URL for the generated file (required) */
+  downloadUrl: string;
   isPaid?: boolean;
   paidAt?: string;
   isOutdated?: boolean;

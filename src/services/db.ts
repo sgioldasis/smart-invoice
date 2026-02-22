@@ -34,6 +34,12 @@ import type {
   WorkRecordTimesheetInput,
   Template,
 } from '../types';
+import {
+  uploadTemplate as uploadTemplateToStorage,
+  deleteTemplateFile,
+  uploadDocument as uploadDocumentToStorage,
+  deleteDocumentFile,
+} from './storage';
 
 // ============================================
 // Collection References
@@ -80,14 +86,11 @@ export async function saveClient(client: Client): Promise<void> {
       // Template references (new structure)
       invoiceTemplateId: client.invoiceTemplateId ?? null,
       timesheetTemplateId: client.timesheetTemplateId ?? null,
-      // Legacy fields (kept for migration compatibility)
-      templateName: client.templateName ?? null,
-      templateBase64: client.templateBase64 ?? null,
-      timesheetTemplateName: client.timesheetTemplateName ?? null,
-      timesheetTemplateBase64: client.timesheetTemplateBase64 ?? null,
+      // Template metadata (for display purposes only)
+      invoiceTemplateFileName: client.invoiceTemplateFileName ?? null,
+      timesheetTemplateFileName: client.timesheetTemplateFileName ?? null,
       timesheetPrompt: client.timesheetPrompt ?? null,
       timesheetMapping: client.timesheetMapping ?? null,
-      timesheetTemplateFileName: client.timesheetTemplateFileName ?? null,
     };
 
     await setDoc(clientRef, clientData, { merge: true });
@@ -170,11 +173,35 @@ export async function getTemplateById(id: string): Promise<Template | null> {
   }
 }
 
-export async function saveTemplate(template: Template): Promise<Template> {
+export async function saveTemplate(
+  template: Template,
+  fileData?: File
+): Promise<Template> {
   try {
     const now = new Date().toISOString();
     const isNew = !template.id || template.id === '';
     const id = isNew ? crypto.randomUUID() : template.id;
+
+    let storagePath = template.storagePath;
+    let downloadUrl = template.downloadUrl;
+
+    // Upload file to Firebase Storage if fileData is provided
+    if (fileData) {
+      const uploadResult = await uploadTemplateToStorage(
+        template.userId,
+        template.clientId,
+        id,
+        template.fileName,
+        fileData
+      );
+      storagePath = uploadResult.storagePath;
+      downloadUrl = uploadResult.downloadUrl;
+    }
+
+    // storagePath and downloadUrl are required
+    if (!storagePath || !downloadUrl) {
+      throw new Error('storagePath and downloadUrl are required. Please upload a file.');
+    }
 
     const templateData = {
       userId: template.userId,
@@ -182,7 +209,8 @@ export async function saveTemplate(template: Template): Promise<Template> {
       type: template.type,
       name: template.name,
       fileName: template.fileName,
-      base64Data: template.base64Data,
+      storagePath,
+      downloadUrl,
       mapping: template.mapping ?? null,
       timesheetMapping: template.timesheetMapping ?? null,
       timesheetPrompt: template.timesheetPrompt ?? null,
@@ -200,8 +228,19 @@ export async function saveTemplate(template: Template): Promise<Template> {
   }
 }
 
-export async function deleteTemplate(id: string): Promise<void> {
+export async function deleteTemplate(id: string, storagePath?: string): Promise<void> {
   try {
+    // Delete file from Firebase Storage if path exists
+    if (storagePath) {
+      try {
+        await deleteTemplateFile(storagePath);
+      } catch (storageError) {
+        // Log but don't fail if storage file doesn't exist
+        console.warn('Error deleting template file from storage:', storageError);
+      }
+    }
+
+    // Delete template metadata from Firestore
     await deleteDoc(doc(db, COLLECTIONS.TEMPLATES, id));
   } catch (e) {
     console.error('Error deleting template:', e);
@@ -391,20 +430,44 @@ export async function getDocumentById(id: string): Promise<Document | null> {
 export async function saveDocument(
   userId: string,
   document: DocumentInput,
-  existingId?: string
+  existingId?: string,
+  fileBlob?: Blob
 ): Promise<Document> {
   try {
     const id = existingId || crypto.randomUUID();
 
+    let storagePath = document.storagePath;
+    let downloadUrl = document.downloadUrl;
+
+    // Upload file to Firebase Storage if fileBlob is provided
+    if (fileBlob && document.fileName) {
+      const uploadResult = await uploadDocumentToStorage(
+        userId,
+        document.clientId,
+        id,
+        document.fileName,
+        fileBlob
+      );
+      storagePath = uploadResult.storagePath;
+      downloadUrl = uploadResult.downloadUrl;
+    }
+
+    // storagePath and downloadUrl are required
+    if (!storagePath || !downloadUrl) {
+      throw new Error('storagePath and downloadUrl are required. Please upload a file.');
+    }
+
     // Build document data, handling null values for outdatedAt to properly clear them
     const { outdatedAt, ...otherFields } = document;
-    
+
     const documentData: any = {
       ...otherFields,
       userId,
       generatedAt: new Date().toISOString(),
+      storagePath,
+      downloadUrl,
     };
-    
+
     // Handle outdatedAt specially - if explicitly set to null, use deleteField()
     // Otherwise include the value
     if (outdatedAt === null) {
@@ -417,15 +480,29 @@ export async function saveDocument(
     const documentRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     await setDoc(documentRef, documentData, { merge: true });
 
-    return { ...document, userId, generatedAt: documentData.generatedAt, id };
+    return { ...document, userId, generatedAt: documentData.generatedAt, id, storagePath, downloadUrl };
   } catch (e) {
     console.error('Error saving document:', e);
     throw e;
   }
 }
 
-export async function deleteDocument(id: string, sourceCollection?: 'documents' | 'invoices'): Promise<void> {
+export async function deleteDocument(
+  id: string,
+  storagePath?: string,
+  sourceCollection?: 'documents' | 'invoices'
+): Promise<void> {
   try {
+    // Delete file from Firebase Storage if path exists
+    if (storagePath) {
+      try {
+        await deleteDocumentFile(storagePath);
+      } catch (storageError) {
+        // Log but don't fail if storage file doesn't exist
+        console.warn('Error deleting document file from storage:', storageError);
+      }
+    }
+
     // If source collection is specified (for legacy invoices), use it
     // Otherwise default to documents collection
     const collectionName = sourceCollection || COLLECTIONS.DOCUMENTS;
@@ -602,8 +679,8 @@ export async function saveTimesheet(
     // Clean undefined values for Firestore
     const cleanTimesheet: WorkRecordTimesheetInput = {
       ...timesheet,
-      templateBase64: timesheet.templateBase64 || null,
       templateName: timesheet.templateName || null,
+      templateStoragePath: timesheet.templateStoragePath || null,
       prompt: timesheet.prompt || null,
     };
 

@@ -10,6 +10,7 @@ import { FileSpreadsheet, Loader2, Calendar, ChevronLeft, ChevronRight, AlertTri
 import { Client, WorkRecord, Document, Template } from '../types';
 import { getWorkRecordByMonth, saveDocument, getDocuments, getClients, getTemplateById } from '../services/db';
 import { fetchGreekHolidays, WorkDayStatus } from '../utils/workRecordCalculator';
+import { downloadTemplateAsArrayBuffer } from '../services/storage';
 
 interface InvoiceGeneratorProps {
   userId: string;
@@ -207,7 +208,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         return;
       }
 
-      // Try new structure first (template reference)
+      // Load template from Firebase Storage
       if (selectedClient.invoiceTemplateId) {
         setLoadingTemplate(true);
         try {
@@ -222,24 +223,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         return;
       }
 
-      // Fallback to legacy structure (embedded base64)
-      if (selectedClient.templateBase64) {
-        // Create a pseudo-template from legacy data
-        setInvoiceTemplate({
-          id: 'legacy',
-          userId: selectedClient.userId,
-          clientId: selectedClient.id,
-          type: 'invoice',
-          name: selectedClient.templateName || 'Legacy Invoice Template',
-          fileName: selectedClient.templateName || 'template.xlsx',
-          base64Data: selectedClient.templateBase64,
-          mapping: selectedClient.mapping,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        });
-      } else {
-        setInvoiceTemplate(null);
-      }
+      setInvoiceTemplate(null);
     };
 
     loadInvoiceTemplate();
@@ -282,10 +266,11 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       return;
     }
 
-    // Check for template in new structure (invoiceTemplate) or legacy (templateBase64)
-    const templateBase64 = invoiceTemplate?.base64Data || selectedClient.templateBase64;
-    if (!templateBase64) {
-      setError('No template uploaded for this client');
+    // Check for template in Firebase Storage
+    const storagePath = invoiceTemplate?.storagePath;
+    
+    if (!storagePath) {
+      setError('No template uploaded for this client. Please upload a template in the client settings.');
       return;
     }
 
@@ -302,27 +287,10 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       // 1. Generate Excel
       const workbook = new ExcelJS.Workbook();
       
-      // Handle base64 data - remove data URL prefix if present
-      let base64Data = templateBase64;
-      if (base64Data.includes(',')) {
-        base64Data = base64Data.split(',')[1];
-      }
-      
-      // Remove any whitespace that might have been added
-      base64Data = base64Data.replace(/\s/g, '');
-      
-      // Validate base64 characters only
-      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
-        throw new Error('Invalid template data format');
-      }
-      
-      // Browser-compatible base64 to ArrayBuffer conversion
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      await workbook.xlsx.load(bytes.buffer);
+      // Load template from Firebase Storage
+      console.log('Loading invoice template from Firebase Storage:', storagePath);
+      const arrayBuffer = await downloadTemplateAsArrayBuffer(storagePath);
+      await workbook.xlsx.load(arrayBuffer);
       const worksheet = workbook.worksheets[0];
 
       // Force Excel to recalculate formulas when opened
@@ -394,16 +362,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       // 3. Generate buffer for download and storage
       const buffer = await workbook.xlsx.writeBuffer();
       
-      // Convert to base64 for storage (browser-compatible)
-      const bufferBytes = new Uint8Array(buffer);
-      let bufferBinary = '';
-      for (let i = 0; i < bufferBytes.byteLength; i++) {
-        bufferBinary += String.fromCharCode(bufferBytes[i]);
-      }
-      const bufferBase64 = btoa(bufferBinary);
-      const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
-      
-      // Download the file
+      // Create blob for download and storage upload
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -426,7 +385,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       document.body.removeChild(a);
       window.URL.revokeObjectURL(url);
 
-      // 4. Save document to database with fileData
+      // 4. Save document to database with blob for Storage upload
       const documentData = {
         clientId: selectedClient.id,
         workRecordId: workRecord.id,
@@ -439,7 +398,8 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         dailyRate: selectedClient.dailyRate,
         totalAmount: stats.amount,
         fileName: fileName, // Use the same filename used for download
-        fileData: fileData, // Store the Excel file data for download
+        storagePath: '', // Will be set by saveDocument after upload
+        downloadUrl: '', // Will be set by saveDocument after upload
         isPaid: false,
         isOutdated: false, // Clear outdated flag on regenerate
       };
@@ -448,7 +408,8 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       const existingDoc = existingDocuments.find((d) => d.documentNumber === invoiceNumber);
       const docId = existingDoc?.id;
 
-      await saveDocument(userId, documentData, docId);
+      // Pass the blob for upload to Firebase Storage
+      await saveDocument(userId, documentData, docId, blob);
 
       // Refresh existing documents
       const updatedDocs = await getDocuments(userId, { clientId: selectedClient.id, type: 'invoice' });
