@@ -42,7 +42,7 @@ import {
 import type { Template } from '../types';
 
 interface DocumentManagerProps {
-  userId: string;
+  userEmail: string;
 }
 
 const COLLECTIONS: { id: CollectionType | 'templates'; name: string; icon: React.ElementType; description: string }[] = [
@@ -68,7 +68,7 @@ interface TemplateDoc {
   updatedAt?: string;
 }
 
-export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
+export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) => {
   // ============================================
   // State
   // ============================================
@@ -105,8 +105,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
 
       if (collectionName === 'templates') {
         // Fetch templates from the templates collection
-        const templatesData = await getTemplates(userId);
-        const clientsData = await getCollectionData('clients', userId);
+        const templatesData = await getTemplates(userEmail);
+        const clientsData = await getCollectionData('clients', userEmail);
         const clientMap = new Map(clientsData.map(c => [c.id, String(c.data.name || 'Unknown')]));
 
         const extractedTemplates: TemplateDoc[] = templatesData.map((template: Template) => {
@@ -129,7 +129,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
         setTemplates(extractedTemplates);
         setDocuments([]);
       } else {
-        const data = await getCollectionData(collectionName, userId);
+        const data = await getCollectionData(collectionName, userEmail);
         setDocuments(data);
         setTemplates([]);
 
@@ -143,7 +143,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
 
         if (clientIds.size > 0) {
           const { getClients } = await import('../services/db');
-          const clients = await getClients(userId);
+          const clients = await getClients(userEmail);
           const nameMap = new Map<string, string>();
           clients.forEach((client) => {
             nameMap.set(client.id, client.name);
@@ -161,7 +161,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userId }) => {
 
   useEffect(() => {
     loadCollection(selectedCollection);
-  }, [selectedCollection, userId]);
+  }, [selectedCollection, userEmail]);
 
   // Helper to estimate base64 size
   const estimateBase64Size = (base64: string): string => {

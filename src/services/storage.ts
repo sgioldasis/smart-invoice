@@ -7,8 +7,11 @@
  *
  * Storage Structure:
  * /users/{userId}/
- *   /templates/{clientId}/{templateId}/{filename}
- *   /documents/{clientId}/{documentId}/{filename}
+ *   /{sanitized-client-name}/
+ *     /templates/{filename}              - Client default templates
+ *     /{YYYY-MM}/
+ *       /{filename}                      - Documents (invoices, timesheets)
+ *       /templates/{filename}            - Month-specific templates
  */
 
 import {
@@ -22,15 +25,98 @@ import {
 import { storage } from '../../firebase';
 
 // ============================================
+// Client Name Sanitization
+// ============================================
+
+/**
+ * Sanitize a client name to be filesystem-safe
+ * - Removes/replaces special characters
+ * - Limits length
+ * - Handles edge cases like empty names
+ * 
+ * Examples:
+ *   "Acme Corp" -> "Acme_Corp"
+ *   "Client @ Home!" -> "Client___Home_"
+ *   "Very Long Client Name..." -> "Very_Long_Client_Name_..." (truncated)
+ */
+export function sanitizeClientName(clientName: string): string {
+  if (!clientName || typeof clientName !== 'string') {
+    return 'unnamed-client';
+  }
+  
+  // Trim and limit length
+  const trimmed = clientName.trim().slice(0, 50);
+  
+  // Replace unsafe characters with underscores
+  // Safe: alphanumeric, hyphen, underscore
+  // Unsafe: spaces, slashes, dots, control chars, etc.
+  const sanitized = trimmed
+    .replace(/[^a-zA-Z0-9\-_]/g, '_')  // Replace unsafe chars with underscore
+    .replace(/_{2,}/g, '_')              // Collapse multiple underscores
+    .replace(/^_+|_+$/g, '');             // Trim leading/trailing underscores
+  
+  return sanitized || 'unnamed-client';
+}
+
+/**
+ * Sanitize user email for use in Firebase Storage paths
+ * Emails contain @ and . which need special handling
+ *
+ * Rules:
+ *   - Replace @ with _at_
+ *   - Replace . with _dot_
+ *   - Keep alphanumeric, hyphen, underscore
+ *   - Truncate to 100 chars max
+ *
+ * Examples:
+ *   "user@example.com" -> "user_at_example_dot_com"
+ *   "john.doe@company.co.uk" -> "john_dot_doe_at_company_dot_co_dot_uk"
+ */
+export function sanitizeUserEmail(email: string): string {
+  if (!email || typeof email !== 'string') {
+    return 'unknown-user';
+  }
+  
+  const trimmed = email.trim().toLowerCase().slice(0, 100);
+  
+  const sanitized = trimmed
+    .replace(/@/g, '_at_')
+    .replace(/\./g, '_dot_')
+    .replace(/[^a-zA-Z0-9\-_]/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_+|_+$/g, '');
+  
+  return sanitized || 'unknown-user';
+}
+
+// ============================================
 // Path Builders
 // ============================================
 
-function buildTemplatePath(userId: string, clientId: string, templateId: string, fileName: string): string {
-  return `users/${userId}/templates/${clientId}/${templateId}/${fileName}`;
+// NOTE: Using user email instead of user ID for more readable paths
+// The email is sanitized to be filesystem-safe
+
+/**
+ * Build path for client-level template (default template for a client)
+ */
+function buildClientTemplatePath(userEmail: string, clientName: string, fileName: string): string {
+  return `users/${sanitizeUserEmail(userEmail)}/${sanitizeClientName(clientName)}/templates/${fileName}`;
 }
 
-function buildDocumentPath(userId: string, clientId: string, documentId: string, fileName: string): string {
-  return `users/${userId}/documents/${clientId}/${documentId}/${fileName}`;
+/**
+ * Build path for month-specific template (overrides client default for a specific month)
+ * Stored in: {clientName}/{month}/templates/{filename}
+ */
+function buildMonthTemplatePath(userEmail: string, clientName: string, month: string, fileName: string): string {
+  return `users/${sanitizeUserEmail(userEmail)}/${sanitizeClientName(clientName)}/${month}/templates/${fileName}`;
+}
+
+/**
+ * Build path for documents (invoices, timesheets) stored in month folder
+ * Stored in: {clientName}/{month}/{filename}
+ */
+function buildDocumentPath(userEmail: string, clientName: string, month: string, fileName: string): string {
+  return `users/${sanitizeUserEmail(userEmail)}/${sanitizeClientName(clientName)}/${month}/${fileName}`;
 }
 
 // ============================================
@@ -40,16 +126,23 @@ function buildDocumentPath(userId: string, clientId: string, documentId: string,
 /**
  * Upload a template file to Firebase Storage
  * Supports both File objects and base64 strings (for migration)
+ *
+ * @param userEmail - User email (will be sanitized for the path)
+ * @param clientName - Client name (will be sanitized for the path)
+ * @param month - Optional month (YYYY-MM). If provided, stores as month-specific template.
+ *                 If omitted, stores as client default template.
  */
 export async function uploadTemplate(
-  userId: string,
-  clientId: string,
-  templateId: string,
+  userEmail: string,
+  clientName: string,
   fileName: string,
   data: File | string, // File object or base64 string
+  month?: string, // YYYY-MM format for month-specific templates
   contentType: string = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 ): Promise<{ storagePath: string; downloadUrl: string }> {
-  const storagePath = buildTemplatePath(userId, clientId, templateId, fileName);
+  const storagePath = month
+    ? buildMonthTemplatePath(userEmail, clientName, month, fileName)
+    : buildClientTemplatePath(userEmail, clientName, fileName);
   const storageRef = ref(storage, storagePath);
 
   let uploadResult;
@@ -112,16 +205,20 @@ export async function deleteTemplateFile(storagePath: string): Promise<void> {
 /**
  * Upload a generated document to Firebase Storage
  * Supports both Blob/File objects and base64 strings
+ * Documents are stored in a flat structure under {clientName}/{month}/
+ *
+ * @param userEmail - User email (will be sanitized for the path)
+ * @param clientName - Client name (will be sanitized for the path)
  */
 export async function uploadDocument(
-  userId: string,
-  clientId: string,
-  documentId: string,
+  userEmail: string,
+  clientName: string,
+  month: string, // YYYY-MM format
   fileName: string,
   data: Blob | File | string,
   contentType: string = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 ): Promise<{ storagePath: string; downloadUrl: string }> {
-  const storagePath = buildDocumentPath(userId, clientId, documentId, fileName);
+  const storagePath = buildDocumentPath(userEmail, clientName, month, fileName);
   const storageRef = ref(storage, storagePath);
 
   let uploadResult;

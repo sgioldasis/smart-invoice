@@ -6,61 +6,54 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email == 's.gioldasis@gmail.com';
     }
     
-    // Helper function to check if user owns the resource
-    function isOwner(userId) {
-      return request.auth != null && request.auth.uid == userId;
+    // Helper function to check if user owns the resource by userEmail
+    function isOwnerByEmail(userEmail) {
+      return request.auth != null && request.auth.token.email == userEmail;
     }
     
-    // Clients collection (existing)
+    // Helper function to check ownership (only userEmail)
+    function isOwner(data) {
+      return isOwnerByEmail(data.userEmail);
+    }
+    
+    // Clients collection
     match /clients/{clientId} {
       allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
     }
     
-    // LEGACY: Invoices collection (maintained for migration period)
-    match /invoices/{invoiceId} {
-      allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
-    }
-    
-    // NEW: Work Records collection
-    // Stores the days worked for each client/month
+    // Work Records collection
     match /workRecords/{workRecordId} {
       allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
     }
     
-    // NEW: Documents collection (replaces invoices for new data)
-    // Stores generated documents (invoices, timesheets) linked to work records
+    // Documents collection
     match /documents/{documentId} {
       allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
     }
     
-    // NEW: Timesheets collection
-    // Stores month-specific timesheet templates and prompts
+    // Timesheets collection
     match /timesheets/{timesheetId} {
       allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
     }
     
-    // NEW: Templates collection
-    // Stores invoice and timesheet templates as standalone documents
+    // Templates collection
     match /templates/{templateId} {
       allow read: if isAuthorized();
-      allow create: if isAuthorized() && isOwner(request.resource.data.userId);
-      allow update: if isAuthorized() && isOwner(resource.data.userId);
-      allow delete: if isAuthorized() && isOwner(resource.data.userId);
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
     }
   }
 }

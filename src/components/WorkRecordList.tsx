@@ -37,13 +37,13 @@ import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocumen
 import { processTimesheetPromptSmart } from '../services/ai';
 
 interface WorkRecordListProps {
-  userId: string;
+  userEmail: string;
   onEditWorkRecord?: (clientId: string, month: string) => void;
   onCreateWorkRecord?: () => void;
 }
 
 export const WorkRecordList: React.FC<WorkRecordListProps> = ({
-  userId,
+  userEmail,
   onEditWorkRecord,
   onCreateWorkRecord,
 }) => {
@@ -150,6 +150,12 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   // ============================================
 
   const filteredRecords = useMemo(() => {
+    console.log('[WorkRecordList] Filtering records:', {
+      totalWorkRecords: workRecords.length,
+      selectedClientId,
+      searchQuery,
+      clientsCount: clients.length
+    });
     let filtered = workRecords;
 
     if (selectedClientId) {
@@ -167,12 +173,15 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       });
     }
 
+    console.log('[WorkRecordList] Filtered records:', filtered.length);
     return filtered;
   }, [workRecords, selectedClientId, searchQuery, clients]);
 
   const groupedByMonth = useMemo(() => {
     const groups: Record<string, WorkRecord[]> = {};
-    filteredRecords.forEach((wr) => {
+    console.log('[WorkRecordList] Grouping records:', filteredRecords.length);
+    filteredRecords.forEach((wr, idx) => {
+      console.log(`[WorkRecordList] Record ${idx}:`, { id: wr.id, month: wr.month, clientId: wr.clientId });
       if (!groups[wr.month]) {
         groups[wr.month] = [];
       }
@@ -181,10 +190,11 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     return groups;
   }, [filteredRecords]);
 
-  const sortedMonths = useMemo(
-    () => Object.keys(groupedByMonth).sort().reverse(),
-    [groupedByMonth]
-  );
+  const sortedMonths = useMemo(() => {
+    const months = Object.keys(groupedByMonth).sort().reverse();
+    console.log('[WorkRecordList] sortedMonths:', months);
+    return months;
+  }, [groupedByMonth]);
 
   const stats = useMemo(() => {
     const totalRecords = filteredRecords.length;
@@ -201,13 +211,19 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
   useEffect(() => {
     const loadData = async () => {
+      console.log('[WorkRecordList] Loading data for userEmail:', userEmail);
       setIsLoading(true);
       try {
         const [clientsData, recordsData, invoicesData] = await Promise.all([
-          getClients(userId),
-          getWorkRecords(userId),
-          getDocuments(userId),
+          getClients(userEmail),
+          getWorkRecords(userEmail),
+          getDocuments(userEmail),
         ]);
+        console.log('[WorkRecordList] Loaded:', {
+          clients: clientsData.length,
+          workRecords: recordsData.length,
+          invoices: invoicesData.length
+        });
         setClients(clientsData);
         setWorkRecords(recordsData);
         setInvoices(invoicesData);
@@ -219,7 +235,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     };
 
     loadData();
-  }, [userId]);
+  }, [userEmail]);
 
   // ============================================
   // Handlers
@@ -481,6 +497,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
       const invoiceData: DocumentInput = {
         clientId: dialogClient.id!,
+        clientName: dialogClient.name,
         workRecordId: dialogRecord.id,
         type: 'invoice',
         documentNumber: invoiceNumber,
@@ -497,9 +514,9 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         outdatedAt: null,
       };
 
-      await saveDocument(userId, invoiceData, existingInvoiceId || undefined, blob);
+      await saveDocument(userEmail, invoiceData, existingInvoiceId || undefined, blob);
 
-      const updatedInvoices = await getDocuments(userId);
+      const updatedInvoices = await getDocuments(userEmail);
       setInvoices(updatedInvoices);
 
       setShowInvoiceDialog(false);
@@ -1246,6 +1263,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       // Save document to database with fileData (so it appears in DocumentManager and can be downloaded)
       const documentData: DocumentInput = {
         clientId: timesheetClient.id!,
+        clientName: timesheetClient.name,
         workRecordId: timesheetRecord.id,
         type: 'timesheet',
         documentNumber: `TS-${timesheetRecord.month}`,
@@ -1267,10 +1285,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       const existingDoc = invoices.find(
         (d) => d.workRecordId === timesheetRecord.id && d.type === 'timesheet'
       );
-      await saveDocument(userId, documentData, existingDoc?.id, blob);
+      await saveDocument(userEmail, documentData, existingDoc?.id, blob);
 
       // Refresh invoices list
-      const updatedDocs = await getDocuments(userId);
+      const updatedDocs = await getDocuments(userEmail);
       setInvoices(updatedDocs);
 
       // Save timesheet configuration
@@ -1283,7 +1301,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         templateName: timesheetMonthTemplateName || null,
       };
 
-      await saveTimesheet(userId, timesheetData, existingTimesheetId || undefined);
+      await saveTimesheet(userEmail, timesheetData, existingTimesheetId || undefined);
 
       setShowTimesheetDialog(false);
       setTimesheetRecord(null);

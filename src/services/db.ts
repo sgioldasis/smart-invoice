@@ -57,13 +57,15 @@ const COLLECTIONS = {
 // Client Operations (Existing)
 // ============================================
 
-export async function getClients(userId: string): Promise<Client[]> {
+export async function getClients(userEmail: string): Promise<Client[]> {
   try {
+    console.log('[getClients] Querying for userEmail:', userEmail);
     const q = query(
       collection(db, COLLECTIONS.CLIENTS),
-      where('userId', '==', userId)
+      where('userEmail', '==', userEmail)
     );
     const snapshot = await getDocs(q);
+    console.log('[getClients] Found', snapshot.docs.length, 'clients');
     return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Client));
   } catch (e) {
     console.error('Error fetching clients:', e);
@@ -130,11 +132,11 @@ export async function deleteClient(id: string): Promise<void> {
 // Template Operations (NEW)
 // ============================================
 
-export async function getTemplates(userId: string): Promise<Template[]> {
+export async function getTemplates(userEmail: string): Promise<Template[]> {
   try {
     const q = query(
       collection(db, COLLECTIONS.TEMPLATES),
-      where('userId', '==', userId)
+      where('userEmail', '==', userEmail)
     );
     const snapshot = await getDocs(q);
     return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Template));
@@ -144,11 +146,11 @@ export async function getTemplates(userId: string): Promise<Template[]> {
   }
 }
 
-export async function getTemplatesByClient(userId: string, clientId: string): Promise<Template[]> {
+export async function getTemplatesByClient(userEmail: string, clientId: string): Promise<Template[]> {
   try {
     const q = query(
       collection(db, COLLECTIONS.TEMPLATES),
-      where('userId', '==', userId),
+      where('userEmail', '==', userEmail),
       where('clientId', '==', clientId)
     );
     const snapshot = await getDocs(q);
@@ -186,11 +188,11 @@ export async function saveTemplate(
     let downloadUrl = template.downloadUrl;
 
     // Upload file to Firebase Storage if fileData is provided
+    // Templates are stored at client level (not month-specific)
     if (fileData) {
       const uploadResult = await uploadTemplateToStorage(
-        template.userId,
-        template.clientId,
-        id,
+        template.userEmail!,
+        template.clientName,
         template.fileName,
         fileData
       );
@@ -206,6 +208,7 @@ export async function saveTemplate(
     const templateData = {
       userId: template.userId,
       clientId: template.clientId,
+      clientName: template.clientName,
       type: template.type,
       name: template.name,
       fileName: template.fileName,
@@ -253,17 +256,19 @@ export async function deleteTemplate(id: string, storagePath?: string): Promise<
 // ============================================
 
 export async function getWorkRecords(
-  userId: string,
+  userEmail: string,
   clientId?: string
 ): Promise<WorkRecord[]> {
   try {
-    const constraints: any[] = [where('userId', '==', userId)];
+    console.log('[getWorkRecords] Querying for userEmail:', userEmail);
+    const constraints: any[] = [where('userEmail', '==', userEmail)];
     if (clientId) {
       constraints.push(where('clientId', '==', clientId));
     }
 
     const q = query(collection(db, COLLECTIONS.WORK_RECORDS), ...constraints);
     const snapshot = await getDocs(q);
+    console.log('[getWorkRecords] Found', snapshot.docs.length, 'work records');
 
     return snapshot.docs.map((doc) => ({
       ...doc.data(),
@@ -290,14 +295,14 @@ export async function getWorkRecordById(id: string): Promise<WorkRecord | null> 
 }
 
 export async function getWorkRecordByMonth(
-  userId: string,
+  userEmail: string,
   clientId: string,
   month: string
 ): Promise<WorkRecord | null> {
   try {
     const q = query(
       collection(db, COLLECTIONS.WORK_RECORDS),
-      where('userId', '==', userId),
+      where('userEmail', '==', userEmail),
       where('clientId', '==', clientId),
       where('month', '==', month)
     );
@@ -316,7 +321,7 @@ export async function getWorkRecordByMonth(
 }
 
 export async function saveWorkRecord(
-  userId: string,
+  userEmail: string,
   workRecord: WorkRecordInput,
   existingId?: string
 ): Promise<WorkRecord> {
@@ -324,7 +329,7 @@ export async function saveWorkRecord(
     const id = existingId || crypto.randomUUID();
     const now = new Date().toISOString();
 
-    console.log('DB: Saving work record', { id, userId, existingId });
+    console.log('DB: Saving work record', { id, userEmail, existingId });
 
     // Clean undefined values for Firestore
     const cleanWorkRecord: WorkRecordInput = {
@@ -335,7 +340,7 @@ export async function saveWorkRecord(
 
     const workRecordData: Omit<WorkRecord, 'id'> = {
       ...cleanWorkRecord,
-      userId,
+      userEmail,
       createdAt: existingId ? (await getWorkRecordById(existingId))?.createdAt || now : now,
       updatedAt: now,
     };
@@ -358,13 +363,29 @@ export async function saveWorkRecord(
 
 export async function deleteWorkRecord(id: string): Promise<void> {
   try {
-    // First delete all associated documents
+    // First delete all associated documents and their storage files
     const documentsSnapshot = await getDocs(
       query(collection(db, COLLECTIONS.DOCUMENTS), where('workRecordId', '==', id))
     );
+    
+    // Delete storage files first
+    for (const docSnapshot of documentsSnapshot.docs) {
+      const docData = docSnapshot.data() as Document;
+      if (docData.storagePath) {
+        try {
+          await deleteDocumentFile(docData.storagePath);
+          console.log(`Deleted storage file: ${docData.storagePath}`);
+        } catch (storageError) {
+          console.warn(`Failed to delete storage file ${docData.storagePath}:`, storageError);
+          // Continue even if storage deletion fails
+        }
+      }
+    }
+    
+    // Then delete the Firestore document records
     await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
 
-    // Then delete the work record
+    // Finally delete the work record
     await deleteDoc(doc(db, COLLECTIONS.WORK_RECORDS, id));
   } catch (e) {
     console.error('Error deleting work record:', e);
@@ -377,7 +398,7 @@ export async function deleteWorkRecord(id: string): Promise<void> {
 // ============================================
 
 export async function getDocuments(
-  userId: string,
+  userEmail: string,
   filters?: {
     clientId?: string;
     workRecordId?: string;
@@ -385,7 +406,8 @@ export async function getDocuments(
   }
 ): Promise<Document[]> {
   try {
-    const constraints: any[] = [where('userId', '==', userId)];
+    // Query by userEmail (new field)
+    const constraints: any[] = [where('userEmail', '==', userEmail)];
 
     if (filters?.clientId) {
       constraints.push(where('clientId', '==', filters.clientId));
@@ -397,10 +419,21 @@ export async function getDocuments(
       constraints.push(where('type', '==', filters.type));
     }
 
-    // Fetch from new documents collection
+    // Fetch documents by userEmail
     console.log('[getDocuments] Fetching documents with constraints:', constraints);
+    console.log('[getDocuments] Querying for userEmail:', userEmail);
     const q = query(collection(db, COLLECTIONS.DOCUMENTS), ...constraints);
     const snapshot = await getDocs(q);
+    console.log('[getDocuments] Found', snapshot.docs.length, 'documents');
+    
+    // Debug: log first doc to see its fields
+    if (snapshot.docs.length > 0) {
+      const firstDoc = snapshot.docs[0].data();
+      console.log('[getDocuments] First doc fields:', Object.keys(firstDoc));
+      console.log('[getDocuments] First doc userEmail:', firstDoc.userEmail);
+      console.log('[getDocuments] First doc userId:', firstDoc.userId);
+    }
+    
     const documents = snapshot.docs.map((doc) => ({
       ...doc.data(),
       id: doc.id,
@@ -428,7 +461,7 @@ export async function getDocumentById(id: string): Promise<Document | null> {
 }
 
 export async function saveDocument(
-  userId: string,
+  userEmail: string,
   document: DocumentInput,
   existingId?: string,
   fileBlob?: Blob
@@ -440,11 +473,12 @@ export async function saveDocument(
     let downloadUrl = document.downloadUrl;
 
     // Upload file to Firebase Storage if fileBlob is provided
+    // Documents are stored in flat structure: {clientName}/{month}/{filename}
     if (fileBlob && document.fileName) {
       const uploadResult = await uploadDocumentToStorage(
-        userId,
-        document.clientId,
-        id,
+        userEmail,
+        document.clientName,
+        document.month, // YYYY-MM format
         document.fileName,
         fileBlob
       );
@@ -462,7 +496,7 @@ export async function saveDocument(
 
     const documentData: any = {
       ...otherFields,
-      userId,
+      userEmail: userEmail,
       generatedAt: new Date().toISOString(),
       storagePath,
       downloadUrl,
@@ -480,7 +514,7 @@ export async function saveDocument(
     const documentRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     await setDoc(documentRef, documentData, { merge: true });
 
-    return { ...document, userId, generatedAt: documentData.generatedAt, id, storagePath, downloadUrl };
+    return { ...document, userEmail: userEmail, generatedAt: documentData.generatedAt, id, storagePath, downloadUrl };
   } catch (e) {
     console.error('Error saving document:', e);
     throw e;
@@ -646,13 +680,13 @@ export async function getTimesheetByWorkRecord(
 }
 
 export async function getTimesheetsByClient(
-  userId: string,
+  userEmail: string,
   clientId: string
 ): Promise<WorkRecordTimesheet[]> {
   try {
     const q = query(
       collection(db, COLLECTIONS.TIMESHEETS),
-      where('userId', '==', userId),
+      where('userEmail', '==', userEmail),
       where('clientId', '==', clientId)
     );
 
@@ -668,7 +702,7 @@ export async function getTimesheetsByClient(
 }
 
 export async function saveTimesheet(
-  userId: string,
+  userEmail: string,
   timesheet: WorkRecordTimesheetInput,
   existingId?: string
 ): Promise<WorkRecordTimesheet> {
@@ -686,7 +720,7 @@ export async function saveTimesheet(
 
     const timesheetData: Omit<WorkRecordTimesheet, 'id'> = {
       ...cleanTimesheet,
-      userId,
+      userEmail,
       createdAt: existingId ? (await getDoc(doc(db, COLLECTIONS.TIMESHEETS, existingId))).data()?.createdAt || now : now,
       updatedAt: now,
     };
@@ -710,11 +744,11 @@ export async function deleteTimesheet(id: string): Promise<void> {
   }
 }
 
-export async function deleteAllClientTimesheets(userId: string, clientId: string): Promise<number> {
+export async function deleteAllClientTimesheets(userEmail: string, clientId: string): Promise<number> {
   try {
     const q = query(
       collection(db, COLLECTIONS.TIMESHEETS),
-      where('userId', '==', userId),
+      where('userEmail', '==', userEmail),
       where('clientId', '==', clientId)
     );
 
@@ -746,11 +780,13 @@ export interface FirestoreDocument {
  */
 export async function getCollectionData(
   collectionName: CollectionType,
-  userId: string
+  userEmail: string
 ): Promise<FirestoreDocument[]> {
   try {
-    const q = query(collection(db, collectionName), where('userId', '==', userId));
+    console.log(`[getCollectionData] Fetching ${collectionName} for userEmail:`, userEmail);
+    const q = query(collection(db, collectionName), where('userEmail', '==', userEmail));
     const snapshot = await getDocs(q);
+    console.log(`[getCollectionData] Found ${snapshot.docs.length} documents in ${collectionName}`);
 
     return snapshot.docs.map((docSnapshot) => ({
       id: docSnapshot.id,

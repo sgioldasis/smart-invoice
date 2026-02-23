@@ -2,8 +2,10 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
     // Allow read/write access to authenticated users for their own files
+    // Only supports email-based paths (migration complete)
     match /users/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, write: if request.auth != null && 
+        userId == 's_dot_gioldasis_at_gmail_dot_com';
     }
 
     // Deny all other access by default

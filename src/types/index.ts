@@ -31,7 +31,9 @@ export interface TimesheetMapping {
 export interface Template {
   id: string;
   userId: string;
+  userEmail?: string; // For storage path
   clientId: string;
+  clientName: string;
   type: 'invoice' | 'timesheet';
   name: string;
   fileName: string;
@@ -96,7 +98,7 @@ export interface WorkRecordConfig {
  */
 export interface WorkRecord {
   id: string;
-  userId: string;
+  userEmail: string;
   clientId: string;
   month: string; // YYYY-MM format
 
@@ -152,7 +154,7 @@ export interface WorkRecordInput {
  */
 export interface WorkRecordTimesheet {
   id: string;
-  userId: string;
+  userEmail: string;
   clientId: string;
   workRecordId: string; // Link to the work record
   month: string; // YYYY-MM format
@@ -196,7 +198,7 @@ export type DocumentType = 'invoice' | 'timesheet';
  */
 export interface Document {
   id: string;
-  userId: string;
+  userEmail: string;
   clientId: string;
   workRecordId: string; // Link to the work record
 
@@ -234,7 +236,9 @@ export interface Document {
  * Input type for creating a document
  */
 export interface DocumentInput {
+  userEmail?: string; // For database storage
   clientId: string;
+  clientName: string;
   workRecordId: string;
   type: DocumentType;
   documentNumber: string;

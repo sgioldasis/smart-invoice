@@ -5,40 +5,30 @@ import {
   Building2,
   Calendar as CalendarIcon,
   FileSpreadsheet,
-  Settings,
-  LogOut,
   Plus,
-  Save,
-  Download,
   Check,
   X,
   Bot,
   Loader2,
   ChevronLeft,
-  ChevronRight,
   FileText,
   Trash2,
   Sun,
   Moon,
-  History,
-  Printer,
-  Edit3,
   Landmark,
   UserSquare,
-  Info,
   Briefcase,
-  Eye,
   BarChart3,
   TrendingUp,
   Users,
   ClipboardList,
 } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
+import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
 import { motion } from 'framer-motion';
 import { GoogleGenAI, Type } from "@google/genai";
 import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
-import { format, getDaysInMonth, startOfMonth, endOfMonth, eachDayOfInterval, isWeekend, isSameDay, parseISO, addMonths, subMonths, addDays } from 'date-fns';
+import { format, parseISO } from 'date-fns';
 import { Auth } from './Auth';
 
 // NEW: Work Record Components
@@ -144,9 +134,9 @@ import {
 
 // 1. Firestore Storage Service
 const DB = {
-  getClients: async (userId: string): Promise<Client[]> => {
+  getClients: async (userEmail: string): Promise<Client[]> => {
     try {
-      const q = query(collection(db, 'clients'), where('userId', '==', userId));
+      const q = query(collection(db, 'clients'), where('userId', '==', userEmail));
       const snapshot = await getDocs(q);
       return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Client));
     } catch (e) {
@@ -340,6 +330,7 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
             <BarChart3 size={20} />
             <span>Analytics</span>
           </button>
+
         </nav>
         <div className="p-4 border-t border-slate-800 space-y-4">
           {/* Theme Toggle */}
@@ -449,10 +440,10 @@ const Dashboard = ({ userId, onEditClient, onSelectClient }: any) => {
   );
 };
 
-const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
+const ClientEditor = ({ userEmail, client, onSave, onCancel }: any) => {
   const [formData, setFormData] = useState<Client>(client || {
     id: crypto.randomUUID(),
-    userId: userId,
+    userId: userEmail,
     name: '',
     issuerName: 'My Company',
     issuerDetails: '',
@@ -496,8 +487,10 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
       // Create and save template as separate document (upload file to Storage)
       const template: Template = {
         id: crypto.randomUUID(),
-        userId: userId,
+        userId: userEmail,
+        userEmail: userEmail,
         clientId: formData.id,
+        clientName: formData.name,
         type: 'invoice',
         name: file.name,
         fileName: file.name,
@@ -545,8 +538,10 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
       // Create and save timesheet template as separate document (upload file to Storage)
       const template: Template = {
         id: crypto.randomUUID(),
-        userId: userId,
+        userId: userEmail,
+        userEmail: userEmail,
         clientId: formData.id,
+        clientName: formData.name,
         type: 'timesheet',
         name: file.name,
         fileName: file.name,
@@ -587,7 +582,7 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
   };
 
   const handleClearAllClientTimesheets = async () => {
-    if (!client?.id || !userId) {
+    if (!client?.id || !userEmail) {
       alert('Please save the client first before clearing timesheet templates.');
       return;
     }
@@ -599,7 +594,7 @@ const ClientEditor = ({ userId, client, onSave, onCancel }: any) => {
     if (!confirmed) return;
 
     try {
-      const deletedCount = await deleteAllClientTimesheets(userId, client.id);
+      const deletedCount = await deleteAllClientTimesheets(userEmail, client.id);
       alert(`Successfully deleted ${deletedCount} timesheet template(s) for "${formData.name}".`);
     } catch (error: any) {
       console.error('Error clearing timesheet templates:', error);
@@ -1358,7 +1353,7 @@ export default function App() {
           {activeTab === 'workrecords' && workRecordView === 'list' && (
             <WorkRecordList
               key={workRecordListKey}
-              userId={user.uid}
+              userEmail={user.email!}
               onEditWorkRecord={handleEditWorkRecord}
               onCreateWorkRecord={handleCreateWorkRecord}
               onGenerateInvoice={handleGenerateInvoiceFromWorkRecord}
@@ -1367,7 +1362,7 @@ export default function App() {
 
           {activeTab === 'workrecords' && workRecordView === 'edit' && (
             <WorkRecordManager
-              userId={user.uid}
+              userEmail={user.email!}
               initialClientId={editingWorkRecordClientId}
               initialMonth={editingWorkRecordMonth}
               onSave={handleWorkRecordSaved}
@@ -1385,7 +1380,7 @@ export default function App() {
 
           {activeTab === 'dashboard' && viewState === 'edit' && (
             <ClientEditor
-              userId={user.uid}
+              userEmail={user.email!}
               client={editingClient}
               onSave={handleSaveClient}
               onCancel={() => setViewState('list')}
@@ -1395,7 +1390,7 @@ export default function App() {
           {/* Invoice Generator Tab */}
           {activeTab === 'generator' && (
             <NewInvoiceGenerator
-              userId={user.uid}
+              userEmail={user.email!}
               initialClientId={editingWorkRecordClientId || targetClientId}
               initialMonth={editingWorkRecordMonth}
               existingInvoiceNumber={invoiceGenInvoiceNumber}
@@ -1405,7 +1400,7 @@ export default function App() {
           {/* Document Manager Tab */}
           {activeTab === 'documents' && (
             <DocumentManager
-              userId={user.uid}
+              userEmail={user.email!}
               onRegenerateDocument={(clientId, month, documentNumber) => {
                 setTargetClientId(clientId);
                 setEditingWorkRecordMonth(month);
@@ -1425,6 +1420,7 @@ export default function App() {
           {activeTab === 'analytics' && (
             <Analytics userId={user.uid} />
           )}
+
         </>
       )}
     </Layout>

@@ -60,14 +60,14 @@ import {
 import { downloadTemplateAsArrayBuffer } from '../services/storage';
 
 interface WorkRecordManagerProps {
-  userId: string;
+  userEmail: string;
   initialClientId?: string;
   initialMonth?: string;
   onSave?: () => void;
 }
 
 export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
-  userId,
+  userEmail,
   initialClientId,
   initialMonth,
   onSave,
@@ -147,7 +147,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
   // Load clients on mount
   useEffect(() => {
     const loadClients = async () => {
-      const data = await getClients(userId);
+      const data = await getClients(userEmail);
       setClients(data);
       if (initialClientId) {
         setSelectedClientId(initialClientId);
@@ -157,7 +157,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       setLoading(false);
     };
     loadClients();
-  }, [userId, initialClientId]);
+  }, [userEmail, initialClientId]);
 
   // Fetch holidays when year changes
   useEffect(() => {
@@ -177,7 +177,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       try {
         // Check for existing work record
         const existing = await getWorkRecordByMonth(
-          userId,
+          userEmail,
           selectedClientId,
           monthStr
         );
@@ -217,7 +217,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
     };
 
     loadWorkRecord();
-  }, [userId, selectedClientId, monthStr, selectedClient]);
+  }, [userEmail, selectedClientId, monthStr, selectedClient]);
 
   // Load timesheet template for this work record
   useEffect(() => {
@@ -323,7 +323,7 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
       return;
     }
 
-    if (!userId) {
+    if (!userEmail) {
       setSaveError('You must be logged in to save work records.');
       return;
     }
@@ -344,10 +344,10 @@ export const WorkRecordManager: React.FC<WorkRecordManagerProps> = ({
         totalWorkingDays: workingDays.length,
       };
 
-      console.log('Saving work record:', { userId, workRecordInput, existingId: existingRecord?.id });
+      console.log('Saving work record:', { userEmail, workRecordInput, existingId: existingRecord?.id });
 
       const saved = await saveWorkRecord(
-        userId,
+        userEmail,
         workRecordInput,
         existingRecord?.id
       );
@@ -436,13 +436,14 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
 
     try {
       // Import uploadTemplate dynamically to avoid circular dependency
+      // Month-specific templates are stored in {clientName}/{month}/ folder
       const { uploadTemplate } = await import('../services/storage');
       const result = await uploadTemplate(
-        userId,
-        selectedClientId,
-        `month-template-${existingRecord.id}`,
+        userEmail,
+        selectedClient.name,
         file.name,
-        file
+        file,
+        monthStr // Store in month-specific folder
       );
       setMonthTemplateFile(file);
       setMonthTemplateStoragePath(result.storagePath);
@@ -462,7 +463,7 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
 
     try {
       // NOTE: Prompt always comes from client configuration, don't save it in timesheet
-      await saveTimesheet(userId, {
+      await saveTimesheet(userEmail, {
         clientId: selectedClientId,
         workRecordId: existingRecord.id,
         month: monthStr,
@@ -684,8 +685,9 @@ To deploy the rules, run: firebase deploy --only firestore:rules`;
       window.URL.revokeObjectURL(url);
 
       // Save document record with all relevant data from work record
-      await saveDocument(userId, {
+      await saveDocument(userEmail, {
         clientId: selectedClient.id,
+        clientName: selectedClient.name,
         workRecordId: existingRecord.id,
         type: 'timesheet',
         documentNumber: `TS-${monthStr}`,

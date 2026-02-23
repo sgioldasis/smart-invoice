@@ -13,14 +13,14 @@ import { fetchGreekHolidays, WorkDayStatus } from '../utils/workRecordCalculator
 import { downloadTemplateAsArrayBuffer } from '../services/storage';
 
 interface InvoiceGeneratorProps {
-  userId: string;
+  userEmail: string;
   initialClientId?: string;
   initialMonth?: string;
   existingInvoiceNumber?: string;
 }
 
 export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
-  userId,
+  userEmail,
   initialClientId,
   initialMonth,
   existingInvoiceNumber,
@@ -76,14 +76,14 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
   useEffect(() => {
     const loadClients = async () => {
       try {
-        const data = await getClients(userId);
+        const data = await getClients(userEmail);
         setClients(data);
       } catch (err) {
         console.error('Error loading clients:', err);
       }
     };
     loadClients();
-  }, [userId]);
+  }, [userEmail]);
 
   // Update selected client when initialClientId prop changes
   useEffect(() => {
@@ -156,7 +156,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       if (!selectedClientId) return;
       setLoading(true);
       try {
-        const record = await getWorkRecordByMonth(userId, selectedClientId, monthStr);
+        const record = await getWorkRecordByMonth(userEmail, selectedClientId, monthStr);
         setWorkRecord(record);
         if (!record) {
           setError(`No work record found for ${format(currentDate, 'MMMM yyyy')}. Please create one first.`);
@@ -171,34 +171,34 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       }
     };
     loadWorkRecord();
-  }, [userId, selectedClientId, monthStr, currentDate]);
+  }, [userEmail, selectedClientId, monthStr, currentDate]);
 
   // Load existing documents for this client
   useEffect(() => {
     const loadDocuments = async () => {
       if (!selectedClientId) return;
       try {
-        const docs = await getDocuments(userId, { clientId: selectedClientId, type: 'invoice' });
+        const docs = await getDocuments(userEmail, { clientId: selectedClientId, type: 'invoice' });
         setExistingDocuments(docs.filter((d) => d.type === 'invoice'));
       } catch (err) {
         console.error('Error loading documents:', err);
       }
     };
     loadDocuments();
-  }, [userId, selectedClientId]);
+  }, [userEmail, selectedClientId]);
 
   // Load ALL invoices for global numbering
   useEffect(() => {
     const loadAllInvoices = async () => {
       try {
-        const docs = await getDocuments(userId, { type: 'invoice' });
+        const docs = await getDocuments(userEmail, { type: 'invoice' });
         setAllInvoices(docs.filter((d) => d.type === 'invoice'));
       } catch (err) {
         console.error('Error loading all invoices:', err);
       }
     };
     loadAllInvoices();
-  }, [userId]);
+  }, [userEmail]);
 
   // Load invoice template when selected client changes
   useEffect(() => {
@@ -388,6 +388,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       // 4. Save document to database with blob for Storage upload
       const documentData = {
         clientId: selectedClient.id,
+        clientName: selectedClient.name,
         workRecordId: workRecord.id,
         type: 'invoice' as const,
         documentNumber: invoiceNumber,
@@ -409,10 +410,10 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
       const docId = existingDoc?.id;
 
       // Pass the blob for upload to Firebase Storage
-      await saveDocument(userId, documentData, docId, blob);
+      await saveDocument(userEmail, documentData, docId, blob);
 
       // Refresh existing documents
-      const updatedDocs = await getDocuments(userId, { clientId: selectedClient.id, type: 'invoice' });
+      const updatedDocs = await getDocuments(userEmail, { clientId: selectedClient.id, type: 'invoice' });
       setExistingDocuments(updatedDocs.filter((d) => d.type === 'invoice'));
 
       setSaveSuccess(true);
