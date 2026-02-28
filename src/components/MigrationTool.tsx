@@ -48,7 +48,7 @@ function getStatusColor(status: string): string {
     case 'paid':
       return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400';
     case 'sent':
-      return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400';
+      return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400';
     case 'pdf-uploaded':
       return 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400';
     case 'excel-uploaded':

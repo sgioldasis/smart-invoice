@@ -1480,7 +1480,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             generated: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
                             'excel-uploaded': 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
                             'pdf-uploaded': 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300',
-                            sent: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
+                            sent: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
                             paid: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
                             uploaded: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
                           };
@@ -1867,7 +1867,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                         generated: 'bg-blue-500',
                         'excel-uploaded': 'bg-purple-500',
                         'pdf-uploaded': 'bg-indigo-500',
-                        sent: 'bg-green-500',
+                        sent: 'bg-amber-500',
                         paid: 'bg-emerald-500',
                       };
                       const color = statusColors[entry.status] || 'bg-slate-500';
