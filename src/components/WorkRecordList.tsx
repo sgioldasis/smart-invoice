@@ -10,7 +10,7 @@
  * - Generate and download invoices directly
  */
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Briefcase,
   Calendar as CalendarIcon,
@@ -66,6 +66,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [workRecords, setWorkRecords] = useState<WorkRecord[]>([]);
   const [invoices, setInvoices] = useState<Document[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
   const [uploadingRecordId, setUploadingRecordId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
@@ -114,6 +115,36 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [timesheetFileName, setTimesheetFileName] = useState('');
   const [timesheetTemplate, setTimesheetTemplate] = useState<Template | null>(null);
   const [loadingTimesheetTemplate, setLoadingTimesheetTemplate] = useState(false);
+
+  // Status date picker dialog state
+  const [showStatusDateDialog, setShowStatusDateDialog] = useState(false);
+  const [statusDateTarget, setStatusDateTarget] = useState<{ type: 'sent' | 'paid'; document: Document } | null>(null);
+  // Status date picker - separate day/month/year for custom display
+  const [statusDay, setStatusDay] = useState(() => {
+    return new Date().getDate();
+  });
+  const [statusMonth, setStatusMonth] = useState(() => {
+    return new Date().getMonth(); // 0-11
+  });
+  const [statusYear, setStatusYear] = useState(() => {
+    return new Date().getFullYear();
+  });
+  const [statusTimeValue, setStatusTimeValue] = useState(() => {
+    const now = new Date();
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    return `${hours}:${minutes}`;
+  });
+
+  const statusMonths = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+  ];
+
+  // Generate days based on selected month/year
+  const getStatusDaysInMonth = (month: number, year: number) => {
+    return new Date(year, month + 1, 0).getDate();
+  };
 
   // Update default filename when record or template changes
   useEffect(() => {
@@ -240,33 +271,48 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   // Effects
   // ============================================
 
+  // Load data function - can be called manually or automatically
+  const loadData = useCallback(async () => {
+    console.log('[WorkRecordList] Loading data for userEmail:', userEmail);
+    setIsLoading(true);
+    try {
+      const [clientsData, recordsData, invoicesData] = await Promise.all([
+        getClients(userEmail),
+        getWorkRecords(userEmail),
+        getDocuments(userEmail),
+      ]);
+      console.log('[WorkRecordList] Loaded:', {
+        clients: clientsData.length,
+        workRecords: recordsData.length,
+        invoices: invoicesData.length
+      });
+      setClients(clientsData);
+      setWorkRecords(recordsData);
+      setInvoices(invoicesData);
+    } catch (error) {
+      console.error('Error loading work records:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [userEmail]);
+
+  // Initial load and refresh on userEmail or refreshKey change
   useEffect(() => {
-    const loadData = async () => {
-      console.log('[WorkRecordList] Loading data for userEmail:', userEmail);
-      setIsLoading(true);
-      try {
-        const [clientsData, recordsData, invoicesData] = await Promise.all([
-          getClients(userEmail),
-          getWorkRecords(userEmail),
-          getDocuments(userEmail),
-        ]);
-        console.log('[WorkRecordList] Loaded:', {
-          clients: clientsData.length,
-          workRecords: recordsData.length,
-          invoices: invoicesData.length
-        });
-        setClients(clientsData);
-        setWorkRecords(recordsData);
-        setInvoices(invoicesData);
-      } catch (error) {
-        console.error('Error loading work records:', error);
-      } finally {
-        setIsLoading(false);
+    loadData();
+  }, [loadData, refreshKey]);
+
+  // Refresh data when window regains focus (user returns from Admin Tools)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('[WorkRecordList] Window visible, refreshing data...');
+        loadData();
       }
     };
 
-    loadData();
-  }, [userEmail]);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [loadData]);
 
   // ============================================
   // Handlers
@@ -354,23 +400,65 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   };
 
   // Helper to check if document has a PDF version
-  // Checks both legacy finalDownloadUrl and new finalDocuments array
+  // Checks: finalDocuments array, legacy final fields, AND main storage fields (fileName, storagePath, downloadUrl)
   const hasPdfVersion = (doc: Document): boolean => {
-    // Check new finalDocuments array first
-    const hasFinalDocPdf = doc.finalDocuments?.some(fd => fd.fileExtension === 'pdf');
-    const hasLegacyFinalPdf = isPdfUrl(doc.finalDownloadUrl);
-    const hasMainPdf = isPdfUrl(doc.downloadUrl);
-    return hasFinalDocPdf || hasLegacyFinalPdf || hasMainPdf;
+    // Check new finalDocuments array (case-insensitive)
+    const hasFinalDocPdf = doc.finalDocuments?.some(fd =>
+      fd.fileExtension?.toLowerCase() === 'pdf'
+    );
+    
+    // Check legacy final fields
+    const hasFinalFileNamePdf = (doc.finalFileName || '').toLowerCase().endsWith('.pdf');
+    const hasFinalStoragePdf = (doc.finalStoragePath || '').toLowerCase().endsWith('.pdf');
+    const hasFinalDownloadPdf = isPdfUrl(doc.finalDownloadUrl);
+    
+    // Check MAIN storage fields (fileName, storagePath, downloadUrl)
+    const hasMainFileNamePdf = (doc.fileName || '').toLowerCase().endsWith('.pdf');
+    const hasMainStoragePdf = (doc.storagePath || '').toLowerCase().endsWith('.pdf');
+    const hasMainDownloadPdf = isPdfUrl(doc.downloadUrl);
+    
+    return hasFinalDocPdf || hasFinalFileNamePdf || hasFinalStoragePdf || hasFinalDownloadPdf ||
+           hasMainFileNamePdf || hasMainStoragePdf || hasMainDownloadPdf;
   };
 
   // Helper to check if document has an Excel version
-  // Checks both legacy finalDownloadUrl and new finalDocuments array
   const hasExcelVersion = (doc: Document): boolean => {
-    // Check new finalDocuments array first
-    const hasFinalDocExcel = doc.finalDocuments?.some(fd => ['xlsx', 'xls'].includes(fd.fileExtension));
-    const hasLegacyFinalExcel = isExcelUrl(doc.finalDownloadUrl);
-    const hasMainExcel = isExcelUrl(doc.downloadUrl);
-    return hasFinalDocExcel || hasLegacyFinalExcel || hasMainExcel;
+    // Check new finalDocuments array (case-insensitive)
+    const hasFinalDocExcel = doc.finalDocuments?.some(fd => {
+      const ext = fd.fileExtension?.toLowerCase();
+      return ['xlsx', 'xls'].includes(ext);
+    });
+    
+    // Check legacy final fields
+    const hasFinalFileNameExcel =
+      (doc.finalFileName || '').toLowerCase().endsWith('.xlsx') ||
+      (doc.finalFileName || '').toLowerCase().endsWith('.xls');
+    const hasFinalStorageExcel =
+      (doc.finalStoragePath || '').toLowerCase().endsWith('.xlsx') ||
+      (doc.finalStoragePath || '').toLowerCase().endsWith('.xls');
+    const hasFinalDownloadExcel = isExcelUrl(doc.finalDownloadUrl);
+    
+    // Check MAIN storage fields
+    const hasMainFileNameExcel =
+      (doc.fileName || '').toLowerCase().endsWith('.xlsx') ||
+      (doc.fileName || '').toLowerCase().endsWith('.xls');
+    const hasMainStorageExcel =
+      (doc.storagePath || '').toLowerCase().endsWith('.xlsx') ||
+      (doc.storagePath || '').toLowerCase().endsWith('.xls');
+    const hasMainDownloadExcel = isExcelUrl(doc.downloadUrl);
+    
+    // Check if there's likely an Excel sibling file
+    // This handles cases where both PDF and Excel exist in storage but only PDF is linked in Firestore
+    // e.g., "05-Tesselate-Invoice-FEBRUARY-2026.pdf" likely has "05-Tesselate-Invoice-FEBRUARY-2026.xlsx" sibling
+    let hasLikelyExcelSibling = false;
+    if (doc.storagePath?.toLowerCase().endsWith('.pdf')) {
+      // If we have a PDF in the invoice folder, assume there might be an Excel version too
+      // This is based on the app's pattern of generating both formats
+      hasLikelyExcelSibling = doc.storagePath.includes('/invoice/');
+    }
+    
+    return hasFinalDocExcel || hasFinalFileNameExcel || hasFinalStorageExcel || hasFinalDownloadExcel ||
+           hasMainFileNameExcel || hasMainStorageExcel || hasMainDownloadExcel || hasLikelyExcelSibling;
   };
 
   // Helper to get the correct Excel download URL for a document
@@ -388,6 +476,15 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     if (isExcelUrl(doc.downloadUrl)) {
       return doc.downloadUrl;
     }
+    
+    // If we have a PDF downloadUrl but no Excel URL, construct the Excel URL
+    // by replacing .pdf with .xlsx in the URL
+    if (doc.downloadUrl && doc.downloadUrl.toLowerCase().endsWith('.pdf')) {
+      const excelUrl = doc.downloadUrl.replace(/\.pdf$/i, '.xlsx');
+      console.log('[getExcelDownloadUrl] Constructed Excel URL from PDF:', excelUrl.substring(0, 100));
+      return excelUrl;
+    }
+    
     return undefined;
   };
 
@@ -403,7 +500,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     }
     
     // Check if path ends with Excel extension
-    const isExcelPath = doc.storagePath.endsWith('.xlsx') || doc.storagePath.endsWith('.xls');
+    const isExcelPath = doc.storagePath.toLowerCase().endsWith('.xlsx') || doc.storagePath.toLowerCase().endsWith('.xls');
     console.log('[regenerateExcelUrl] Is Excel path:', isExcelPath);
     
     if (isExcelPath) {
@@ -416,6 +513,21 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         console.error('[regenerateExcelUrl] Failed to regenerate Excel download URL:', err);
       }
     }
+    
+    // If we have a PDF path, try to get the Excel sibling URL
+    if (doc.storagePath.toLowerCase().endsWith('.pdf')) {
+      const excelStoragePath = doc.storagePath.replace(/\.pdf$/i, '.xlsx');
+      console.log('[regenerateExcelUrl] Trying Excel sibling path:', excelStoragePath);
+      try {
+        const { getDocumentDownloadUrl } = await import('../services/storage');
+        const url = await getDocumentDownloadUrl(excelStoragePath);
+        console.log('[regenerateExcelUrl] Successfully regenerated Excel sibling URL:', url);
+        return url;
+      } catch (err) {
+        console.error('[regenerateExcelUrl] Failed to get Excel sibling URL:', err);
+      }
+    }
+    
     return undefined;
   };
 
@@ -1716,9 +1828,22 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   };
 
   const getInvoiceForRecord = (recordId: string): Document | undefined => {
-    return invoices.find(
+    const invoice = invoices.find(
       (inv) => inv.workRecordId === recordId && inv.type === 'invoice'
     );
+    if (recordId.includes('7ec3438d')) { // February Tesselate record
+      console.log('[getInvoiceForRecord] Looking for record:', recordId.slice(0, 8));
+      console.log('[getInvoiceForRecord] Found invoice:', invoice?.id?.slice(0, 8));
+      console.log('[getInvoiceForRecord] Invoice type:', invoice?.type);
+      console.log('[getInvoiceForRecord] All invoices for this workRecordId:',
+        invoices.filter(inv => inv.workRecordId === recordId).map(i => ({
+          id: i.id.slice(0, 8),
+          type: i.type,
+          status: i.status
+        }))
+      );
+    }
+    return invoice;
   };
 
   const getTimesheetForRecord = (recordId: string): Document | undefined => {
@@ -1828,6 +1953,20 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             </option>
           ))}
         </select>
+        
+        {/* Refresh Button */}
+        <button
+          onClick={() => {
+            console.log('[WorkRecordList] Manual refresh triggered');
+            setRefreshKey(prev => prev + 1);
+          }}
+          disabled={isLoading}
+          className="flex items-center gap-2 px-4 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg border border-slate-300 dark:border-slate-600 transition disabled:opacity-50"
+          title="Refresh data"
+        >
+          <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
+          <span className="hidden sm:inline">Refresh</span>
+        </button>
       </div>
 
       {/* Records List */}
@@ -1982,7 +2121,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <StatusBadge status={invoice.status || 'generated'} size="sm" timestamp={invoice.paidAt || invoice.sentAt || invoice.finalizedAt || invoice.generatedAt} />
+                                <StatusBadge status={getEffectiveStatus(invoice)} size="sm" timestamp={invoice.paidAt || invoice.sentAt || invoice.finalizedAt || invoice.generatedAt} />
                               </button>
 
                               {/* Invoice Dropdown Menu */}
@@ -2147,19 +2286,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                   <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
                                   {invoice.status !== 'sent' && invoice.status !== 'paid' && (
                                     <button
-                                      onClick={async (e) => {
+                                      onClick={(e) => {
                                         e.stopPropagation();
-                                        try {
-                                          const { markDocumentSent } = await import('../services/db');
-                                          await markDocumentSent(userEmail!, invoice.id, `Marked as sent from WorkRecordList`);
-                                          // Refresh documents to show updated status
-                                          const { getDocuments } = await import('../services/db');
-                                          const updatedDocs = await getDocuments(userEmail!);
-                                          setInvoices(updatedDocs);
-                                        } catch (err) {
-                                          console.error('Error marking as sent:', err);
-                                          alert('Failed to mark as sent. Please try again.');
-                                        }
+                                        setStatusDateTarget({ type: 'sent', document: invoice });
+                                        // Set default date to now
+                                        const now = new Date();
+                                        setStatusDay(now.getDate());
+                                        setStatusMonth(now.getMonth());
+                                        setStatusYear(now.getFullYear());
+                                        const hours1 = String(now.getHours()).padStart(2, '0');
+                                        const minutes1 = String(now.getMinutes()).padStart(2, '0');
+                                        setStatusTimeValue(`${hours1}:${minutes1}`);
+                                        setShowStatusDateDialog(true);
                                         setOpenDropdown(null);
                                       }}
                                       className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
@@ -2170,19 +2308,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                   )}
                                   {invoice.status !== 'paid' && (
                                     <button
-                                      onClick={async (e) => {
+                                      onClick={(e) => {
                                         e.stopPropagation();
-                                        try {
-                                          const { markInvoicePaid } = await import('../services/db');
-                                          await markInvoicePaid(userEmail!, invoice.id, `Marked as paid from WorkRecordList`);
-                                          // Refresh documents to show updated status
-                                          const { getDocuments } = await import('../services/db');
-                                          const updatedDocs = await getDocuments(userEmail!);
-                                          setInvoices(updatedDocs);
-                                        } catch (err) {
-                                          console.error('Error marking as paid:', err);
-                                          alert('Failed to mark as paid. Please try again.');
-                                        }
+                                        setStatusDateTarget({ type: 'paid', document: invoice });
+                                        // Set default date to now
+                                        const now = new Date();
+                                        setStatusDay(now.getDate());
+                                        setStatusMonth(now.getMonth());
+                                        setStatusYear(now.getFullYear());
+                                        const hours2 = String(now.getHours()).padStart(2, '0');
+                                        const minutes2 = String(now.getMinutes()).padStart(2, '0');
+                                        setStatusTimeValue(`${hours2}:${minutes2}`);
+                                        setShowStatusDateDialog(true);
                                         setOpenDropdown(null);
                                       }}
                                       className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
@@ -2248,7 +2385,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <StatusBadge status={timesheet.status || 'generated'} size="sm" timestamp={timesheet.sentAt || timesheet.finalizedAt || timesheet.generatedAt} />
+                                <StatusBadge status={getEffectiveStatus(timesheet)} size="sm" timestamp={timesheet.sentAt || timesheet.finalizedAt || timesheet.generatedAt} />
                               </button>
 
                               {/* Excel Timesheet Dropdown Menu */}
@@ -2307,19 +2444,18 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                     <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
                                     {timesheet.status !== 'sent' && (
                                       <button
-                                        onClick={async (e) => {
+                                        onClick={(e) => {
                                           e.stopPropagation();
-                                          try {
-                                            const { markDocumentSent } = await import('../services/db');
-                                            await markDocumentSent(userEmail!, timesheet.id, `Marked as sent from WorkRecordList`);
-                                            // Refresh documents to show updated status
-                                            const { getDocuments } = await import('../services/db');
-                                            const updatedDocs = await getDocuments(userEmail!);
-                                            setInvoices(updatedDocs);
-                                          } catch (err) {
-                                            console.error('Error marking as sent:', err);
-                                            alert('Failed to mark as sent. Please try again.');
-                                          }
+                                          setStatusDateTarget({ type: 'sent', document: timesheet });
+                                          // Set default date to now
+                                          const now = new Date();
+                                          setStatusDay(now.getDate());
+                                          setStatusMonth(now.getMonth());
+                                          setStatusYear(now.getFullYear());
+                                          const hours3 = String(now.getHours()).padStart(2, '0');
+                                          const minutes3 = String(now.getMinutes()).padStart(2, '0');
+                                          setStatusTimeValue(`${hours3}:${minutes3}`);
+                                          setShowStatusDateDialog(true);
                                           setOpenDropdown(null);
                                         }}
                                         className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
@@ -2660,6 +2796,130 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                 No timesheet template configured. Please upload a template in the client settings.
               </p>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Status Date Picker Dialog */}
+      {showStatusDateDialog && statusDateTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-md w-full">
+            <div className="p-6 border-b border-slate-200 dark:border-slate-700">
+              <h3 className="text-lg font-semibold text-slate-800 dark:text-white">
+                Mark as {statusDateTarget.type === 'sent' ? 'Sent' : 'Paid'}
+              </h3>
+              <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
+                Select the date and time when this document was {statusDateTarget.type === 'sent' ? 'sent' : 'paid'}.
+              </p>
+            </div>
+            <div className="p-6 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                  Date
+                </label>
+                <div className="flex gap-2">
+                  {/* Day dropdown */}
+                  <select
+                    value={statusDay}
+                    onChange={(e) => setStatusDay(parseInt(e.target.value))}
+                    className="w-20 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                  >
+                    {Array.from({ length: getStatusDaysInMonth(statusMonth, statusYear) }, (_, i) => i + 1).map((day) => (
+                      <option key={day} value={day}>{day}</option>
+                    ))}
+                  </select>
+                  {/* Month dropdown with names */}
+                  <select
+                    value={statusMonth}
+                    onChange={(e) => {
+                      const newMonth = parseInt(e.target.value);
+                      setStatusMonth(newMonth);
+                      // Adjust day if new month has fewer days
+                      const daysInNewMonth = getStatusDaysInMonth(newMonth, statusYear);
+                      if (statusDay > daysInNewMonth) {
+                        setStatusDay(daysInNewMonth);
+                      }
+                    }}
+                    className="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                  >
+                    {statusMonths.map((monthName, index) => (
+                      <option key={index} value={index}>{monthName}</option>
+                    ))}
+                  </select>
+                  {/* Year dropdown */}
+                  <select
+                    value={statusYear}
+                    onChange={(e) => {
+                      const newYear = parseInt(e.target.value);
+                      setStatusYear(newYear);
+                      // Adjust day for February in leap years
+                      const daysInMonth = getStatusDaysInMonth(statusMonth, newYear);
+                      if (statusDay > daysInMonth) {
+                        setStatusDay(daysInMonth);
+                      }
+                    }}
+                    className="w-24 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                  >
+                    {Array.from({ length: 11 }, (_, i) => new Date().getFullYear() - 5 + i).map((year) => (
+                      <option key={year} value={year}>{year}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                  Time
+                </label>
+                <input
+                  type="time"
+                  value={statusTimeValue}
+                  onChange={(e) => setStatusTimeValue(e.target.value)}
+                  className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-2 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                />
+              </div>
+            </div>
+            <div className="p-6 border-t border-slate-200 dark:border-slate-700 flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setShowStatusDateDialog(false);
+                  setStatusDateTarget(null);
+                }}
+                className="px-4 py-2 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const { markDocumentSent, markInvoicePaid } = await import('../services/db');
+                    const [hours, minutes] = statusTimeValue.split(':').map(Number);
+                    const localDate = new Date(statusYear, statusMonth, statusDay, hours, minutes);
+                    const isoDate = localDate.toISOString();
+                    
+                    if (statusDateTarget.type === 'sent') {
+                      await markDocumentSent(userEmail!, statusDateTarget.document.id, `Marked as sent from WorkRecordList`, isoDate);
+                    } else {
+                      await markInvoicePaid(userEmail!, statusDateTarget.document.id, `Marked as paid from WorkRecordList`, isoDate);
+                    }
+                    
+                    // Refresh documents to show updated status
+                    const { getDocuments } = await import('../services/db');
+                    const updatedDocs = await getDocuments(userEmail!);
+                    setInvoices(updatedDocs);
+                    
+                    setShowStatusDateDialog(false);
+                    setStatusDateTarget(null);
+                  } catch (err) {
+                    console.error(`Error marking as ${statusDateTarget.type}:`, err);
+                    alert(`Failed to mark as ${statusDateTarget.type}. Please try again.`);
+                  }
+                }}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+              >
+                <CheckCircle size={16} />
+                Confirm
+              </button>
+            </div>
           </div>
         </div>
       )}

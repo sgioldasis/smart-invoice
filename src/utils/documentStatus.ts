@@ -257,11 +257,10 @@ export function hasFinalVersion(document: Document): boolean {
     return true;
   }
   // Fall back to legacy fields
-  return !!(
-    document.finalStoragePath ||
-    document.finalDownloadUrl ||
-    document.finalFileName
-  );
+  if (document.finalStoragePath || document.finalDownloadUrl || document.finalFileName) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -304,39 +303,99 @@ export function getFinalDocuments(document: Document): Array<{
  * but their status field wasn't updated (e.g., "generated" -> "final")
  */
 export function getEffectiveStatus(document: Document): DocumentStatus {
+  // Debug logging - show ALL potential file fields
+  console.log('[getEffectiveStatus] Checking:', {
+    id: document.id?.slice(0, 8),
+    status: document.status,
+    finalFileName: document.finalFileName,
+    finalStoragePath: document.finalStoragePath?.slice(0, 50),
+    finalDownloadUrl: document.finalDownloadUrl?.slice(0, 50),
+    // Additional fields
+    downloadUrl: document.downloadUrl?.slice(0, 50),
+    fileName: document.fileName,
+    storagePath: document.storagePath?.slice(0, 50),
+    hasFinalDocs: !!document.finalDocuments?.length,
+    finalDocs: document.finalDocuments?.map(fd => ({
+      name: fd.fileName,
+      ext: fd.fileExtension,
+      path: fd.storagePath?.slice(0, 30),
+    })),
+  });
+
   // If document is paid, that's the highest status
   if (document.status === 'paid' || document.isPaid) {
+    console.log('[getEffectiveStatus] Returning: paid');
     return 'paid';
   }
   
   // If document was sent, show sent status
   if (document.status === 'sent') {
+    console.log('[getEffectiveStatus] Returning: sent');
     return 'sent';
   }
   
-  // If document has uploaded files, determine the type
-  if (hasFinalVersion(document)) {
-    const finalDocs = document.finalDocuments || [];
-    const hasPdf = finalDocs.some(fd => fd.fileExtension.toLowerCase() === 'pdf');
-    const hasExcel = finalDocs.some(fd =>
-      fd.fileExtension.toLowerCase() === 'xlsx' ||
-      fd.fileExtension.toLowerCase() === 'xls'
-    );
-    
-    // Return appropriate status based on file types
-    if (hasPdf) return 'pdf-uploaded';
-    if (hasExcel) return 'excel-uploaded';
-    
-    // Fallback: check current status if it's already an uploaded state
-    if (document.status === 'pdf-uploaded' || document.status === 'excel-uploaded') {
-      return document.status;
-    }
-    
-    // Default to pdf-uploaded if we can't determine
+  // Check ALL file fields: finalDocuments, legacy final fields, AND main storage fields
+  const finalDocs = document.finalDocuments || [];
+  
+  // Check finalDocuments array for file types
+  let hasPdf = finalDocs.some(fd => fd.fileExtension?.toLowerCase() === 'pdf');
+  let hasExcel = finalDocs.some(fd =>
+    fd.fileExtension?.toLowerCase() === 'xlsx' ||
+    fd.fileExtension?.toLowerCase() === 'xls'
+  );
+  
+  // Check legacy FINAL fields (finalFileName, finalStoragePath, finalDownloadUrl)
+  const finalFileName = document.finalFileName || '';
+  const finalStoragePath = document.finalStoragePath || '';
+  const finalDownloadUrl = document.finalDownloadUrl || '';
+  
+  if (finalFileName.toLowerCase().endsWith('.pdf')) hasPdf = true;
+  if (finalFileName.toLowerCase().endsWith('.xlsx') || finalFileName.toLowerCase().endsWith('.xls')) hasExcel = true;
+  if (finalStoragePath.toLowerCase().endsWith('.pdf')) hasPdf = true;
+  if (finalStoragePath.toLowerCase().endsWith('.xlsx') || finalStoragePath.toLowerCase().endsWith('.xls')) hasExcel = true;
+  if (finalDownloadUrl.toLowerCase().includes('.pdf')) hasPdf = true;
+  if (finalDownloadUrl.toLowerCase().includes('.xlsx') || finalDownloadUrl.toLowerCase().includes('.xls')) hasExcel = true;
+  
+  // ALSO check MAIN storage fields (fileName, storagePath, downloadUrl)
+  // This handles documents where files are stored in the generated fields
+  const mainFileName = document.fileName || '';
+  const mainStoragePath = document.storagePath || '';
+  const mainDownloadUrl = document.downloadUrl || '';
+  
+  if (mainFileName.toLowerCase().endsWith('.pdf')) hasPdf = true;
+  if (mainFileName.toLowerCase().endsWith('.xlsx') || mainFileName.toLowerCase().endsWith('.xls')) hasExcel = true;
+  if (mainStoragePath.toLowerCase().endsWith('.pdf')) hasPdf = true;
+  if (mainStoragePath.toLowerCase().endsWith('.xlsx') || mainStoragePath.toLowerCase().endsWith('.xls')) hasExcel = true;
+  if (mainDownloadUrl.toLowerCase().includes('.pdf')) hasPdf = true;
+  if (mainDownloadUrl.toLowerCase().includes('.xlsx') || mainDownloadUrl.toLowerCase().includes('.xls')) hasExcel = true;
+  
+  // Check if there's likely an Excel sibling file
+  // This handles cases where both PDF and Excel exist in storage but only PDF is linked in Firestore
+  // e.g., "05-Tesselate-Invoice-FEBRUARY-2026.pdf" likely has "05-Tesselate-Invoice-FEBRUARY-2026.xlsx" sibling
+  if (mainStoragePath.toLowerCase().endsWith('.pdf') && mainStoragePath.includes('/invoice/')) {
+    hasExcel = true;
+  }
+  
+  console.log('[getEffectiveStatus] Results:', { hasPdf, hasExcel, finalDocsLength: finalDocs.length });
+
+  // If we found any files, return appropriate status
+  if (hasPdf) {
+    console.log('[getEffectiveStatus] Returning: pdf-uploaded');
     return 'pdf-uploaded';
+  }
+  if (hasExcel) {
+    console.log('[getEffectiveStatus] Returning: excel-uploaded');
+    return 'excel-uploaded';
+  }
+  
+  // If no files found but status says uploaded, preserve it
+  if (document.status === 'pdf-uploaded' || document.status === 'excel-uploaded') {
+    console.log('[getEffectiveStatus] Returning stored:', document.status);
+    return document.status;
   }
   
   // Otherwise return the stored status or default to 'generated'
+  console.log('[getEffectiveStatus] Returning default:', document.status || 'generated');
   return document.status || 'generated';
 }
 

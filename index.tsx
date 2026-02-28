@@ -22,6 +22,7 @@ import {
   TrendingUp,
   Users,
   ClipboardList,
+  Settings,
 } from 'lucide-react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, AreaChart } from 'recharts';
 import { motion } from 'framer-motion';
@@ -41,6 +42,9 @@ import { InvoiceGenerator as NewInvoiceGenerator } from './src/components/Invoic
 
 // NEW: Document Manager
 import { DocumentManager } from './src/components/DocumentManager';
+
+// NEW: Migration Tool
+import { MigrationTool } from './src/components/MigrationTool';
 
 // NEW: Import WorkRecord types
 import type { WorkRecord, Document, Template } from './src/types';
@@ -136,8 +140,19 @@ import {
 const DB = {
   getClients: async (userEmail: string): Promise<Client[]> => {
     try {
-      const q = query(collection(db, 'clients'), where('userId', '==', userEmail));
+      // Try userEmail first (new structure)
+      const q = query(collection(db, 'clients'), where('userEmail', '==', userEmail));
       const snapshot = await getDocs(q);
+      
+      // If no results, try userId (legacy structure - for backward compatibility)
+      if (snapshot.empty) {
+        console.log('[DB.getClients] No clients with userEmail, trying userId...');
+        const qLegacy = query(collection(db, 'clients'), where('userId', '==', userEmail));
+        const legacySnapshot = await getDocs(qLegacy);
+        console.log('[DB.getClients] Found', legacySnapshot.docs.length, 'clients with userId');
+        return legacySnapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Client));
+      }
+      
       return snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Client));
     } catch (e) {
       console.error('Error fetching clients:', e);
@@ -167,9 +182,9 @@ const DB = {
       throw e;
     }
   },
-  getDocuments: async (userId: string, clientId?: string, type?: 'invoice' | 'timesheet'): Promise<Document[]> => {
+  getDocuments: async (userEmail: string, clientId?: string, type?: 'invoice' | 'timesheet'): Promise<Document[]> => {
     try {
-      const constraints: any[] = [where('userId', '==', userId)];
+      const constraints: any[] = [where('userEmail', '==', userEmail)];
       if (clientId) {
         constraints.push(where('clientId', '==', clientId));
       }
@@ -185,11 +200,11 @@ const DB = {
     }
   },
   // NEW: Work Record methods
-  getWorkRecordByMonth: async (userId: string, clientId: string, month: string): Promise<WorkRecord | null> => {
+  getWorkRecordByMonth: async (userEmail: string, clientId: string, month: string): Promise<WorkRecord | null> => {
     try {
       const q = query(
         collection(db, 'workRecords'),
-        where('userId', '==', userId),
+        where('userEmail', '==', userEmail),
         where('clientId', '==', clientId),
         where('month', '==', month)
       );
@@ -329,6 +344,13 @@ const Layout = ({ children, activeTab, setActiveTab, theme, toggleTheme, authCom
           >
             <BarChart3 size={20} />
             <span>Analytics</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('admin')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === 'admin' ? 'bg-indigo-600 text-white' : 'hover:bg-slate-800 text-slate-300'}`}
+          >
+            <Settings size={20} />
+            <span>Admin</span>
           </button>
 
         </nav>
@@ -844,7 +866,7 @@ const ClientEditor = ({ userEmail, client, onSave, onCancel }: any) => {
 
 // --- Analytics Component ---
 
-const Analytics = ({ userId }: { userId: string }) => {
+const Analytics = ({ userEmail }: { userEmail: string }) => {
   const [clients, setClients] = useState<Client[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
@@ -852,10 +874,10 @@ const Analytics = ({ userId }: { userId: string }) => {
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
-      console.log('Analytics: Loading data for user', userId);
+      console.log('Analytics: Loading data for userEmail:', userEmail);
       const [clientsData, docsData] = await Promise.all([
-        DB.getClients(userId),
-        DB.getDocuments(userId, undefined, 'invoice') // Fetch documents of type 'invoice'
+        DB.getClients(userEmail),
+        DB.getDocuments(userEmail, undefined, 'invoice') // Fetch documents of type 'invoice'
       ]);
       console.log('Analytics: Loaded clients', clientsData.length);
       console.log('Analytics: Loaded documents', docsData.length);
@@ -864,7 +886,7 @@ const Analytics = ({ userId }: { userId: string }) => {
       setLoading(false);
     };
     loadData();
-  }, [userId]);
+  }, [userEmail]);
 
   // Prepare chart data
   const chartData = useMemo(() => {
@@ -1418,7 +1440,15 @@ export default function App() {
 
           {/* Analytics Tab */}
           {activeTab === 'analytics' && (
-            <Analytics userId={user.uid} />
+            <Analytics userEmail={user.email!} />
+          )}
+
+          {/* Admin Tab */}
+          {activeTab === 'admin' && (
+            <div className="p-6">
+              <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">Admin Tools</h1>
+              <MigrationTool />
+            </div>
           )}
 
         </>

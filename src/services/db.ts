@@ -72,11 +72,25 @@ const COLLECTIONS = {
 export async function getClients(userEmail: string): Promise<Client[]> {
   try {
     console.log('[getClients] Querying for userEmail:', userEmail);
+    // Try userEmail first (new structure)
     const q = query(
       collection(db, COLLECTIONS.CLIENTS),
       where('userEmail', '==', userEmail)
     );
     const snapshot = await getDocs(q);
+    
+    // If no results, try userId (legacy structure - for backward compatibility)
+    if (snapshot.empty) {
+      console.log('[getClients] No clients with userEmail, trying userId...');
+      const qLegacy = query(
+        collection(db, COLLECTIONS.CLIENTS),
+        where('userId', '==', userEmail)
+      );
+      const legacySnapshot = await getDocs(qLegacy);
+      console.log('[getClients] Found', legacySnapshot.docs.length, 'clients with userId');
+      return legacySnapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Client));
+    }
+    
     console.log('[getClients] Found', snapshot.docs.length, 'clients');
     return snapshot.docs.map((doc) => ({ ...doc.data(), id: doc.id } as Client));
   } catch (e) {
@@ -910,25 +924,116 @@ export async function uploadFinalDocument(
 
 /**
  * Mark document as sent to client
+ * Optionally accepts a custom date for the sent timestamp
  */
 export async function markDocumentSent(
   userEmail: string,
   documentId: string,
-  note?: string
+  note?: string,
+  sentAt?: string
 ): Promise<void> {
-  return updateDocumentStatus(userEmail, documentId, 'sent', note || 'Sent to client');
+  try {
+    // Get current document
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    const documentSnap = await getDoc(documentRef);
+
+    if (!documentSnap.exists()) {
+      throw new Error('Document not found');
+    }
+
+    const document = documentSnap.data() as Document;
+
+    // Verify ownership
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to update this document');
+    }
+
+    // Validate status transition
+    if (!isValidStatusTransition(document.status, 'sent', document.type)) {
+      throw new Error(
+        `Invalid status transition from ${document.status} to sent for ${document.type}`
+      );
+    }
+
+    const timestamp = sentAt || new Date().toISOString();
+
+    // Build update data
+    const updateData: any = {
+      status: 'sent',
+      sentAt: timestamp,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Add to status history
+    updateData.statusHistory = addStatusToHistory(
+      document.statusHistory || [],
+      'sent',
+      note || 'Sent to client'
+    );
+
+    await setDoc(documentRef, updateData, { merge: true });
+  } catch (e) {
+    console.error('Error marking document as sent:', e);
+    throw e;
+  }
 }
 
 /**
  * Mark invoice as paid
  * Only valid for invoice documents
+ * Optionally accepts a custom date for the paid timestamp
  */
 export async function markInvoicePaid(
   userEmail: string,
   documentId: string,
-  note?: string
+  note?: string,
+  paidAt?: string
 ): Promise<void> {
-  return updateDocumentStatus(userEmail, documentId, 'paid', note || 'Invoice paid');
+  try {
+    // Get current document
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    const documentSnap = await getDoc(documentRef);
+
+    if (!documentSnap.exists()) {
+      throw new Error('Document not found');
+    }
+
+    const document = documentSnap.data() as Document;
+
+    // Verify ownership
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to update this document');
+    }
+
+    // Validate status transition
+    if (!isValidStatusTransition(document.status, 'paid', document.type)) {
+      throw new Error(
+        `Invalid status transition from ${document.status} to paid for ${document.type}`
+      );
+    }
+
+    const timestamp = paidAt || new Date().toISOString();
+
+    // Build update data
+    const updateData: any = {
+      status: 'paid',
+      paidAt: timestamp,
+      isPaid: true,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Add to status history
+    updateData.statusHistory = addStatusToHistory(
+      document.statusHistory || [],
+      'paid',
+      note || 'Invoice paid'
+    );
+
+    await setDoc(documentRef, updateData, { merge: true });
+  } catch (e) {
+    console.error('Error marking invoice as paid:', e);
+    throw e;
+  }
 }
 
 /**

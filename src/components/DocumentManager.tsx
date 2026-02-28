@@ -27,6 +27,10 @@ import {
   Download,
   File,
   Upload,
+  FolderSync,
+  CheckCircle,
+  XCircle,
+  Copy,
 } from 'lucide-react';
 import { format } from 'date-fns';
 import * as XLSX from 'xlsx';
@@ -49,6 +53,25 @@ import {
 } from '../services/storage';
 import { saveDocument } from '../services/db';
 import type { Template } from '../types';
+import {
+  migrateDocuments,
+  previewMigration,
+  getMigrationStats,
+  type MigrationProgress,
+  type MigrationResult,
+} from '../services/migrateDocuments';
+import {
+  previewDuplicates,
+  runDeduplication,
+  type DeduplicationResult,
+  type DuplicateGroup,
+} from '../services/deduplicateService';
+import {
+  previewStatusMigration,
+  runStatusMigration,
+  type MigrationResult as StatusMigrationResult,
+  type StatusChange,
+} from '../services/migrateDocumentStatusService';
 
 interface DocumentManagerProps {
   userEmail: string;
@@ -261,6 +284,33 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   const [storageFilesMap, setStorageFilesMap] = useState<Map<string, { name: string; fullPath: string; downloadUrl?: string }[]>>(new Map());
   const [loadingStorageFiles, setLoadingStorageFiles] = useState<Set<string>>(new Set());
 
+  // Migration state
+  const [showMigrationModal, setShowMigrationModal] = useState(false);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState<MigrationProgress | null>(null);
+  const [migrationResult, setMigrationResult] = useState<MigrationResult | null>(null);
+  const [migrationStats, setMigrationStats] = useState<{
+    total: number;
+    migrated: number;
+    needsMigration: number;
+    withBase64Data: number;
+    withOldPath: number;
+  } | null>(null);
+
+  // Deduplication state
+  const [showDeduplicateModal, setShowDeduplicateModal] = useState(false);
+  const [isDeduplicating, setIsDeduplicating] = useState(false);
+  const [deduplicatePreview, setDeduplicatePreview] = useState<DeduplicationResult | null>(null);
+  const [deduplicateResult, setDeduplicateResult] = useState<DeduplicationResult | null>(null);
+  const [deduplicateLogs, setDeduplicateLogs] = useState<string[]>([]);
+
+  // Status Migration state
+  const [showStatusMigrationModal, setShowStatusMigrationModal] = useState(false);
+  const [isMigratingStatus, setIsMigratingStatus] = useState(false);
+  const [statusMigrationPreview, setStatusMigrationPreview] = useState<StatusMigrationResult | null>(null);
+  const [statusMigrationResult, setStatusMigrationResult] = useState<StatusMigrationResult | null>(null);
+  const [statusMigrationLogs, setStatusMigrationLogs] = useState<string[]>([]);
+
   // ============================================
   // Data Loading
   // ============================================
@@ -336,19 +386,47 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   const loadStorageFilesForDocs = async (docs: FirestoreDocument[]) => {
     const newStorageFilesMap = new Map<string, { name: string; fullPath: string; downloadUrl?: string }[]>();
     const loadingSet = new Set<string>();
+    const { sanitizeUserEmail, sanitizeClientName } = await import('../services/storage');
+    const sanitizedEmail = sanitizeUserEmail(userEmail);
 
     for (const doc of docs) {
       const data = doc.data;
       // Build folder path from document metadata to ensure we get the right folder
       // even if finalStoragePath points to a different file
-      if (data.clientName && data.month && data.type) {
-        const { sanitizeUserEmail, sanitizeClientName } = await import('../services/storage');
-        const sanitizedEmail = sanitizeUserEmail(userEmail);
-        const sanitizedClient = sanitizeClientName(String(data.clientName));
-        const docType = String(data.type).toLowerCase();
+      
+      // Try to get clientName from document or lookup from clientId
+      let clientName = data.clientName;
+      if (!clientName && data.clientId) {
+        clientName = clientNames.get(String(data.clientId));
+      }
+      
+      // Try to get month from document
+      let month = data.month;
+      if (!month && data.documentNumber) {
+        const match = String(data.documentNumber).match(/(\d{4})-(\d{2})/);
+        if (match) month = `${match[1]}-${match[2]}`;
+      }
+      
+      // Try to get type from document
+      let docType = data.type;
+      if (!docType) {
+        const fileNameStr = String(data.fileName || '');
+        if (data.documentNumber?.toString().startsWith('INV') ||
+            fileNameStr.includes('Invoice')) {
+          docType = 'invoice';
+        } else if (data.documentNumber?.toString().startsWith('TMS') ||
+                   fileNameStr.includes('Timesheet') ||
+                   fileNameStr.includes('Time Sheet')) {
+          docType = 'timesheet';
+        }
+      }
+      
+      if (clientName && month && docType) {
+        const sanitizedClient = sanitizeClientName(String(clientName));
+        const docTypeLower = String(docType).toLowerCase();
         
         // Path for documents (e.g., users/email/client/2026-03/invoice/)
-        const docsPath = `users/${sanitizedEmail}/${sanitizedClient}/${data.month}/${docType}`;
+        const docsPath = `users/${sanitizedEmail}/${sanitizedClient}/${month}/${docTypeLower}`;
 
         // Load documents folder (type-specific subfolder)
         if (!loadingSet.has(docsPath)) {
@@ -378,10 +456,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
 
   // Load storage files when documents change
   useEffect(() => {
-    if (selectedCollection === 'documents' && documents.length > 0) {
+    if (selectedCollection === 'documents' && documents.length > 0 && clientNames.size > 0) {
       loadStorageFilesForDocs(documents);
     }
-  }, [documents, selectedCollection]);
+  }, [documents, selectedCollection, clientNames]);
 
   // Load clients for the upload modal
   useEffect(() => {
@@ -828,8 +906,34 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   // ============================================
 
   const filteredDocuments = useMemo(() => {
+    // Deduplicate documents by workRecordId + type, keeping the most recent one
+    const docMap = new Map<string, FirestoreDocument>();
+    documents.forEach((doc) => {
+      const workRecordId = doc.data?.workRecordId;
+      const type = doc.data?.type;
+      // Only deduplicate documents that have a workRecordId (invoices/timesheets from work records)
+      if (workRecordId && type) {
+        const key = `${workRecordId}-${type}`;
+        const existing = docMap.get(key);
+        // Keep the document with the most recent generatedAt timestamp
+        if (!existing) {
+          docMap.set(key, doc);
+        } else {
+          const existingDate = new Date(String(existing.data?.generatedAt || 0)).getTime();
+          const newDate = new Date(String(doc.data?.generatedAt || 0)).getTime();
+          if (newDate > existingDate) {
+            docMap.set(key, doc);
+          }
+        }
+      } else {
+        // For documents without workRecordId, use document ID as key (no deduplication)
+        docMap.set(doc.id, doc);
+      }
+    });
+    const deduplicatedDocs = Array.from(docMap.values());
+
     // First, sort all documents by title descending (newest month first)
-    const sortedDocuments = [...documents].sort((a, b) => {
+    const sortedDocuments = deduplicatedDocs.sort((a, b) => {
       const titleA = getDocumentTitle(a);
       const titleB = getDocumentTitle(b);
       // Sort descending (Z to A, so newer dates come first)
@@ -1057,6 +1161,38 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
               >
                 <RefreshCw size={20} className="text-slate-600 dark:text-slate-400" />
               </button>
+              {selectedCollection === 'documents' && (
+                <button
+                  onClick={async () => {
+                    const stats = await getMigrationStats(userEmail);
+                    setMigrationStats(stats);
+                    setShowMigrationModal(true);
+                    setMigrationResult(null);
+                    setMigrationProgress(null);
+                  }}
+                  className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                  title="Migrate Storage Structure"
+                >
+                  <FolderSync size={20} className="text-slate-600 dark:text-slate-400" />
+                </button>
+              )}
+              {selectedCollection === 'documents' && (
+                <button
+                  onClick={async () => {
+                    setShowDeduplicateModal(true);
+                    setDeduplicatePreview(null);
+                    setDeduplicateResult(null);
+                    setDeduplicateLogs([]);
+                    // Load preview
+                    const preview = await previewDuplicates();
+                    setDeduplicatePreview(preview);
+                  }}
+                  className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                  title="Deduplicate Documents"
+                >
+                  <Copy size={20} className="text-slate-600 dark:text-slate-400" />
+                </button>
+              )}
             </div>
           </div>
 
@@ -1267,11 +1403,34 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                           // Get all storage files for this document's folder
                           // Build folder path from document metadata (same logic as loadStorageFilesForDocs)
                           const storageFiles = (() => {
-                            if (!doc.data.clientName || !doc.data.month || !doc.data.type) return [];
+                            // Try to get clientName from document or lookup from clientId
+                            let clientName = doc.data.clientName;
+                            if (!clientName && doc.data.clientId) {
+                              clientName = clientNames.get(String(doc.data.clientId));
+                            }
+                            // Try to get month from document
+                            let month = doc.data.month;
+                            if (!month && doc.data.documentNumber) {
+                              const match = String(doc.data.documentNumber).match(/(\d{4})-(\d{2})/);
+                              if (match) month = `${match[1]}-${match[2]}`;
+                            }
+                            // Try to get type from document
+                            let docType = doc.data.type;
+                            if (!docType) {
+                              if (doc.data.documentNumber?.toString().startsWith('INV') ||
+                                  doc.data.fileName?.includes('Invoice')) {
+                                docType = 'invoice';
+                              } else if (doc.data.documentNumber?.toString().startsWith('TMS') ||
+                                         doc.data.fileName?.includes('Timesheet') ||
+                                         doc.data.fileName?.includes('Time Sheet')) {
+                                docType = 'timesheet';
+                              }
+                            }
+                            
+                            if (!clientName || !month || !docType) return [];
                             const sanitizedEmail = sanitizeUserEmail(userEmail);
-                            const sanitizedClient = sanitizeClientName(String(doc.data.clientName));
-                            const docType = String(doc.data.type).toLowerCase();
-                            const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${doc.data.month}/${docType}`;
+                            const sanitizedClient = sanitizeClientName(String(clientName));
+                            const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${month}/${String(docType).toLowerCase()}`;
                             return storageFilesMap.get(folderPath) || [];
                           })();
 
@@ -1287,11 +1446,32 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             }
                           };
                           let statusTagText = '';
+                          // First check if we have files to determine status from
+                          const hasFiles = storageFiles.length > 0 || doc.data.storagePath || doc.data.finalDocuments?.length > 0;
+                          const hasPdf = storageFiles.some(f => f.name.toLowerCase().endsWith('.pdf')) ||
+                            doc.data.finalDocuments?.some((fd: any) => fd.fileName?.toLowerCase().endsWith('.pdf'));
+                          const hasExcel = storageFiles.some(f => f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.xls')) ||
+                            doc.data.finalDocuments?.some((fd: any) => fd.fileName?.toLowerCase().match(/\.(xlsx|xls)$/));
+                          
                           if (statusHistory && statusHistory.length > 0) {
                             const latest = statusHistory[statusHistory.length - 1];
                             const statusLabel = formatStatusLabel(latest.status);
                             const statusDate = format(new Date(latest.timestamp), 'MMM d, HH:mm');
                             statusTagText = `${statusLabel} • ${statusDate}`;
+                          } else if (currentStatus && !hasFiles) {
+                            // Only use currentStatus if no files exist
+                            statusTagText = formatStatusLabel(currentStatus);
+                          } else if (hasFiles) {
+                            // Document has files - prioritize PDF status if PDF exists
+                            if (hasPdf) {
+                              statusTagText = 'PDF Uploaded';
+                            } else if (hasExcel) {
+                              statusTagText = 'Excel Uploaded';
+                            } else if (doc.data.finalDocuments?.length > 0 || doc.data.finalStoragePath) {
+                              statusTagText = 'Uploaded';
+                            } else {
+                              statusTagText = 'Generated';
+                            }
                           } else if (currentStatus) {
                             statusTagText = formatStatusLabel(currentStatus);
                           }
@@ -1302,8 +1482,23 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             'pdf-uploaded': 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300',
                             sent: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
                             paid: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+                            uploaded: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
                           };
-                          const currentStatusKey = statusHistory?.[statusHistory.length - 1]?.status || currentStatus || 'generated';
+                          let currentStatusKey = statusHistory?.[statusHistory.length - 1]?.status;
+                          if (!currentStatusKey && hasFiles) {
+                            // Determine status from storage files (prioritize PDF over stored status)
+                            if (hasPdf) {
+                              currentStatusKey = 'pdf-uploaded';
+                            } else if (hasExcel) {
+                              currentStatusKey = 'excel-uploaded';
+                            } else if (doc.data.finalDocuments?.length > 0 || doc.data.finalStoragePath) {
+                              currentStatusKey = 'uploaded';
+                            } else {
+                              currentStatusKey = 'generated';
+                            }
+                          } else if (!currentStatusKey) {
+                            currentStatusKey = currentStatus || 'generated';
+                          }
                           const statusColorClass = statusColors[currentStatusKey] || statusColors.generated;
 
                           return (
@@ -1400,11 +1595,36 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                     {(() => {
                       // Build folder path from document metadata (same logic as loadStorageFilesForDocs)
                       const storageFiles = (() => {
-                        if (!doc.data.clientName || !doc.data.month || !doc.data.type) return [];
+                        // Try to get clientName from document or lookup from clientId
+                        let clientName = doc.data.clientName;
+                        if (!clientName && doc.data.clientId) {
+                          clientName = clientNames.get(String(doc.data.clientId));
+                        }
+                        // Try to get month from document (could be in 'month' or parsed from documentNumber/month field)
+                        let month = doc.data.month;
+                        if (!month && doc.data.documentNumber) {
+                          // Try to extract from document ID or number (e.g., INV-2026-02-001 -> 2026-02)
+                          const match = String(doc.data.documentNumber).match(/(\d{4})-(\d{2})/);
+                          if (match) month = `${match[1]}-${match[2]}`;
+                        }
+                        // Try to get type from document
+                        let docType = doc.data.type;
+                        if (!docType) {
+                          // Infer from documentNumber or other fields
+                          if (doc.data.documentNumber?.toString().startsWith('INV') ||
+                              doc.data.fileName?.includes('Invoice')) {
+                            docType = 'invoice';
+                          } else if (doc.data.documentNumber?.toString().startsWith('TMS') ||
+                                     doc.data.fileName?.includes('Timesheet') ||
+                                     doc.data.fileName?.includes('Time Sheet')) {
+                            docType = 'timesheet';
+                          }
+                        }
+                        
+                        if (!clientName || !month || !docType) return [];
                         const sanitizedEmail = sanitizeUserEmail(userEmail);
-                        const sanitizedClient = sanitizeClientName(String(doc.data.clientName));
-                        const docType = String(doc.data.type).toLowerCase();
-                        const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${doc.data.month}/${docType}`;
+                        const sanitizedClient = sanitizeClientName(String(clientName));
+                        const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${month}/${String(docType).toLowerCase()}`;
                         return storageFilesMap.get(folderPath) || [];
                       })();
 
@@ -1986,6 +2206,426 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
               >
                 {uploading ? <Loader2 size={16} className="animate-spin" /> : 'Upload'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Migration Modal */}
+      {showMigrationModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-900/50">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 rounded-lg">
+                  <FolderSync size={20} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-slate-900 dark:text-white">
+                    Migrate Storage Structure
+                  </h2>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    Move documents to the new folder structure
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !isMigrating && setShowMigrationModal(false)}
+                className="p-2 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-xl transition-colors text-slate-500 dark:text-slate-400 disabled:opacity-50"
+                disabled={isMigrating}
+              >
+                <X size={24} />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-auto p-6 space-y-6">
+              {/* Stats Overview */}
+              {migrationStats && !migrationResult && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-4 text-center">
+                    <div className="text-2xl font-bold text-slate-900 dark:text-white">{migrationStats.total}</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Total Documents</div>
+                  </div>
+                  <div className="bg-emerald-50 dark:bg-emerald-900/20 rounded-xl p-4 text-center">
+                    <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{migrationStats.migrated}</div>
+                    <div className="text-xs text-emerald-600 dark:text-emerald-400">Already Migrated</div>
+                  </div>
+                  <div className="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-4 text-center">
+                    <div className="text-2xl font-bold text-amber-600 dark:text-amber-400">{migrationStats.needsMigration}</div>
+                    <div className="text-xs text-amber-600 dark:text-amber-400">Need Migration</div>
+                  </div>
+                  <div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-4 text-center">
+                    <div className="text-2xl font-bold text-slate-600 dark:text-slate-400">{migrationStats.withBase64Data + migrationStats.withOldPath}</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Legacy Files</div>
+                  </div>
+                </div>
+              )}
+
+              {/* Migration Progress */}
+              {isMigrating && migrationProgress && (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                      Migrating documents...
+                    </span>
+                    <span className="text-sm text-slate-500 dark:text-slate-400">
+                      {migrationProgress.current} / {migrationProgress.total}
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-3 overflow-hidden">
+                    <div
+                      className="bg-amber-500 h-3 rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${(migrationProgress.current / migrationProgress.total) * 100}%` }}
+                    />
+                  </div>
+                  {migrationProgress.currentDocument && (
+                    <p className="text-sm text-slate-500 dark:text-slate-400 truncate">
+                      Current: {migrationProgress.currentDocument}
+                    </p>
+                  )}
+                  <div className="flex gap-4 text-sm">
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      <CheckCircle size={14} className="inline mr-1" />
+                      {migrationProgress.migrated} migrated
+                    </span>
+                    <span className="text-slate-500 dark:text-slate-400">
+                      <RefreshCw size={14} className="inline mr-1" />
+                      {migrationProgress.skipped} skipped
+                    </span>
+                    {migrationProgress.failed > 0 && (
+                      <span className="text-red-600 dark:text-red-400">
+                        <XCircle size={14} className="inline mr-1" />
+                        {migrationProgress.failed} failed
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Migration Result */}
+              {migrationResult && (
+                <div className="space-y-4">
+                  <div className="flex items-center gap-3">
+                    {migrationResult.failed === 0 ? (
+                      <>
+                        <div className="p-3 bg-emerald-100 dark:bg-emerald-900/30 rounded-full">
+                          <CheckCircle size={24} className="text-emerald-600 dark:text-emerald-400" />
+                        </div>
+                        <div>
+                          <h3 className="font-semibold text-emerald-700 dark:text-emerald-400">Migration Complete!</h3>
+                          <p className="text-sm text-slate-600 dark:text-slate-400">
+                            All documents have been successfully migrated.
+                          </p>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="p-3 bg-amber-100 dark:bg-amber-900/30 rounded-full">
+                          <AlertTriangle size={24} className="text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <div>
+                          <h3 className="font-semibold text-amber-700 dark:text-amber-400">Migration Completed with Issues</h3>
+                          <p className="text-sm text-slate-600 dark:text-slate-400">
+                            {migrationResult.failed} document(s) failed to migrate.
+                          </p>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="bg-emerald-50 dark:bg-emerald-900/20 rounded-lg p-3 text-center">
+                      <div className="text-xl font-bold text-emerald-600 dark:text-emerald-400">{migrationResult.migrated}</div>
+                      <div className="text-xs text-emerald-600 dark:text-emerald-400">Migrated</div>
+                    </div>
+                    <div className="bg-slate-50 dark:bg-slate-800 rounded-lg p-3 text-center">
+                      <div className="text-xl font-bold text-slate-600 dark:text-slate-400">{migrationResult.skipped}</div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">Skipped</div>
+                    </div>
+                    {migrationResult.failed > 0 && (
+                      <div className="bg-red-50 dark:bg-red-900/20 rounded-lg p-3 text-center">
+                        <div className="text-xl font-bold text-red-600 dark:text-red-400">{migrationResult.failed}</div>
+                        <div className="text-xs text-red-600 dark:text-red-400">Failed</div>
+                      </div>
+                    )}
+                    {migrationResult.deleted > 0 && (
+                      <div className="bg-slate-50 dark:bg-slate-800 rounded-lg p-3 text-center">
+                        <div className="text-xl font-bold text-slate-600 dark:text-slate-400">{migrationResult.deleted}</div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400">Old Files Deleted</div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Errors List */}
+                  {migrationResult.errors.length > 0 && (
+                    <div className="bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800 rounded-lg p-4">
+                      <h4 className="font-medium text-red-700 dark:text-red-400 mb-2">Errors:</h4>
+                      <ul className="space-y-1 text-sm text-red-600 dark:text-red-400 max-h-32 overflow-y-auto">
+                        {migrationResult.errors.map((err, idx) => (
+                          <li key={idx} className="truncate" title={err.error}>
+                            {err.documentId}: {err.error}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Info Box */}
+              {!isMigrating && !migrationResult && (
+                <div className="bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800 rounded-lg p-4">
+                  <h4 className="font-medium text-blue-700 dark:text-blue-400 mb-2">What will be migrated?</h4>
+                  <ul className="space-y-1 text-sm text-blue-600 dark:text-blue-400">
+                    <li>• Documents missing storagePath (base64 data)</li>
+                    <li>• Documents in old folder paths</li>
+                    <li>• Documents without type subfolders (invoice/timesheet)</li>
+                    <li>• Final documents in legacy locations</li>
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-3 bg-slate-50 dark:bg-slate-900/50">
+              {!migrationResult ? (
+                <>
+                  <button
+                    onClick={() => setShowMigrationModal(false)}
+                    disabled={isMigrating}
+                    className="px-4 py-2 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setIsMigrating(true);
+                      try {
+                        const result = await migrateDocuments({
+                          userEmail,
+                          deleteOldFiles: false, // Keep old files for safety
+                          onProgress: (progress) => setMigrationProgress(progress),
+                        });
+                        setMigrationResult(result);
+                        // Refresh the stats
+                        const newStats = await getMigrationStats(userEmail);
+                        setMigrationStats(newStats);
+                      } catch (error) {
+                        console.error('Migration failed:', error);
+                      } finally {
+                        setIsMigrating(false);
+                      }
+                    }}
+                    disabled={isMigrating || (migrationStats && migrationStats.needsMigration === 0)}
+                    className="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isMigrating ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <FolderSync size={16} />
+                    )}
+                    {isMigrating ? 'Migrating...' : 'Start Migration'}
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => setShowMigrationModal(false)}
+                  className="px-4 py-2 bg-slate-500 hover:bg-slate-600 text-white rounded-lg transition-colors"
+                >
+                  Close
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Deduplication Modal */}
+      {showDeduplicateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-900/50">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-indigo-100 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 rounded-lg">
+                  <Copy size={20} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-bold text-slate-900 dark:text-white">
+                    Deduplicate Documents
+                  </h2>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    Remove duplicate Firestore documents
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !isDeduplicating && setShowDeduplicateModal(false)}
+                className="p-2 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-xl transition-colors text-slate-500 dark:text-slate-400 disabled:opacity-50"
+                disabled={isDeduplicating}
+              >
+                <X size={24} />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-6">
+              {!deduplicatePreview && !deduplicateResult && (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 size={32} className="animate-spin text-indigo-600" />
+                  <span className="ml-3 text-slate-600 dark:text-slate-400">Analyzing documents...</span>
+                </div>
+              )}
+
+              {deduplicatePreview && !deduplicateResult && (
+                <>
+                  {/* Stats */}
+                  <div className="grid grid-cols-3 gap-4 mb-6">
+                    <div className="bg-slate-50 dark:bg-slate-800 rounded-xl p-4 text-center">
+                      <div className="text-2xl font-bold text-slate-700 dark:text-slate-300">{deduplicatePreview.totalDocuments}</div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">Total Documents</div>
+                    </div>
+                    <div className="bg-amber-50 dark:bg-amber-900/20 rounded-xl p-4 text-center">
+                      <div className="text-2xl font-bold text-amber-600 dark:text-amber-400">{deduplicatePreview.duplicateGroups.length}</div>
+                      <div className="text-xs text-amber-600 dark:text-amber-400">Duplicate Groups</div>
+                    </div>
+                    <div className="bg-rose-50 dark:bg-rose-900/20 rounded-xl p-4 text-center">
+                      <div className="text-2xl font-bold text-rose-600 dark:text-rose-400">{deduplicatePreview.totalDuplicates}</div>
+                      <div className="text-xs text-rose-600 dark:text-rose-400">To Delete</div>
+                    </div>
+                  </div>
+
+                  {/* Duplicate Groups */}
+                  {deduplicatePreview.duplicateGroups.length > 0 ? (
+                    <div className="space-y-4">
+                      <h3 className="font-semibold text-slate-700 dark:text-slate-300">Duplicate Groups Found:</h3>
+                      {deduplicatePreview.duplicateGroups.map((group, idx) => (
+                        <div key={group.key} className="bg-slate-50 dark:bg-slate-800 rounded-lg p-4">
+                          <div className="flex items-center justify-between mb-2">
+                            <span className="font-medium text-slate-700 dark:text-slate-300">
+                              {idx + 1}. {group.key}
+                            </span>
+                            <span className="text-sm text-slate-500 dark:text-slate-400">
+                              {group.delete.length} duplicate{group.delete.length !== 1 ? 's' : ''}
+                            </span>
+                          </div>
+                          <div className="space-y-2 text-sm">
+                            <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
+                              <CheckCircle size={14} />
+                              <span>Keep: {group.keep.id} ({new Date(group.keep.generatedAt || 0).toLocaleString()})</span>
+                            </div>
+                            {group.delete.map((dup, i) => (
+                              <div key={dup.id} className="flex items-center gap-2 text-rose-600 dark:text-rose-400">
+                                <XCircle size={14} />
+                                <span>Delete: {dup.id} ({new Date(dup.generatedAt || 0).toLocaleString()})</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-center py-8">
+                      <CheckCircle size={48} className="mx-auto mb-4 text-emerald-500" />
+                      <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300">No Duplicates Found!</h3>
+                      <p className="text-slate-500 dark:text-slate-400">All documents are unique.</p>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Progress */}
+              {isDeduplicating && (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 size={32} className="animate-spin text-indigo-600" />
+                  <span className="ml-3 text-slate-600 dark:text-slate-400">Removing duplicates...</span>
+                </div>
+              )}
+
+              {/* Result */}
+              {deduplicateResult && (
+                <div className="text-center py-6">
+                  {deduplicateResult.failedCount === 0 ? (
+                    <>
+                      <CheckCircle size={64} className="mx-auto mb-4 text-emerald-500" />
+                      <h3 className="text-xl font-semibold text-emerald-700 dark:text-emerald-400 mb-2">
+                        Deduplication Complete!
+                      </h3>
+                    </>
+                  ) : (
+                    <>
+                      <AlertTriangle size={64} className="mx-auto mb-4 text-amber-500" />
+                      <h3 className="text-xl font-semibold text-amber-700 dark:text-amber-400 mb-2">
+                        Completed with Issues
+                      </h3>
+                    </>
+                  )}
+                  <p className="text-slate-600 dark:text-slate-400 mb-4">
+                    Deleted {deduplicateResult.deletedCount} of {deduplicateResult.totalDuplicates} duplicates
+                    {deduplicateResult.failedCount > 0 && ` (${deduplicateResult.failedCount} failed)`}
+                  </p>
+                  {deduplicateLogs.length > 0 && (
+                    <div className="text-left bg-slate-100 dark:bg-slate-800 rounded-lg p-4 max-h-48 overflow-y-auto text-sm font-mono">
+                      {deduplicateLogs.map((log, i) => (
+                        <div key={i} className="text-slate-600 dark:text-slate-400">{log}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-3 bg-white dark:bg-slate-950">
+              {!deduplicateResult ? (
+                <>
+                  <button
+                    onClick={() => setShowDeduplicateModal(false)}
+                    disabled={isDeduplicating}
+                    className="px-4 py-2 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setIsDeduplicating(true);
+                      setDeduplicateLogs([]);
+                      try {
+                        const result = await runDeduplication((message) => {
+                          setDeduplicateLogs(prev => [...prev, message]);
+                        });
+                        setDeduplicateResult(result);
+                        // Refresh documents
+                        if (selectedCollection === 'documents') {
+                          loadCollection('documents');
+                        }
+                      } catch (error) {
+                        console.error('Deduplication failed:', error);
+                      } finally {
+                        setIsDeduplicating(false);
+                      }
+                    }}
+                    disabled={isDeduplicating || !deduplicatePreview || deduplicatePreview.totalDuplicates === 0}
+                    className="px-4 py-2 bg-rose-500 hover:bg-rose-600 text-white rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isDeduplicating ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <Trash2 size={16} />
+                    )}
+                    {isDeduplicating ? 'Removing...' : `Remove ${deduplicatePreview?.totalDuplicates || 0} Duplicates`}
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => setShowDeduplicateModal(false)}
+                  className="px-4 py-2 bg-slate-500 hover:bg-slate-600 text-white rounded-lg transition-colors"
+                >
+                  Close
+                </button>
+              )}
             </div>
           </div>
         </div>
