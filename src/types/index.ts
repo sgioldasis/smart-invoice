@@ -185,15 +185,69 @@ export interface WorkRecordTimesheetInput {
 }
 
 // ============================================
-// Document Types (NEW - replaces InvoiceRecord)
+// Document Status Types
 // ============================================
 
 export type DocumentType = 'invoice' | 'timesheet';
 
 /**
+ * Document status workflow:
+ * generated → excel-uploaded/pdf-uploaded → sent → paid (invoices only)
+ *
+ * - generated: Initial Excel generated from template
+ * - excel-uploaded: Excel file uploaded by user
+ * - pdf-uploaded: PDF file uploaded by user
+ * - sent: Document sent to client
+ * - paid: Invoice paid by client (invoices only)
+ */
+export type DocumentStatus = 'generated' | 'excel-uploaded' | 'pdf-uploaded' | 'sent' | 'paid';
+
+/**
+ * Status history entry for audit trail
+ */
+export interface StatusHistoryEntry {
+  status: DocumentStatus;
+  timestamp: string; // ISO timestamp
+  note?: string; // Optional note about the status change
+}
+
+// ============================================
+// Final Document Info (NEW - for multiple final documents)
+// ============================================
+
+/**
+ * Information about a single uploaded final document
+ * Used to track multiple versions (e.g., PDF and Excel) of the same document
+ */
+export interface FinalDocumentInfo {
+  /** Unique ID for this final document */
+  id: string;
+  /** Filename of the uploaded document */
+  fileName: string;
+  /** Firebase Storage path to the file */
+  storagePath: string;
+  /** Public download URL for the file */
+  downloadUrl: string;
+  /** MIME type of the file */
+  contentType?: string;
+  /** File extension (pdf, xlsx, etc.) */
+  fileExtension: string;
+  /** When this file was uploaded */
+  uploadedAt: string;
+  /** Optional note about this version */
+  note?: string;
+}
+
+// ============================================
+// Document Types (NEW - replaces InvoiceRecord)
+// ============================================
+
+/**
  * Document - A generated artifact (invoice, timesheet, etc.)
- * 
- * Documents are immutable snapshots of a work record at the time of generation.
+ *
+ * Documents track their lifecycle through status changes:
+ * Generated (Excel) → Final (Uploaded) → Sent → Paid (invoices)
+ *
  * They link to a work record but store their own copy of the data for historical accuracy.
  */
 export interface Document {
@@ -213,21 +267,62 @@ export interface Document {
   dailyRate: number; // Rate at time of generation
   totalAmount: number;
 
-  // Document metadata
-  generatedAt: string; // ISO timestamp
-  fileName?: string;
+  // ============================================
+  // STATUS TRACKING
+  // ============================================
+  
+  /** Current status in the document lifecycle */
+  status: DocumentStatus;
+  
+  /** Audit trail of all status changes */
+  statusHistory: StatusHistoryEntry[];
+  
+  // Status timestamps
+  generatedAt: string; // ISO timestamp - when initially generated
+  finalizedAt?: string; // ISO timestamp - when marked as final
+  sentAt?: string;      // ISO timestamp - when marked as sent
+  paidAt?: string;      // ISO timestamp - when marked as paid (invoices only)
 
-  // Firebase Storage references (required)
+  // ============================================
+  // STORAGE: Generated version (Excel from template)
+  // ============================================
+  
+  /** Original filename of the generated document */
+  fileName?: string;
   /** Firebase Storage path to the generated file */
   storagePath: string;
   /** Public download URL for the generated file */
   downloadUrl: string;
 
-  // Invoice-specific fields
-  isPaid?: boolean;
-  paidAt?: string;
+  // ============================================
+  // STORAGE: Final version (uploaded file) - LEGACY, use finalDocuments
+  // Same filename will overwrite in Firebase Storage
+  // ============================================
+  
+  /** @deprecated Use finalDocuments array instead */
+  finalFileName?: string;
+  /** @deprecated Use finalDocuments array instead */
+  finalStoragePath?: string;
+  /** @deprecated Use finalDocuments array instead */
+  finalDownloadUrl?: string;
 
-  // Outdated flag - set when work record is updated after document generation
+  // ============================================
+  // STORAGE: Multiple final documents (NEW)
+  // Supports keeping both PDF and Excel versions
+  // ============================================
+  
+  /** Array of all uploaded final documents */
+  finalDocuments?: FinalDocumentInfo[];
+
+  // ============================================
+  // LEGACY/DEPRECATED FIELDS (for backward compatibility)
+  // ============================================
+  
+  /** @deprecated Use status === 'paid' instead */
+  isPaid?: boolean;
+  /** @deprecated Use paidAt instead */
+  paidAtLegacy?: string;
+  /** Outdated flag - set when work record is updated after document generation */
   isOutdated?: boolean;
   outdatedAt?: string; // ISO timestamp when marked as outdated
 }
@@ -248,13 +343,32 @@ export interface DocumentInput {
   weekendDatesArray?: string[];
   dailyRate: number;
   totalAmount: number;
+
+  // Status (defaults to 'generated' if not provided)
+  status?: DocumentStatus;
+  statusHistory?: StatusHistoryEntry[];
+  
+  // Status timestamps
+  generatedAt?: string;
+  finalizedAt?: string | null;
+  sentAt?: string | null;
+  paidAt?: string | null;
+
+  // Storage: Generated version
   fileName?: string;
-  /** Firebase Storage path to the generated file (required) */
   storagePath: string;
-  /** Public download URL for the generated file (required) */
   downloadUrl: string;
+
+  // Storage: Final version (legacy)
+  finalFileName?: string | null;
+  finalStoragePath?: string | null;
+  finalDownloadUrl?: string | null;
+
+  // Storage: Multiple final documents (NEW)
+  finalDocuments?: FinalDocumentInfo[];
+
+  // Legacy
   isPaid?: boolean;
-  paidAt?: string;
   isOutdated?: boolean;
   outdatedAt?: string | null;
 }

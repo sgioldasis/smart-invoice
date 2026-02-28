@@ -26,8 +26,10 @@ import {
   AlertCircle,
   Download,
   File,
+  Upload,
 } from 'lucide-react';
 import { format } from 'date-fns';
+import * as XLSX from 'xlsx';
 import {
   getCollectionData,
   deleteDocumentById,
@@ -37,8 +39,15 @@ import {
 } from '../services/db';
 import {
   downloadDocument as downloadFromStorage,
+  uploadDocument,
   downloadTemplate as downloadTemplateFromStorage,
+  sanitizeUserEmail,
+  sanitizeClientName,
+  listStorageFiles,
+  getFinalDocumentDownloadUrl,
+  deleteFinalDocument,
 } from '../services/storage';
+import { saveDocument } from '../services/db';
 import type { Template } from '../types';
 
 interface DocumentManagerProps {
@@ -68,6 +77,140 @@ interface TemplateDoc {
   updatedAt?: string;
 }
 
+// ============================================
+// Excel Preview Modal Component
+// ============================================
+
+interface ExcelPreviewModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  data: any[][];
+  fileName: string;
+  merges?: XLSX.Range[];
+  cols?: XLSX.ColInfo[];
+}
+
+const ExcelPreviewModal: React.FC<ExcelPreviewModalProps> = ({
+  isOpen,
+  onClose,
+  data,
+  fileName,
+  merges = [],
+  cols = []
+}) => {
+  if (!isOpen) return null;
+
+  // Helper to check if a cell is the start of a merge
+  const getMergeInfo = (r: number, c: number) => {
+    return merges.find(m => m.s.r === r && m.s.c === c);
+  };
+
+  // Helper to check if a cell is covered by a merge (but not the start)
+  const isCellCovered = (r: number, c: number) => {
+    return merges.some(m =>
+      r >= m.s.r && r <= m.e.r &&
+      c >= m.s.c && c <= m.e.c &&
+      !(r === m.s.r && c === m.s.c)
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+      <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-900/50">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 rounded-lg">
+              <FileSpreadsheet size={20} />
+            </div>
+            <div>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                Preview Document
+              </h2>
+              <p className="text-sm text-slate-500 dark:text-slate-400 font-mono">
+                {fileName}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-2 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-xl transition-colors text-slate-500 dark:text-slate-400"
+          >
+            <X size={24} />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-auto p-6 bg-slate-50 dark:bg-slate-950">
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="bg-white dark:bg-slate-900 border-collapse table-fixed">
+                <colgroup>
+                  {cols.map((col, i) => (
+                    <col key={i} style={{ width: col.wpx ? `${col.wpx}px` : '120px' }} />
+                  ))}
+                  {/* Fallback columns if data is wider than cols info */}
+                  {data[0]?.length > cols.length &&
+                    Array.from({ length: data[0].length - cols.length }).map((_, i) => (
+                      <col key={i + cols.length} style={{ width: '120px' }} />
+                    ))
+                  }
+                </colgroup>
+                <tbody>
+                  {data.map((row, rowIndex) => (
+                    <tr key={rowIndex} className="h-8 border-b border-slate-100 dark:border-slate-800 last:border-0 hover:bg-slate-50/50 dark:hover:bg-slate-800/20">
+                      {row.map((cell, cellIndex) => {
+                        // Skip if this cell is part of a merge but not the start
+                        if (isCellCovered(rowIndex, cellIndex)) return null;
+
+                        const merge = getMergeInfo(rowIndex, cellIndex);
+                        const rowSpan = merge ? (merge.e.r - merge.s.r + 1) : 1;
+                        const colSpan = merge ? (merge.e.c - merge.s.c + 1) : 1;
+
+                        return (
+                          <td
+                            key={cellIndex}
+                            rowSpan={rowSpan}
+                            colSpan={colSpan}
+                            className={`
+                              px-3 py-1 text-slate-700 dark:text-slate-300 border-r border-slate-100 dark:border-slate-800 last:border-0 truncate
+                              ${rowIndex === 0 ? 'font-semibold bg-slate-50/50 dark:bg-slate-800/30' : ''}
+                              ${cell === null || cell === undefined || cell === '' ? 'bg-slate-50/30 dark:bg-slate-800/10' : ''}
+                            `}
+                            title={String(cell || '')}
+                          >
+                            {cell !== null && cell !== undefined ? String(cell) : ''}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {data.length === 0 && (
+              <div className="py-12 flex flex-col items-center justify-center text-slate-500 dark:text-slate-400">
+                <FileSpreadsheet size={48} className="mb-4 opacity-20" />
+                <p>No data found in this spreadsheet</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-3 bg-white dark:bg-slate-950">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+          >
+            Close Preview
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) => {
   // ============================================
   // State
@@ -91,8 +234,32 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   // Expand/collapse JSON view
   const [expandedDocs, setExpandedDocs] = useState<Set<string>>(new Set());
 
+  // Excel Preview state
+  const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<any[][]>([]);
+  const [previewMerges, setPreviewMerges] = useState<XLSX.Range[]>([]);
+  const [previewCols, setPreviewCols] = useState<XLSX.ColInfo[]>([]);
+  const [previewFileName, setPreviewFileName] = useState('');
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+
   // Client name cache for displaying client names instead of IDs
   const [clientNames, setClientNames] = useState<Map<string, string>>(new Map());
+
+  // Upload modal state
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadClient, setUploadClient] = useState('');
+  const [uploadMonth, setUploadMonth] = useState(format(new Date(), 'yyyy-MM'));
+  const [uploadType, setUploadType] = useState<'invoice' | 'timesheet'>('invoice');
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+
+  // Clients list for upload modal
+  const [uploadClientsList, setUploadClientsList] = useState<{ id: string, name: string }[]>([]);
+
+  // Storage files per document folder (to show ALL files, not just the one in Firestore)
+  const [storageFilesMap, setStorageFilesMap] = useState<Map<string, { name: string; fullPath: string; downloadUrl?: string }[]>>(new Map());
+  const [loadingStorageFiles, setLoadingStorageFiles] = useState<Set<string>>(new Set());
 
   // ============================================
   // Data Loading
@@ -163,12 +330,104 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     loadCollection(selectedCollection);
   }, [selectedCollection, userEmail]);
 
+  // Load storage files for documents to show ALL files in each folder
+  // Construct folder path from document metadata (client, month, type) to ensure consistency
+  // Files are now organized in type-specific subfolders: {client}/{month}/{type}/
+  const loadStorageFilesForDocs = async (docs: FirestoreDocument[]) => {
+    const newStorageFilesMap = new Map<string, { name: string; fullPath: string; downloadUrl?: string }[]>();
+    const loadingSet = new Set<string>();
+
+    for (const doc of docs) {
+      const data = doc.data;
+      // Build folder path from document metadata to ensure we get the right folder
+      // even if finalStoragePath points to a different file
+      if (data.clientName && data.month && data.type) {
+        const { sanitizeUserEmail, sanitizeClientName } = await import('../services/storage');
+        const sanitizedEmail = sanitizeUserEmail(userEmail);
+        const sanitizedClient = sanitizeClientName(String(data.clientName));
+        const docType = String(data.type).toLowerCase();
+        
+        // Path for documents (e.g., users/email/client/2026-03/invoice/)
+        const docsPath = `users/${sanitizedEmail}/${sanitizedClient}/${data.month}/${docType}`;
+
+        // Load documents folder (type-specific subfolder)
+        if (!loadingSet.has(docsPath)) {
+          loadingSet.add(docsPath);
+          try {
+            const files = await listStorageFiles(docsPath);
+            // Get download URLs for each file
+            const filesWithUrls = await Promise.all(
+              files.map(async (file) => ({
+                ...file,
+                downloadUrl: await getFinalDocumentDownloadUrl(file.fullPath),
+              }))
+            );
+            newStorageFilesMap.set(docsPath, filesWithUrls);
+          } catch (err) {
+            // Don't error if folder doesn't exist - it just means no files yet
+            console.log(`No files found in ${docsPath} (folder may not exist yet)`);
+            newStorageFilesMap.set(docsPath, []);
+          }
+        }
+      }
+    }
+
+    setStorageFilesMap(newStorageFilesMap);
+    setLoadingStorageFiles(new Set());
+  };
+
+  // Load storage files when documents change
+  useEffect(() => {
+    if (selectedCollection === 'documents' && documents.length > 0) {
+      loadStorageFilesForDocs(documents);
+    }
+  }, [documents, selectedCollection]);
+
+  // Load clients for the upload modal
+  useEffect(() => {
+    const loadClients = async () => {
+      try {
+        const { getClients } = await import('../services/db');
+        const clientsData = await getClients(userEmail);
+        setUploadClientsList(clientsData.map(c => ({ id: c.id, name: c.name })));
+        if (clientsData.length > 0) {
+          setUploadClient(clientsData[0].id);
+        }
+      } catch (err) {
+        console.error('Error loading clients for upload:', err);
+      }
+    };
+    if (showUploadModal && uploadClientsList.length === 0) {
+      loadClients();
+    }
+  }, [showUploadModal, userEmail, uploadClientsList.length]);
+
   // Helper to estimate base64 size
   const estimateBase64Size = (base64: string): string => {
     const bytes = (base64.length * 3) / 4;
     if (bytes < 1024) return `${Math.round(bytes)} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  /**
+   * Helper to rewrite legacy UID-based storage paths to email-based paths
+   * Legacy: users/04eFF4c9fKQ7f4AicMFVgrVsgpT2/...
+   * Modern: users/s_dot_gioldasis_at_gmail_dot_com/...
+   */
+  const getCorrectedPath = (storagePath: string): string => {
+    if (!storagePath || typeof storagePath !== 'string') return storagePath;
+
+    const parts = storagePath.split('/');
+    if (parts.length >= 2 && parts[0] === 'users') {
+      const sanitizedEmail = sanitizeUserEmail(userEmail);
+      // If second part is NOT the sanitized email, it's likely a UID
+      if (parts[1] !== sanitizedEmail) {
+        console.log(`[PathCorrection] Rewriting ${parts[1]} to ${sanitizedEmail}`);
+        return ['users', sanitizedEmail, ...parts.slice(2)].join('/');
+      }
+    }
+    return storagePath;
   };
 
   // ============================================
@@ -231,24 +490,35 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
 
   const downloadDocument = async (doc: FirestoreDocument) => {
     const data = doc.data;
-    const fileName = String(data.fileName || `${data.documentNumber || doc.id}.xlsx`);
     
-    // Priority 1: Use Firebase Storage download URL if available
-    if (data.downloadUrl && typeof data.downloadUrl === 'string') {
-      const link = document.createElement('a');
-      link.href = data.downloadUrl;
-      link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
-      link.target = '_blank';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      return;
+    // Use finalFileName if available (for uploaded final versions), otherwise fall back to fileName
+    const fileName = String(data.finalFileName || data.fileName || `${data.documentNumber || doc.id}.xlsx`);
+
+    // Priority 0: Download final version from Firebase Storage if available
+    if (data.finalStoragePath && typeof data.finalStoragePath === 'string') {
+      try {
+        const correctedPath = getCorrectedPath(data.finalStoragePath);
+        const blob = await downloadFromStorage(correctedPath);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        return;
+      } catch (error) {
+        console.error('Error downloading final version from Storage:', error);
+        // Fall through to other methods
+      }
     }
-    
-    // Priority 2: Download from Firebase Storage using storagePath
+
+    // Priority 1: Download from Firebase Storage using storagePath via SDK (Authenticated)
     if (data.storagePath && typeof data.storagePath === 'string') {
       try {
-        const blob = await downloadFromStorage(data.storagePath);
+        const correctedPath = getCorrectedPath(data.storagePath);
+        const blob = await downloadFromStorage(correctedPath);
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
@@ -260,17 +530,41 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         return;
       } catch (error) {
         console.error('Error downloading from Storage:', error);
-        // Fall through to legacy methods
+        // Fall through to other methods
       }
     }
-    
+
+    // Priority 2: Use final download URL if available (for uploaded final versions)
+    if (data.finalDownloadUrl && typeof data.finalDownloadUrl === 'string') {
+      const link = document.createElement('a');
+      link.href = data.finalDownloadUrl;
+      link.download = fileName;
+      link.target = '_blank';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+
+    // Priority 3: Use Firebase Storage download URL if available (Legacy/Public)
+    if (data.downloadUrl && typeof data.downloadUrl === 'string') {
+      const link = document.createElement('a');
+      link.href = data.downloadUrl;
+      link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
+      link.target = '_blank';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+
     // Priority 3: Check if document has base64 file data (legacy)
     if (data.fileData && typeof data.fileData === 'string') {
       // Create proper data URL if it's just base64
       const fileDataStr = data.fileData.startsWith('data:')
         ? data.fileData
         : `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${data.fileData}`;
-      
+
       const link = document.createElement('a');
       link.href = fileDataStr;
       link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
@@ -279,13 +573,13 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
       document.body.removeChild(link);
       return;
     }
-    
+
     // Priority 4: Legacy support for excelBase64 field
     if (data.excelBase64 && typeof data.excelBase64 === 'string') {
       const excelData = data.excelBase64.startsWith('data:')
         ? data.excelBase64
         : `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${data.excelBase64}`;
-      
+
       const link = document.createElement('a');
       link.href = excelData;
       link.download = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
@@ -307,6 +601,91 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     }
   };
 
+  const handleExcelPreview = async (doc: FirestoreDocument) => {
+    setIsPreviewLoading(true);
+    setPreviewFileName(doc.data.fileName || 'document.xlsx');
+
+    try {
+      let arrayBuffer: ArrayBuffer;
+
+      // 1. Get binary data
+      console.log('[handleExcelPreview] Fetching data for:', doc.id, doc.data.fileName);
+
+      // Priority 1: Use storagePath via Firebase SDK (Authenticated)
+      if (typeof doc.data.storagePath === 'string') {
+        const correctedPath = getCorrectedPath(doc.data.storagePath as string);
+        console.log('[handleExcelPreview] Using Storage SDK:', correctedPath);
+        const blob = await downloadFromStorage(correctedPath);
+        arrayBuffer = await blob.arrayBuffer();
+      }
+      // Priority 2: Use downloadUrl via fetch (Legacy/External)
+      else if (typeof doc.data.downloadUrl === 'string') {
+        console.log('[handleExcelPreview] Using fetch:', doc.data.downloadUrl);
+        const response = await fetch(doc.data.downloadUrl as string);
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('[handleExcelPreview] Fetch failed:', response.status, errorText);
+          throw new Error(`Access Denied: ${response.status} ${response.statusText}`);
+        }
+        arrayBuffer = await response.arrayBuffer();
+      }
+      // Priority 3: Handle base64 data
+      else if (typeof doc.data.fileData === 'string' || typeof doc.data.excelBase64 === 'string') {
+        console.log('[handleExcelPreview] Using base64 data');
+        const fileContent = (doc.data.fileData as string) || (doc.data.excelBase64 as string);
+        const base64 = fileContent.includes(',') ? fileContent.split(',')[1] : fileContent;
+        const binaryString = window.atob(base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        arrayBuffer = bytes.buffer;
+      } else {
+        throw new Error('No file data available for preview');
+      }
+
+      console.log('[handleExcelPreview] Data received, size:', arrayBuffer.byteLength);
+
+      // Basic check: is it XML? (Commonly an error message from GCS)
+      const firstBytes = new Uint8Array(arrayBuffer.slice(0, 100));
+      const firstChars = String.fromCharCode(...firstBytes);
+      console.log('[handleExcelPreview] First chars:', firstChars.slice(0, 50));
+
+      if (firstChars.trim().startsWith('<Error>') || firstChars.trim().startsWith('<?xml')) {
+        if (!firstChars.includes('workbook') && !firstChars.includes('worksheet')) {
+          // If it starts with < but doesn't look like Excel XML, it's probably a GCS error
+          console.error('[handleExcelPreview] Received XML error message instead of Excel file');
+          throw new Error('Received an error message from the storage server instead of the Excel file. Access may be denied.');
+        }
+      }
+
+      // 2. Parse with SheetJS
+      const workbook = XLSX.read(arrayBuffer, { type: 'array', cellStyles: true });
+      const firstSheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[firstSheetName];
+
+      console.log('[handleExcelPreview] Sheet parsed:', firstSheetName);
+      console.log('[handleExcelPreview] Merges:', worksheet['!merges']?.length || 0);
+
+      // 3. Convert to JSON (array of arrays, preserving empty cells for alignment)
+      const jsonData = XLSX.utils.sheet_to_json(worksheet, {
+        header: 1,
+        defval: '', // Use empty string for empty cells
+        blankrows: true
+      }) as any[][];
+
+      setPreviewData(jsonData);
+      setPreviewMerges(worksheet['!merges'] || []);
+      setPreviewCols(worksheet['!cols'] || []);
+      setIsPreviewModalOpen(true);
+    } catch (error) {
+      console.error('Error previewing Excel:', error);
+      alert('Failed to preview Excel file. You might need to download it instead.');
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  };
+
   // ============================================
   // Render Helpers (defined before use)
   // ============================================
@@ -315,59 +694,55 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     const data = doc.data;
     const clientName = data.clientId ? clientNames.get(String(data.clientId)) : null;
     const clientPart = clientName ? `${clientName}` : (data.clientId ? String(data.clientId).slice(0, 8) : null);
-    
-    // Build prefix: [YYYY-MM Client Name] or [YYYY-MM] or [Client Name]
+
+    // Build title: [YYYY-MM Client Name] or [YYYY-MM] or [Client Name]
     const prefixParts: string[] = [];
     if (data.month) prefixParts.push(String(data.month));
     if (clientPart) prefixParts.push(clientPart);
-    const titlePrefix = prefixParts.length > 0 ? `[${prefixParts.join(' ')}] • ` : '';
     
-    // Collection-specific descriptive titles
+    // Return just the prefix (month and client name)
+    if (prefixParts.length > 0) {
+      return prefixParts.join(' ');
+    }
+
+    // Fallback if no month/client available
     switch (selectedCollection) {
       case 'documents': {
-        // For documents (invoices/timesheets) - use filename as title with prefix
-        if (data.fileName) {
-          return `${titlePrefix}${data.fileName}`;
-        }
-        // Fallback to type + document number if no filename
         const type = data.type === 'invoice' ? 'Invoice' : data.type === 'timesheet' ? 'Timesheet' : 'Document';
         if (data.documentNumber) {
-          return `${titlePrefix}${type} #${data.documentNumber}`;
+          return `${type} #${data.documentNumber}`;
         }
-        return `${titlePrefix}${String(data.name || doc.id.slice(0, 8) + '...')}`;
+        return String(data.name || doc.id.slice(0, 8) + '...');
       }
-      
+
       case 'workRecords': {
-        // For work records with prefix
-        if (data.month) {
-          try {
-            const [year, monthNum] = String(data.month).split('-');
-            const date = new Date(parseInt(year), parseInt(monthNum) - 1);
-            const monthName = format(date, 'MMMM yyyy');
-            return `${titlePrefix}Work Record • ${monthName}`;
-          } catch {
-            return `${titlePrefix}Work Record • ${data.month}`;
-          }
-        }
-        return `${titlePrefix}Work Record`;
+        // For work records - show month and client only
+        const wrParts: string[] = [];
+        if (data.month) wrParts.push(String(data.month));
+        if (clientPart) wrParts.push(clientPart);
+        return wrParts.length > 0 ? wrParts.join(' ') : 'Work Record';
       }
-      
+
       case 'clients': {
-        // For clients (no prefix, just name)
+        // For clients (just name)
         return String(data.name || 'Unnamed Client');
       }
-      
+
       case 'timesheets': {
-        // For timesheet configs with prefix
-        return `${titlePrefix}Timesheet Config`;
+        // For timesheet configs - show month and client only
+        const tsParts: string[] = [];
+        if (data.month) tsParts.push(String(data.month));
+        if (clientPart) tsParts.push(clientPart);
+        return tsParts.length > 0 ? tsParts.join(' ') : 'Timesheet Config';
       }
-      
+
       default:
-        // Fallback with prefix
-        if (data.name) return `${titlePrefix}${String(data.name)}`;
-        if (data.documentNumber) return `${titlePrefix}${String(data.documentNumber)}`;
+        // Fallback - show month and client only
+        if (data.month && clientPart) return `${data.month} ${clientPart}`;
         if (data.month) return String(data.month);
         if (clientPart) return clientPart;
+        if (data.name) return String(data.name);
+        if (data.documentNumber) return String(data.documentNumber);
         return doc.id.slice(0, 8) + '...';
     }
   };
@@ -375,18 +750,15 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   const getDocumentSubtitle = (doc: FirestoreDocument): string => {
     const data = doc.data;
     const parts: string[] = [];
-    
+
     // Determine document type
     const docType = data.type || (data.invoiceNumber ? 'invoice' : null);
-    
+
     // Collection-specific subtitle content
     switch (selectedCollection) {
       case 'documents': {
-        // Add month as first element for all documents
-        if (data.month) {
-          parts.push(String(data.month));
-        }
-        
+        // Month is shown in the title, not needed in subtitle
+
         if (docType === 'invoice') {
           // Invoice-specific info
           if (data.workingDays !== undefined) {
@@ -400,12 +772,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
             const currency = data.currency || '€';
             parts.push(`${currency} ${data.dailyRate}/day`);
           }
-          // Payment status for invoices
-          if (data.isPaid) {
-            parts.push('✓ Paid');
-          } else {
-            parts.push('Unpaid');
-          }
         } else if (docType === 'timesheet') {
           // Timesheet-specific info (no amounts/rates)
           if (data.workingDays !== undefined) {
@@ -415,12 +781,9 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         }
         break;
       }
-      
+
       case 'workRecords': {
-        // Add month as first element for work records
-        if (data.month) {
-          parts.push(String(data.month));
-        }
+        // Month is shown in the title, not needed in subtitle
         // Work record info
         if (data.workingDays && Array.isArray(data.workingDays)) {
           parts.push(`${data.workingDays.length} working days`);
@@ -431,7 +794,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         }
         break;
       }
-      
+
       case 'clients': {
         // Client info
         if (data.dailyRate !== undefined) {
@@ -440,7 +803,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         }
         break;
       }
-      
+
       default:
         // Generic fallback
         if (data.workingDays !== undefined) {
@@ -451,27 +814,12 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
           parts.push(`Total: ${currency} ${data.totalAmount}`);
         }
     }
-    
+
     // Show outdated status (applies to all types)
     if (data.isOutdated) {
       parts.push('⚠ Outdated');
     }
-    
-    // Show generation/creation date
-    if (data.generatedAt) {
-      try {
-        parts.push(`Generated ${format(new Date(String(data.generatedAt)), 'MMM d, yyyy')}`);
-      } catch {
-        parts.push(String(data.generatedAt));
-      }
-    } else if (data.createdAt) {
-      try {
-        parts.push(`Created ${format(new Date(String(data.createdAt)), 'MMM d, yyyy')}`);
-      } catch {
-        parts.push(String(data.createdAt));
-      }
-    }
-    
+
     return parts.join(' • ') || 'No additional info';
   };
 
@@ -487,7 +835,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
       // Sort descending (Z to A, so newer dates come first)
       return titleB.localeCompare(titleA);
     });
-    
+
     if (!searchQuery.trim()) return sortedDocuments;
 
     const query = searchQuery.toLowerCase();
@@ -495,37 +843,37 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
       // Search in descriptive title (includes collection type, client name, etc.)
       const title = getDocumentTitle(doc).toLowerCase();
       if (title.includes(query)) return true;
-      
+
       // Search in ID
       if (doc.id.toLowerCase().includes(query)) return true;
-      
+
       // Search in document type
       const docType = doc.data?.type;
       if (docType && String(docType).toLowerCase().includes(query)) return true;
-      
+
       // Search in document number (invoice number or timesheet number)
       const docNumber = doc.data?.documentNumber || doc.data?.invoiceNumber || doc.data?.timesheetNumber;
       if (docNumber && String(docNumber).toLowerCase().includes(query)) return true;
-      
+
       // Search in filename
       const fileName = doc.data?.fileName;
       if (fileName && String(fileName).toLowerCase().includes(query)) return true;
-      
+
       // Search in client name (if document has clientId)
       const clientId = doc.data?.clientId;
       if (clientId) {
         const clientName = clientNames.get(String(clientId));
         if (clientName?.toLowerCase().includes(query)) return true;
       }
-      
+
       // Search in month
       const month = doc.data?.month;
       if (month && String(month).toLowerCase().includes(query)) return true;
-      
+
       // Search in notes/description
       const notes = doc.data?.notes || doc.data?.description;
       if (notes && String(notes).toLowerCase().includes(query)) return true;
-      
+
       return false;
     });
   }, [documents, searchQuery, clientNames, selectedCollection]);
@@ -538,16 +886,16 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     return templates.filter((template) => {
       // Search in template name
       if (template.name.toLowerCase().includes(query)) return true;
-      
+
       // Search in client name
       if (template.clientName.toLowerCase().includes(query)) return true;
-      
+
       // Search in type
       if (template.type.toLowerCase().includes(query)) return true;
-      
+
       // Search in filename
       if (template.fileName?.toLowerCase().includes(query)) return true;
-      
+
       return false;
     });
   }, [templates, searchQuery]);
@@ -568,6 +916,65 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
       filtered: filteredDocuments.length,
     };
   }, [documents, filteredDocuments, templates, filteredTemplates, selectedCollection]);
+
+  const handleUploadSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!uploadFile || !uploadClient || !uploadMonth) return;
+
+    try {
+      setUploading(true);
+      setUploadProgress(0);
+      const clientId = uploadClient;
+      const clientName = clientNames.get(clientId) || uploadClientsList.find(c => c.id === clientId)?.name || 'Unknown Client';
+      const fileName = uploadFile.name;
+
+      // Upload the document to Firebase Storage with progress tracking
+      const { storagePath, downloadUrl } = await uploadDocument(
+        userEmail,
+        clientName,
+        uploadMonth,
+        fileName,
+        uploadFile,
+        undefined,
+        (progress) => setUploadProgress(progress)
+      );
+
+      // Save document metadata to Firestore
+      await saveDocument(userEmail, {
+        clientId: clientId,
+        clientName: clientName,
+        workRecordId: `manual-upload-${Date.now()}`, // Or a meaningful ID if applicable
+        type: uploadType,
+        month: uploadMonth,
+        fileName: fileName,
+        storagePath: storagePath,
+        downloadUrl: downloadUrl,
+        isPaid: false,
+        isOutdated: false,
+        documentNumber: '',
+        workingDays: 0,
+        workingDaysArray: [],
+        dailyRate: 0,
+        totalAmount: 0,
+      });
+
+      // Reset internal modal state and close
+      setUploadFile(null);
+      setUploadProgress(0);
+      setShowUploadModal(false);
+
+      // Refresh documents
+      if (selectedCollection === 'documents') {
+        loadCollection('documents');
+      }
+
+    } catch (err) {
+      console.error('Upload error:', err);
+      alert('Failed to upload document.');
+    } finally {
+      setUploading(false);
+    }
+  };
 
   // ============================================
   // Render
@@ -597,11 +1004,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
               <button
                 key={collection.id}
                 onClick={() => setSelectedCollection(collection.id)}
-                className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg mb-1 text-left transition-colors ${
-                  isActive
-                    ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300'
-                    : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300'
-                }`}
+                className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg mb-1 text-left transition-colors ${isActive
+                  ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300'
+                  }`}
               >
                 <Icon size={18} className={isActive ? 'text-indigo-600' : 'text-slate-500'} />
                 <div className="flex-1 min-w-0">
@@ -634,13 +1040,24 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                 {stats.filtered} of {stats.total} documents
               </p>
             </div>
-            <button
-              onClick={() => loadCollection(selectedCollection)}
-              className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
-              title="Refresh"
-            >
-              <RefreshCw size={20} className="text-slate-600 dark:text-slate-400" />
-            </button>
+            <div className="flex items-center gap-2"> {/* Grouping action buttons */}
+              {selectedCollection === 'documents' && (
+                <button
+                  onClick={() => setShowUploadModal(true)}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-500/20 dark:text-sky-300 dark:hover:bg-sky-500/30 rounded-lg transition-colors text-sm font-medium"
+                >
+                  <Upload size={16} />
+                  Upload PDF
+                </button>
+              )}
+              <button
+                onClick={() => loadCollection(selectedCollection)}
+                className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                title="Refresh"
+              >
+                <RefreshCw size={20} className="text-slate-600 dark:text-slate-400" />
+              </button>
+            </div>
           </div>
 
           {/* Search */}
@@ -686,17 +1103,17 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                   // Excel icon component for Excel files
                   const ExcelIcon = () => (
                     <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
-                      <rect width="32" height="32" rx="4" fill="#217346"/>
+                      <rect width="32" height="32" rx="4" fill="#217346" />
                       <path
                         d="M10 8 L16 14 L22 8 L24 10 L18 16 L24 22 L22 24 L16 18 L10 24 L8 22 L14 16 L8 10 Z"
                         fill="white"
                       />
                     </svg>
                   );
-                  
+
                   const isExcel = template.name.toLowerCase().endsWith('.xlsx') ||
-                                   template.name.toLowerCase().endsWith('.xls');
-                  
+                    template.name.toLowerCase().endsWith('.xls');
+
                   return (
                     <div
                       key={template.id}
@@ -709,11 +1126,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             <h3 className="font-semibold text-slate-800 dark:text-white truncate">
                               {template.name}
                             </h3>
-                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${
-                              template.type === 'invoice'
-                                ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
-                                : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
-                            }`}>
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${template.type === 'invoice'
+                              ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
+                              : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
+                              }`}>
                               {template.type === 'invoice' ? 'Invoice Template' : 'Timesheet Template'}
                             </span>
                           </div>
@@ -733,7 +1149,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                           >
                             <Eye size={18} className="text-slate-600 dark:text-slate-400" />
                           </button>
-                          
+
                           <button
                             onClick={async () => {
                               // Download template from Firebase Storage
@@ -780,6 +1196,23 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                 const isExpanded = expandedDocs.has(doc.id);
                 const isDeleting = deletingId === doc.id;
                 const isConfirmingDelete = showDeleteConfirm === doc.id;
+                const isPdf = doc.data.fileName?.toLowerCase().endsWith('.pdf') ||
+                  doc.data.finalFileName?.toLowerCase().endsWith('.pdf');
+                const type = doc.data.type ||
+                  (selectedCollection === 'workRecords' ? 'workRecord' :
+                    doc.data.documentNumber?.toString().startsWith('INV') ? 'invoice' :
+                      doc.data.documentNumber?.toString().startsWith('TMS') ? 'timesheet' :
+                        doc.data.invoiceNumber ? 'invoice' :
+                          doc.data.fileName?.includes('Timesheet') ? 'timesheet' :
+                            doc.data.excelBase64 || doc.data.fileData ? 'file' : 'document');
+                const isExcel = type !== 'workRecord' && (
+                  type === 'timesheet' ||
+                  doc.data.fileName?.toLowerCase().endsWith('.xlsx') ||
+                  doc.data.fileName?.toLowerCase().endsWith('.xls') ||
+                  doc.data.finalFileName?.toLowerCase().endsWith('.xlsx') ||
+                  doc.data.finalFileName?.toLowerCase().endsWith('.xls') ||
+                  doc.data.fileData?.includes('spreadsheet') ||
+                  doc.data.excelBase64);
 
                 return (
                   <div
@@ -790,26 +1223,17 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                     <div className="p-4 flex items-center justify-between">
                       <div className="flex-1 min-w-0">
                         {(() => {
-                          // Determine document type from various fields
-                          const type = doc.data.type ||
-                            (selectedCollection === 'workRecords' ? 'workRecord' :
-                             doc.data.documentNumber?.toString().startsWith('INV') ? 'invoice' :
-                             doc.data.documentNumber?.toString().startsWith('TMS') ? 'timesheet' :
-                             doc.data.invoiceNumber ? 'invoice' :
-                             doc.data.fileName?.includes('Timesheet') ? 'timesheet' :
-                             doc.data.excelBase64 || doc.data.fileData ? 'file' : 'document');
-                          
                           // Get file icon based on type
                           const FileIcon = type === 'invoice' ? FileText :
-                                           type === 'timesheet' ? FileSpreadsheet :
-                                           type === 'workRecord' ? Briefcase :
-                                           type === 'file' ? FileText : FileText;
-                          
+                            type === 'timesheet' ? FileSpreadsheet :
+                              type === 'workRecord' ? Briefcase :
+                                type === 'file' ? FileText : FileText;
+
                           // Excel icon component for Excel files - Official Excel logo style
                           const ExcelIcon = () => (
                             <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
                               {/* Excel green rounded rectangle */}
-                              <rect width="32" height="32" rx="4" fill="#217346"/>
+                              <rect width="32" height="32" rx="4" fill="#217346" />
                               {/* White X shape - stylized like Excel */}
                               <path
                                 d="M10 8 L16 14 L22 8 L24 10 L18 16 L24 22 L22 24 L16 18 L10 24 L8 22 L14 16 L8 10 Z"
@@ -817,18 +1241,21 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                               />
                             </svg>
                           );
-                          
-                          // Determine if it's an Excel file (work records are never Excel files)
-                          const isExcel = type !== 'workRecord' && (
-                                          type === 'timesheet' ||
-                                          doc.data.fileName?.toLowerCase().endsWith('.xlsx') ||
-                                          doc.data.fileName?.toLowerCase().endsWith('.xls') ||
-                                          doc.data.fileData?.includes('spreadsheet') ||
-                                          doc.data.excelBase64);
-                          
+
+                          // PDF icon component
+                          const PdfIcon = () => (
+                            <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
+                              <rect width="32" height="32" rx="4" fill="#E23028" />
+                              <path
+                                d="M22.5 16.5C22.5 17.5 21.5 18 20.5 18H18.5V14.5H20.5C21.5 14.5 22.5 15.5 22.5 16.5Z M12 18H10V12H12.5C14 12 15 13 15 14.5C15 16 14 17 12.5 17H12V18Z M17 12H18.5V18H17V12Z M12.5 13.5H12V15.5H12.5C13 15.5 13.5 15 13.5 14.5C13.5 14 13 13.5 12.5 13.5Z M25 12H27V13.5H25.5V14.5H27V16H25.5V18H24V12H25Z"
+                                fill="white"
+                              />
+                            </svg>
+                          );
+
                           // Get display title using the descriptive title function
                           const displayTitle = getDocumentTitle(doc);
-                          
+
                           const typeColors: Record<string, string> = {
                             invoice: 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200',
                             timesheet: 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200',
@@ -836,23 +1263,69 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             document: 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-300',
                             workRecord: 'bg-amber-200 text-amber-900 dark:bg-amber-500/30 dark:text-amber-200',
                           };
-                          
+
+                          // Get all storage files for this document's folder
+                          // Build folder path from document metadata (same logic as loadStorageFilesForDocs)
+                          const storageFiles = (() => {
+                            if (!doc.data.clientName || !doc.data.month || !doc.data.type) return [];
+                            const sanitizedEmail = sanitizeUserEmail(userEmail);
+                            const sanitizedClient = sanitizeClientName(String(doc.data.clientName));
+                            const docType = String(doc.data.type).toLowerCase();
+                            const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${doc.data.month}/${docType}`;
+                            return storageFilesMap.get(folderPath) || [];
+                          })();
+
+                          // Get latest status with date for tag
+                          const statusHistory = doc.data.statusHistory as Array<{status: string; timestamp: string}> | undefined;
+                          const currentStatus = doc.data.status as string | undefined;
+                          const formatStatusLabel = (status: string): string => {
+                            switch (status) {
+                              case 'excel-uploaded': return 'Excel Uploaded';
+                              case 'pdf-uploaded': return 'PDF Uploaded';
+                              case 'final': return 'Uploaded';
+                              default: return status.charAt(0).toUpperCase() + status.slice(1);
+                            }
+                          };
+                          let statusTagText = '';
+                          if (statusHistory && statusHistory.length > 0) {
+                            const latest = statusHistory[statusHistory.length - 1];
+                            const statusLabel = formatStatusLabel(latest.status);
+                            const statusDate = format(new Date(latest.timestamp), 'MMM d, HH:mm');
+                            statusTagText = `${statusLabel} • ${statusDate}`;
+                          } else if (currentStatus) {
+                            statusTagText = formatStatusLabel(currentStatus);
+                          }
+
+                          const statusColors: Record<string, string> = {
+                            generated: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
+                            'excel-uploaded': 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
+                            'pdf-uploaded': 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300',
+                            sent: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300',
+                            paid: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
+                          };
+                          const currentStatusKey = statusHistory?.[statusHistory.length - 1]?.status || currentStatus || 'generated';
+                          const statusColorClass = statusColors[currentStatusKey] || statusColors.generated;
+
                           return (
                             <>
                               <div className="flex items-center gap-2">
-                                {isExcel ? <ExcelIcon /> : <FileIcon size={20} className="text-slate-500 dark:text-slate-400 shrink-0" />}
                                 <h3 className="font-semibold text-slate-800 dark:text-white truncate">
                                   {displayTitle}
                                 </h3>
                                 <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${typeColors[type] || typeColors.document}`}>
                                   {type === 'workRecord' ? 'Work Record' : type.charAt(0).toUpperCase() + type.slice(1)}
                                 </span>
+                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${statusColorClass}`}>
+                                  {statusTagText}
+                                </span>
+                                {storageFiles.length > 1 && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300">
+                                    {storageFiles.length} files
+                                  </span>
+                                )}
                               </div>
                               <p className="text-sm text-slate-500 dark:text-slate-400 truncate mt-1">
                                 {getDocumentSubtitle(doc)}
-                              </p>
-                              <p className="text-xs text-slate-400 dark:text-slate-500 font-mono mt-1">
-                                ID: {doc.id}
                               </p>
                             </>
                           );
@@ -867,71 +1340,214 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             {clientNames.get(String(doc.data.clientId)) || String(doc.data.clientId).slice(0, 8) + '...'}
                           </span>
                         )}
-                        
+
                         {/* Actions */}
                         <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => viewDocument(doc)}
-                          className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
-                          title="View details"
-                        >
-                          <Eye size={18} className="text-slate-600 dark:text-slate-400" />
-                        </button>
-
-                        {(doc.data.fileData || doc.data.excelBase64 || doc.data.storagePath || doc.data.downloadUrl) && (
                           <button
-                            onClick={() => downloadDocument(doc)}
+                            onClick={() => viewDocument(doc)}
                             className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
-                            title="Download file"
+                            title="View details"
                           >
-                            <Download size={18} className="text-slate-600 dark:text-slate-400" />
+                            <Eye size={18} className="text-slate-600 dark:text-slate-400" />
                           </button>
-                        )}
 
-                        {isConfirmingDelete ? (
-                          <div className="flex items-center gap-1">
-                            <span className="text-xs text-red-600 dark:text-red-400 mr-1">Delete?</span>
-                            <button
-                              onClick={() => handleDelete(doc.id)}
-                              disabled={isDeleting}
-                              className="p-1.5 bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors"
-                            >
-                              {isDeleting ? (
-                                <Loader2 size={14} className="animate-spin" />
-                              ) : (
-                                'Yes'
-                              )}
-                            </button>
-                            <button
-                              onClick={() => setShowDeleteConfirm(null)}
-                              className="p-1.5 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
-                            >
-                              No
-                            </button>
-                          </div>
-                        ) : (
-                          <button
-                            onClick={() => setShowDeleteConfirm(doc.id)}
-                            className="p-2 hover:bg-red-100 dark:hover:bg-red-900/30 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg transition-colors"
-                            title="Delete"
-                          >
-                            <Trash2 size={18} />
-                          </button>
-                        )}
-
-                        <button
-                          onClick={() => toggleExpanded(doc.id)}
-                          className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
-                        >
-                          {isExpanded ? (
-                            <ChevronUp size={18} className="text-slate-600 dark:text-slate-400" />
+                          {isConfirmingDelete ? (
+                            <div className="flex items-center gap-1">
+                              <span className="text-xs text-red-600 dark:text-red-400 mr-1">Delete?</span>
+                              <button
+                                onClick={() => handleDelete(doc.id)}
+                                disabled={isDeleting}
+                                className="p-1.5 bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors"
+                              >
+                                {isDeleting ? (
+                                  <Loader2 size={14} className="animate-spin" />
+                                ) : (
+                                  'Yes'
+                                )}
+                              </button>
+                              <button
+                                onClick={() => setShowDeleteConfirm(null)}
+                                className="p-1.5 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
+                              >
+                                No
+                              </button>
+                            </div>
                           ) : (
-                            <ChevronDown size={18} className="text-slate-600 dark:text-slate-400" />
+                            <button
+                              onClick={() => setShowDeleteConfirm(doc.id)}
+                              className="p-2 hover:bg-red-100 dark:hover:bg-red-900/30 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded-lg transition-colors"
+                              title="Delete"
+                            >
+                              <Trash2 size={18} />
+                            </button>
                           )}
-                        </button>
+
+                          <button
+                            onClick={() => toggleExpanded(doc.id)}
+                            className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+                          >
+                            {isExpanded ? (
+                              <ChevronUp size={18} className="text-slate-600 dark:text-slate-400" />
+                            ) : (
+                              <ChevronDown size={18} className="text-slate-600 dark:text-slate-400" />
+                            )}
+                          </button>
                         </div>
                       </div>
                     </div>
+
+                    {/* File List - Shows all files in the document's storage folder */}
+                    {(() => {
+                      // Build folder path from document metadata (same logic as loadStorageFilesForDocs)
+                      const storageFiles = (() => {
+                        if (!doc.data.clientName || !doc.data.month || !doc.data.type) return [];
+                        const sanitizedEmail = sanitizeUserEmail(userEmail);
+                        const sanitizedClient = sanitizeClientName(String(doc.data.clientName));
+                        const docType = String(doc.data.type).toLowerCase();
+                        const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${doc.data.month}/${docType}`;
+                        return storageFilesMap.get(folderPath) || [];
+                      })();
+
+                      if (storageFiles.length === 0) return null;
+
+                      return (
+                        <div className="border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/30 px-4 py-3">
+                          <div className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2 uppercase tracking-wide">
+                            Files ({storageFiles.length})
+                          </div>
+                          <div className="space-y-2">
+                            {storageFiles.map((file) => {
+                              const isFilePdf = file.name.toLowerCase().endsWith('.pdf');
+                              const isFileExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
+                              
+                              return (
+                                <div key={file.fullPath} className="flex items-center justify-between bg-white dark:bg-slate-800 rounded-lg px-3 py-2 border border-slate-200 dark:border-slate-700">
+                                  <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    {/* File Icon */}
+                                    {isFilePdf ? (
+                                      <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
+                                        <rect width="32" height="32" rx="4" fill="#E23028" />
+                                        <path d="M22.5 16.5C22.5 17.5 21.5 18 20.5 18H18.5V14.5H20.5C21.5 14.5 22.5 15.5 22.5 16.5Z M12 18H10V12H12.5C14 12 15 13 15 14.5C15 16 14 17 12.5 17H12V18Z M17 12H18.5V18H17V12Z M12.5 13.5H12V15.5H12.5C13 15.5 13.5 15 13.5 14.5C13.5 14 13 13.5 12.5 13.5Z M25 12H27V13.5H25.5V14.5H27V16H25.5V18H24V12H25Z" fill="white"/>
+                                      </svg>
+                                    ) : isFileExcel ? (
+                                      <svg width="20" height="20" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0">
+                                        <rect width="32" height="32" rx="4" fill="#217346" />
+                                        <path d="M10 8 L16 14 L22 8 L24 10 L18 16 L24 22 L22 24 L16 18 L10 24 L8 22 L14 16 L8 10 Z" fill="white"/>
+                                      </svg>
+                                    ) : (
+                                      <File size={20} className="text-slate-400 shrink-0" />
+                                    )}
+                                    {/* Filename */}
+                                    <span className="text-sm text-slate-700 dark:text-slate-200 truncate font-mono">
+                                      {file.name}
+                                    </span>
+                                  </div>
+                                  
+                                  {/* File Actions */}
+                                  <div className="flex items-center gap-1 ml-2 shrink-0">
+                                    {/* Preview button */}
+                                    {isFilePdf ? (
+                                      <button
+                                        onClick={() => window.open(file.downloadUrl, '_blank')}
+                                        className="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors text-sky-600 dark:text-sky-400"
+                                        title="Preview PDF"
+                                      >
+                                        <Eye size={16} />
+                                      </button>
+                                    ) : isFileExcel ? (
+                                      <button
+                                        onClick={async () => {
+                                          try {
+                                            const { downloadFinalDocument } = await import('../services/storage');
+                                            const blob = await downloadFinalDocument(file.fullPath);
+                                            const arrayBuffer = await blob.arrayBuffer();
+                                            const workbook = XLSX.read(arrayBuffer, { type: 'array', cellStyles: true });
+                                            const firstSheetName = workbook.SheetNames[0];
+                                            const worksheet = workbook.Sheets[firstSheetName];
+                                            const jsonData = XLSX.utils.sheet_to_json(worksheet, {
+                                              header: 1,
+                                              defval: '',
+                                              blankrows: true
+                                            }) as any[][];
+                                            setPreviewData(jsonData);
+                                            setPreviewMerges(worksheet['!merges'] || []);
+                                            setPreviewCols(worksheet['!cols'] || []);
+                                            setPreviewFileName(file.name);
+                                            setIsPreviewModalOpen(true);
+                                          } catch (err) {
+                                            console.error('Error previewing Excel:', err);
+                                            alert('Failed to preview Excel file');
+                                          }
+                                        }}
+                                        className="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors text-emerald-600 dark:text-emerald-400"
+                                        title="Preview Excel"
+                                      >
+                                        <Eye size={16} />
+                                      </button>
+                                    ) : null}
+                                    
+                                    {/* Download button */}
+                                    <button
+                                      onClick={async () => {
+                                        try {
+                                          const { downloadFinalDocument } = await import('../services/storage');
+                                          const blob = await downloadFinalDocument(file.fullPath);
+                                          const url = URL.createObjectURL(blob);
+                                          const link = document.createElement('a');
+                                          link.href = url;
+                                          link.download = file.name;
+                                          document.body.appendChild(link);
+                                          link.click();
+                                          document.body.removeChild(link);
+                                          URL.revokeObjectURL(url);
+                                        } catch (err) {
+                                          console.error('Error downloading file:', err);
+                                          alert('Failed to download file');
+                                        }
+                                      }}
+                                      className="p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-md transition-colors text-slate-600 dark:text-slate-400"
+                                      title="Download"
+                                    >
+                                      <Download size={16} />
+                                    </button>
+                                    
+                                    {/* Delete button */}
+                                    <button
+                                      onClick={async () => {
+                                        if (!confirm(`Delete "${file.name}"? This cannot be undone.`)) return;
+                                        try {
+                                          await deleteFinalDocument(file.fullPath);
+                                          // Refresh storage files - build folder path from document metadata
+                                          const sanitizedEmail = sanitizeUserEmail(userEmail);
+                                          const sanitizedClient = sanitizeClientName(String(doc.data.clientName));
+                                          const docType = String(doc.data.type).toLowerCase();
+                                          const folderPath = `users/${sanitizedEmail}/${sanitizedClient}/${doc.data.month}/${docType}`;
+                                          const files = await listStorageFiles(folderPath);
+                                          const filesWithUrls = await Promise.all(
+                                            files.map(async (f) => ({
+                                              ...f,
+                                              downloadUrl: await getFinalDocumentDownloadUrl(f.fullPath),
+                                            }))
+                                          );
+                                          setStorageFilesMap(prev => new Map(prev).set(folderPath, filesWithUrls));
+                                        } catch (err) {
+                                          console.error('Error deleting file:', err);
+                                          alert('Failed to delete file');
+                                        }
+                                      }}
+                                      className="p-1.5 hover:bg-red-100 dark:hover:bg-red-900/30 rounded-md transition-colors text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400"
+                                      title="Delete file"
+                                    >
+                                      <Trash2 size={16} />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {/* Expanded JSON View */}
                     {isExpanded && (
@@ -967,32 +1583,149 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
 
           <div className="flex-1 overflow-y-auto p-4">
             <div className="space-y-4">
+              {/* Status History Section */}
               <div>
                 <label className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
-                  Document ID
+                  Status History
                 </label>
-                <p className="text-sm font-mono text-slate-800 dark:text-slate-200 break-all">
-                  {selectedDoc.id}
-                </p>
+                <div className="mt-2 space-y-2">
+                  {(() => {
+                    const statusHistory = (selectedDoc.data.statusHistory as Array<{status: string; timestamp: string; note?: string}> | undefined) || [];
+                    const currentStatus = selectedDoc.data.status as string | undefined;
+                    
+                    const formatStatusLabel = (status: string): string => {
+                      switch (status) {
+                        case 'excel-uploaded': return 'Excel Uploaded';
+                        case 'pdf-uploaded': return 'PDF Uploaded';
+                        case 'final': return 'Uploaded';
+                        default: return status.charAt(0).toUpperCase() + status.slice(1);
+                      }
+                    };
+                    
+                    if (statusHistory.length === 0) {
+                      // Fallback: show current status only
+                      const fallbackStatus = formatStatusLabel(currentStatus || 'generated');
+                      return (
+                        <div className="flex items-center gap-3 p-2 bg-slate-50 dark:bg-slate-800 rounded-lg">
+                          <div className="w-2 h-2 rounded-full bg-blue-500"></div>
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
+                              {fallbackStatus}
+                            </p>
+                            {selectedDoc.data.generatedAt && (
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                {format(new Date(String(selectedDoc.data.generatedAt)), 'MMM d, yyyy HH:mm')}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    }
+                    
+                    return statusHistory.map((entry, index) => {
+                      const isLatest = index === statusHistory.length - 1;
+                      const statusColors: Record<string, string> = {
+                        generated: 'bg-blue-500',
+                        'excel-uploaded': 'bg-purple-500',
+                        'pdf-uploaded': 'bg-indigo-500',
+                        sent: 'bg-green-500',
+                        paid: 'bg-emerald-500',
+                      };
+                      const color = statusColors[entry.status] || 'bg-slate-500';
+                      const displayStatus = formatStatusLabel(entry.status);
+                      
+                      return (
+                        <div key={index} className={`flex items-start gap-3 p-2 rounded-lg ${isLatest ? 'bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800' : 'bg-slate-50 dark:bg-slate-800'}`}>
+                          <div className={`w-2 h-2 rounded-full ${color} mt-2 shrink-0`}></div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium text-slate-800 dark:text-slate-200">
+                              {displayStatus}
+                              {isLatest && <span className="ml-2 text-xs text-blue-600 dark:text-blue-400 font-normal">(current)</span>}
+                            </p>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              {format(new Date(entry.timestamp), 'MMM d, yyyy HH:mm')}
+                            </p>
+                            {entry.note && (
+                              <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 italic">
+                                {entry.note}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
               </div>
 
-              <div>
+              {/* Final Documents Section */}
+              {(() => {
+                const finalDocs = (selectedDoc.data.finalDocuments as Array<{fileName: string; uploadedAt: string; fileExtension: string}> | undefined) || [];
+                if (finalDocs.length === 0) return null;
+                
+                return (
+                  <div>
+                    <label className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
+                      Uploaded Files
+                    </label>
+                    <div className="mt-2 space-y-2">
+                      {finalDocs.map((doc, index) => (
+                        <div key={index} className="flex items-center gap-2 p-2 bg-slate-50 dark:bg-slate-800 rounded-lg">
+                          <div className="w-8 h-8 rounded bg-slate-200 dark:bg-slate-700 flex items-center justify-center text-xs font-medium text-slate-600 dark:text-slate-400 uppercase">
+                            {doc.fileExtension}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-slate-800 dark:text-slate-200 truncate">
+                              {doc.fileName}
+                            </p>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              Uploaded {format(new Date(doc.uploadedAt), 'MMM d, yyyy')}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              <div className="border-t border-slate-200 dark:border-slate-700 pt-4">
                 <label className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
-                  Collection
+                  Document Details
                 </label>
-                <p className="text-sm text-slate-800 dark:text-slate-200">
-                  {selectedDoc.collection}
-                </p>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400">ID:</span>
+                    <span className="ml-2 font-mono text-slate-700 dark:text-slate-300">{selectedDoc.id.slice(0, 8)}...</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400">Type:</span>
+                    <span className="ml-2 text-slate-700 dark:text-slate-300 capitalize">{selectedDoc.data.type || 'document'}</span>
+                  </div>
+                  {selectedDoc.data.documentNumber && (
+                    <div>
+                      <span className="text-slate-500 dark:text-slate-400">Number:</span>
+                      <span className="ml-2 text-slate-700 dark:text-slate-300">{selectedDoc.data.documentNumber}</span>
+                    </div>
+                  )}
+                  {selectedDoc.data.month && (
+                    <div>
+                      <span className="text-slate-500 dark:text-slate-400">Month:</span>
+                      <span className="ml-2 text-slate-700 dark:text-slate-300">{selectedDoc.data.month}</span>
+                    </div>
+                  )}
+                </div>
               </div>
 
-              <div>
-                <label className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
-                  Full Data
-                </label>
-                <pre className="mt-1 text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded-lg overflow-x-auto text-slate-700 dark:text-slate-300">
+              {/* Debug: Raw Data (collapsible) */}
+              <details className="mt-4">
+                <summary className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase cursor-pointer hover:text-slate-700 dark:hover:text-slate-300">
+                  Raw Data (Debug)
+                </summary>
+                <pre className="mt-2 text-xs bg-slate-100 dark:bg-slate-800 p-3 rounded-lg overflow-x-auto text-slate-700 dark:text-slate-300">
                   {JSON.stringify(selectedDoc.data, null, 2)}
                 </pre>
-              </div>
+              </details>
             </div>
           </div>
 
@@ -1039,11 +1772,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                 <label className="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">
                   Type
                 </label>
-                <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${
-                  selectedTemplate.type === 'invoice'
-                    ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
-                    : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
-                }`}>
+                <span className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium ${selectedTemplate.type === 'invoice'
+                  ? 'bg-red-200 text-red-900 dark:bg-red-500/30 dark:text-red-200'
+                  : 'bg-sky-200 text-sky-900 dark:bg-sky-500/30 dark:text-sky-200'
+                  }`}>
                   {selectedTemplate.type === 'invoice' ? 'Invoice Template' : 'Timesheet Template'}
                 </span>
               </div>
@@ -1147,6 +1879,127 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
           </div>
         </div>
       )}
+
+      {showUploadModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 print:hidden">
+          <div className="bg-white dark:bg-slate-900 rounded-xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-800/50">
+              <h3 className="text-lg font-semibold text-slate-800 dark:text-white flex items-center gap-2">
+                <Upload size={20} className="text-sky-500" />
+                Upload PDF Document
+              </h3>
+              <button
+                onClick={() => setShowUploadModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                disabled={uploading}
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto">
+              <form id="upload-pdf-form" onSubmit={handleUploadSubmit} className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Client
+                  </label>
+                  <select
+                    value={uploadClient}
+                    onChange={(e) => setUploadClient(e.target.value)}
+                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    required
+                  >
+                    <option value="" disabled>Select a client</option>
+                    {uploadClientsList.map(client => (
+                      <option key={client.id} value={client.id}>{client.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Month
+                  </label>
+                  <input
+                    type="month"
+                    value={uploadMonth}
+                    onChange={(e) => setUploadMonth(e.target.value)}
+                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Document Type
+                  </label>
+                  <select
+                    value={uploadType}
+                    onChange={(e) => setUploadType(e.target.value as 'invoice' | 'timesheet')}
+                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    required
+                  >
+                    <option value="invoice">Invoice</option>
+                    <option value="timesheet">Timesheet</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    PDF File
+                  </label>
+                  <input
+                    type="file"
+                    accept="application/pdf"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    required
+                  />
+                </div>
+                {/* Upload Progress Bar */}
+                {uploading && (
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-slate-600 dark:text-slate-400">Uploading...</span>
+                      <span className="text-slate-800 dark:text-slate-200 font-medium">{Math.round(uploadProgress)}%</span>
+                    </div>
+                    <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2.5 overflow-hidden">
+                      <div
+                        className="bg-sky-500 h-2.5 rounded-full transition-all duration-300 ease-out"
+                        style={{ width: `${uploadProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </form>
+            </div>
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-3 bg-slate-50 dark:bg-slate-800/50">
+              <button
+                type="button"
+                onClick={() => setShowUploadModal(false)}
+                className="px-4 py-2 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors"
+                disabled={uploading}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                form="upload-pdf-form"
+                disabled={!uploadFile || !uploadClient || uploading}
+                className="px-4 py-2 bg-sky-500 hover:bg-sky-600 text-white rounded-lg transition-colors flex items-center justify-center min-w-[100px] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {uploading ? <Loader2 size={16} className="animate-spin" /> : 'Upload'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Excel Preview Modal */}
+      <ExcelPreviewModal
+        isOpen={isPreviewModalOpen}
+        onClose={() => setIsPreviewModalOpen(false)}
+        data={previewData}
+        fileName={previewFileName}
+        merges={previewMerges}
+        cols={previewCols}
+      />
     </div>
   );
 };

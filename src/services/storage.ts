@@ -17,10 +17,12 @@
 import {
   ref,
   uploadBytes,
+  uploadBytesResumable,
   getDownloadURL,
   deleteObject,
   getBlob,
   uploadString,
+  UploadTask,
 } from 'firebase/storage';
 import { storage } from '../../firebase';
 
@@ -113,10 +115,14 @@ function buildMonthTemplatePath(userEmail: string, clientName: string, month: st
 
 /**
  * Build path for documents (invoices, timesheets) stored in month folder
- * Stored in: {clientName}/{month}/{filename}
+ * Stored in: {clientName}/{month}/{type}/{filename} or {clientName}/{month}/{filename}
  */
-function buildDocumentPath(userEmail: string, clientName: string, month: string, fileName: string): string {
-  return `users/${sanitizeUserEmail(userEmail)}/${sanitizeClientName(clientName)}/${month}/${fileName}`;
+function buildDocumentPath(userEmail: string, clientName: string, month: string, fileName: string, documentType?: 'invoice' | 'timesheet'): string {
+  const basePath = `users/${sanitizeUserEmail(userEmail)}/${sanitizeClientName(clientName)}/${month}`;
+  if (documentType) {
+    return `${basePath}/${documentType}/${fileName}`;
+  }
+  return `${basePath}/${fileName}`;
 }
 
 // ============================================
@@ -205,10 +211,11 @@ export async function deleteTemplateFile(storagePath: string): Promise<void> {
 /**
  * Upload a generated document to Firebase Storage
  * Supports both Blob/File objects and base64 strings
- * Documents are stored in a flat structure under {clientName}/{month}/
+ * Documents are stored under {clientName}/{month}/{type}/
  *
  * @param userEmail - User email (will be sanitized for the path)
  * @param clientName - Client name (will be sanitized for the path)
+ * @param documentType - Optional document type ('invoice' | 'timesheet') to organize files into subfolders
  */
 export async function uploadDocument(
   userEmail: string,
@@ -216,11 +223,41 @@ export async function uploadDocument(
   month: string, // YYYY-MM format
   fileName: string,
   data: Blob | File | string,
-  contentType: string = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  contentType: string = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  onProgress?: (progress: number) => void,
+  documentType?: 'invoice' | 'timesheet'
 ): Promise<{ storagePath: string; downloadUrl: string }> {
-  const storagePath = buildDocumentPath(userEmail, clientName, month, fileName);
+  const storagePath = buildDocumentPath(userEmail, clientName, month, fileName, documentType);
   const storageRef = ref(storage, storagePath);
 
+  // If progress callback is provided and data is Blob/File (not string), use resumable upload
+  if (onProgress && typeof data !== 'string') {
+    const uploadTask = uploadBytesResumable(storageRef, data, {
+      contentType: data instanceof File ? data.type || contentType : contentType,
+    });
+
+    // Return a promise that resolves when upload completes
+    return new Promise((resolve, reject) => {
+      uploadTask.on(
+        'state_changed',
+        (snapshot) => {
+          // Calculate and report progress
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          onProgress(progress);
+        },
+        (error) => {
+          reject(error);
+        },
+        async () => {
+          // Upload complete
+          const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+          resolve({ storagePath, downloadUrl });
+        }
+      );
+    });
+  }
+
+  // Fallback to regular upload (no progress tracking)
   let uploadResult;
   if (typeof data === 'string') {
     // Handle base64 string (remove data URL prefix if present)
@@ -265,6 +302,140 @@ export async function getDocumentDownloadUrl(storagePath: string): Promise<strin
 export async function deleteDocumentFile(storagePath: string): Promise<void> {
   const storageRef = ref(storage, storagePath);
   await deleteObject(storageRef);
+}
+
+// ============================================
+// Final Document Storage Operations
+// ============================================
+
+/**
+ * Build path for final version of a document
+ * Files are stored with their exact filename - same filename will overwrite
+ * Document type (invoice/timesheet) is included in the path to separate them
+ */
+function buildFinalDocumentPath(userEmail: string, clientName: string, month: string, fileName: string, documentType?: 'invoice' | 'timesheet'): string {
+  // Include document type in the path to separate invoices and timesheets
+  // Format: users/{email}/{client}/{month}/{type}/{filename}
+  const typeFolder = documentType || 'document';
+  const basePath = buildDocumentPath(userEmail, clientName, month, '');
+  return `${basePath}${typeFolder}/${fileName}`;
+}
+
+/**
+ * Upload a final version of a document to Firebase Storage
+ * This is the edited/uploaded version that replaces the generated Excel
+ *
+ * @param userEmail - User email (will be sanitized for the path)
+ * @param clientName - Client name (will be sanitized for the path)
+ * @param month - Month in YYYY-MM format
+ * @param fileName - Original filename
+ * @param data - File data (Blob, File, or base64 string)
+ * @param contentType - MIME type of the file
+ * @param onProgress - Optional callback for upload progress (0-100)
+ * @param documentType - Optional document type ('invoice' | 'timesheet') to separate storage folders
+ * @returns Object containing storagePath and downloadUrl for the final version
+ */
+export async function uploadFinalDocument(
+  userEmail: string,
+  clientName: string,
+  month: string,
+  fileName: string,
+  data: Blob | File | string,
+  contentType?: string,
+  onProgress?: (progress: number) => void,
+  documentType?: 'invoice' | 'timesheet'
+): Promise<{ finalStoragePath: string; finalDownloadUrl: string }> {
+  const finalStoragePath = buildFinalDocumentPath(userEmail, clientName, month, fileName, documentType);
+  const storageRef = ref(storage, finalStoragePath);
+
+  // Determine content type from file extension if not provided
+  const finalContentType = contentType || getContentType(fileName);
+
+  // If progress callback is provided and data is Blob/File (not string), use resumable upload
+  if (onProgress && typeof data !== 'string') {
+    const uploadTask = uploadBytesResumable(storageRef, data, {
+      contentType: data instanceof File ? data.type || finalContentType : finalContentType,
+    });
+
+    // Return a promise that resolves when upload completes
+    return new Promise((resolve, reject) => {
+      uploadTask.on(
+        'state_changed',
+        (snapshot) => {
+          // Calculate and report progress
+          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+          onProgress(progress);
+        },
+        (error) => {
+          reject(error);
+        },
+        async () => {
+          // Upload complete
+          const finalDownloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
+          resolve({ finalStoragePath, finalDownloadUrl });
+        }
+      );
+    });
+  }
+
+  // Fallback to regular upload (no progress tracking)
+  let uploadResult;
+  if (typeof data === 'string') {
+    // Handle base64 string (remove data URL prefix if present)
+    const base64Data = data.replace(/^data:[^;]+;base64,/, '');
+    uploadResult = await uploadString(storageRef, base64Data, 'base64', {
+      contentType: finalContentType,
+    });
+  } else if (data instanceof File) {
+    // Handle File object
+    uploadResult = await uploadBytes(storageRef, data, {
+      contentType: data.type || finalContentType,
+    });
+  } else {
+    // Handle Blob
+    uploadResult = await uploadBytes(storageRef, data, { contentType: finalContentType });
+  }
+
+  const finalDownloadUrl = await getDownloadURL(uploadResult.ref);
+
+  return { finalStoragePath, finalDownloadUrl };
+}
+
+/**
+ * Download a final document from Firebase Storage
+ */
+export async function downloadFinalDocument(finalStoragePath: string): Promise<Blob> {
+  const storageRef = ref(storage, finalStoragePath);
+  return getBlob(storageRef);
+}
+
+/**
+ * Get download URL for a final document
+ */
+export async function getFinalDocumentDownloadUrl(finalStoragePath: string): Promise<string> {
+  const storageRef = ref(storage, finalStoragePath);
+  return getDownloadURL(storageRef);
+}
+
+/**
+ * Delete a final document file from Firebase Storage
+ */
+export async function deleteFinalDocument(finalStoragePath: string): Promise<void> {
+  const storageRef = ref(storage, finalStoragePath);
+  await deleteObject(storageRef);
+}
+
+/**
+ * List all files in a storage path
+ */
+export async function listStorageFiles(path: string): Promise<{ name: string; fullPath: string }[]> {
+  const { listAll } = await import('firebase/storage');
+  const storageRef = ref(storage, path);
+  const result = await listAll(storageRef);
+  return result.items.map(item => ({
+    name: item.name,
+    fullPath: item.fullPath
+  }));
 }
 
 // ============================================

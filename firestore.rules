@@ -40,8 +40,16 @@ service cloud.firestore {
       allow delete: if isAuthorized() && isOwner(resource.data);
     }
     
-    // Timesheets collection
+    // Timesheets collection (WorkRecordTimesheets)
     match /timesheets/{timesheetId} {
+      allow read: if isAuthorized();
+      allow create: if isAuthorized() && isOwner(request.resource.data);
+      allow update: if isAuthorized() && isOwner(resource.data);
+      allow delete: if isAuthorized() && isOwner(resource.data);
+    }
+    
+    // Work Record Timesheets collection (alternative name)
+    match /workRecordTimesheets/{timesheetId} {
       allow read: if isAuthorized();
       allow create: if isAuthorized() && isOwner(request.resource.data);
       allow update: if isAuthorized() && isOwner(resource.data);

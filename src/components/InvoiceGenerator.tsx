@@ -241,7 +241,7 @@ export const InvoiceGenerator: React.FC<InvoiceGeneratorProps> = ({
         const num = match ? parseInt(match[0], 10) : 0;
         return isNaN(num) ? 0 : num;
       })
-      .filter((n) => n > 0);
+      .filter((n) => n > 0 && n < 10000); // Only consider reasonable invoice numbers (ignore timestamps/IDs)
 
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
     const nextNum = maxNum + 1;

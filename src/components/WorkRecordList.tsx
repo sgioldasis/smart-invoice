@@ -10,7 +10,7 @@
  * - Generate and download invoices directly
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Briefcase,
   Calendar as CalendarIcon,
@@ -29,12 +29,23 @@ import {
   Upload,
   Bot,
   Download,
+  CheckCircle,
+  MoreVertical,
+  FileText,
+  Eye,
+  RefreshCw,
+  Send,
+  DollarSign,
 } from 'lucide-react';
+import { StatusBadge } from './DocumentStatus';
+import type { DocumentStatus } from '../types';
 import { format, parseISO, endOfMonth, getDaysInMonth, isValid } from 'date-fns';
 import * as ExcelJS from 'exceljs';
 import type { Client, WorkRecord, Document, DocumentInput, WorkRecordTimesheet, WorkRecordTimesheetInput, Template } from '../types';
-import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet, getTemplateById } from '../services/db';
+import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocument, getTimesheetByWorkRecord, saveTimesheet, getTemplateById, uploadFinalDocument, markDocumentSent, markInvoicePaid } from '../services/db';
+import { getDocumentDownloadUrl } from '../services/storage';
 import { processTimesheetPromptSmart } from '../services/ai';
+import { hasFinalVersion, canMarkAsFinal, canMarkAsSent, canMarkAsPaid, getEffectiveDownloadUrl, STATUS_METADATA, getEffectiveStatus } from '../utils/documentStatus';
 
 interface WorkRecordListProps {
   userEmail: string;
@@ -56,8 +67,28 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [invoices, setInvoices] = useState<Document[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
+  const [uploadingRecordId, setUploadingRecordId] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [selectedClientId, setSelectedClientId] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Dropdown menu state for document actions
+  const [openDropdown, setOpenDropdown] = useState<{ type: 'invoice' | 'timesheet'; recordId: string } | null>(null);
+  const [dropdownPosition, setDropdownPosition] = useState<{ top: number; left: number } | null>(null);
+  const invoiceButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const timesheetButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = () => {
+      setOpenDropdown(null);
+      setDropdownPosition(null);
+    };
+    if (openDropdown) {
+      document.addEventListener('click', handleClickOutside);
+      return () => document.removeEventListener('click', handleClickOutside);
+    }
+  }, [openDropdown]);
 
   // Invoice dialog state
   const [showInvoiceDialog, setShowInvoiceDialog] = useState(false);
@@ -245,16 +276,16 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     // Check for associated documents
     const invoice = getInvoiceForRecord(record.id);
     const timesheet = getTimesheetForRecord(record.id);
-    
+
     const associatedDocs: string[] = [];
     if (invoice) associatedDocs.push(`Invoice: ${invoice.fileName || invoice.documentNumber || 'unnamed'}`);
     if (timesheet) associatedDocs.push(`Timesheet: ${timesheet.fileName || timesheet.documentNumber || 'unnamed'}`);
-    
+
     let confirmMessage = 'Are you sure you want to delete this work record?';
     if (associatedDocs.length > 0) {
       confirmMessage = `\n⚠️ Warning: This work record has associated documents that will also be deleted:\n\n${associatedDocs.map(d => `  • ${d}`).join('\n')}\n\nAre you sure you want to delete this work record and all its associated documents?\n`;
     }
-    
+
     if (!confirm(confirmMessage)) {
       return;
     }
@@ -285,7 +316,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         const num = match ? parseInt(match[0], 10) : 0;
         return isNaN(num) ? 0 : num;
       })
-      .filter((n) => n > 0);
+      .filter((n) => n > 0 && n < 10000); // Only consider reasonable invoice numbers (ignore timestamps/IDs)
 
     const maxNum = existingNumbers.length > 0 ? Math.max(...existingNumbers) : 0;
     const nextNum = maxNum + 1;
@@ -299,6 +330,139 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     const [year, monthNum] = month.split('-');
     const monthName = format(new Date(parseInt(year), parseInt(monthNum) - 1), 'MMMM').toUpperCase();
     return `${invNum}-${safeClientName}-Invoice-${monthName}-${year}.xlsx`;
+  };
+
+  // Helper to get file extension from URL or filename
+  const getFileExtensionFromUrl = (url: string | undefined): string => {
+    if (!url) return '';
+    // Try to extract from filename in URL
+    const decodedUrl = decodeURIComponent(url);
+    const match = decodedUrl.match(/[^/]+\.([^.?]+)(?:\?|$)/);
+    return match ? match[1].toLowerCase() : '';
+  };
+
+  // Helper to check if URL points to Excel file
+  const isExcelUrl = (url: string | undefined): boolean => {
+    const ext = getFileExtensionFromUrl(url);
+    return ['xlsx', 'xls'].includes(ext);
+  };
+
+  // Helper to check if URL points to PDF file
+  const isPdfUrl = (url: string | undefined): boolean => {
+    const ext = getFileExtensionFromUrl(url);
+    return ext === 'pdf';
+  };
+
+  // Helper to check if document has a PDF version
+  // Checks both legacy finalDownloadUrl and new finalDocuments array
+  const hasPdfVersion = (doc: Document): boolean => {
+    // Check new finalDocuments array first
+    const hasFinalDocPdf = doc.finalDocuments?.some(fd => fd.fileExtension === 'pdf');
+    const hasLegacyFinalPdf = isPdfUrl(doc.finalDownloadUrl);
+    const hasMainPdf = isPdfUrl(doc.downloadUrl);
+    return hasFinalDocPdf || hasLegacyFinalPdf || hasMainPdf;
+  };
+
+  // Helper to check if document has an Excel version
+  // Checks both legacy finalDownloadUrl and new finalDocuments array
+  const hasExcelVersion = (doc: Document): boolean => {
+    // Check new finalDocuments array first
+    const hasFinalDocExcel = doc.finalDocuments?.some(fd => ['xlsx', 'xls'].includes(fd.fileExtension));
+    const hasLegacyFinalExcel = isExcelUrl(doc.finalDownloadUrl);
+    const hasMainExcel = isExcelUrl(doc.downloadUrl);
+    return hasFinalDocExcel || hasLegacyFinalExcel || hasMainExcel;
+  };
+
+  // Helper to get the correct Excel download URL for a document
+  // Prioritizes finalDocuments array, falls back to legacy fields
+  const getExcelDownloadUrl = (doc: Document): string | undefined => {
+    // Check new finalDocuments array first
+    const finalDocExcel = doc.finalDocuments?.find(fd => ['xlsx', 'xls'].includes(fd.fileExtension));
+    if (finalDocExcel) {
+      return finalDocExcel.downloadUrl;
+    }
+    // Fall back to legacy fields
+    if (doc.finalDownloadUrl && isExcelUrl(doc.finalDownloadUrl)) {
+      return doc.finalDownloadUrl;
+    }
+    if (isExcelUrl(doc.downloadUrl)) {
+      return doc.downloadUrl;
+    }
+    return undefined;
+  };
+
+  // Helper to regenerate Excel URL from storage path (for legacy documents)
+  const regenerateExcelUrl = async (doc: Document): Promise<string | undefined> => {
+    console.log('[regenerateExcelUrl] Attempting to regenerate URL for doc:', doc.id);
+    console.log('[regenerateExcelUrl] storagePath:', doc.storagePath);
+    console.log('[regenerateExcelUrl] fileName:', doc.fileName);
+    
+    if (!doc.storagePath) {
+      console.warn('[regenerateExcelUrl] No storagePath available');
+      return undefined;
+    }
+    
+    // Check if path ends with Excel extension
+    const isExcelPath = doc.storagePath.endsWith('.xlsx') || doc.storagePath.endsWith('.xls');
+    console.log('[regenerateExcelUrl] Is Excel path:', isExcelPath);
+    
+    if (isExcelPath) {
+      try {
+        const { getDocumentDownloadUrl } = await import('../services/storage');
+        const url = await getDocumentDownloadUrl(doc.storagePath);
+        console.log('[regenerateExcelUrl] Successfully regenerated URL:', url);
+        return url;
+      } catch (err) {
+        console.error('[regenerateExcelUrl] Failed to regenerate Excel download URL:', err);
+      }
+    }
+    return undefined;
+  };
+
+  // Helper to get the correct PDF download URL for a document
+  // Prioritizes finalDocuments array, falls back to legacy fields
+  const getPdfDownloadUrl = (doc: Document): string | undefined => {
+    // Check new finalDocuments array first
+    const finalDocPdf = doc.finalDocuments?.find(fd => fd.fileExtension === 'pdf');
+    if (finalDocPdf) {
+      return finalDocPdf.downloadUrl;
+    }
+    // Fall back to legacy fields
+    if (doc.finalDownloadUrl && isPdfUrl(doc.finalDownloadUrl)) {
+      return doc.finalDownloadUrl;
+    }
+    if (isPdfUrl(doc.downloadUrl)) {
+      return doc.downloadUrl;
+    }
+    return doc.finalDownloadUrl || doc.downloadUrl;
+  };
+
+  // Helper to get fresh download URL from storage (fixes expired token issues)
+  // Updated to support finalDocuments array
+  const getFreshPdfUrl = async (doc: Document): Promise<string | undefined> => {
+    let storagePath: string | undefined;
+    
+    // Check new finalDocuments array first
+    const finalDocPdf = doc.finalDocuments?.find(fd => fd.fileExtension === 'pdf');
+    if (finalDocPdf) {
+      storagePath = finalDocPdf.storagePath;
+    } else if (doc.finalDownloadUrl && isPdfUrl(doc.finalDownloadUrl) && doc.finalStoragePath) {
+      // Fall back to legacy fields
+      storagePath = doc.finalStoragePath;
+    } else if (isPdfUrl(doc.downloadUrl) && doc.storagePath) {
+      storagePath = doc.storagePath;
+    }
+    
+    if (storagePath) {
+      try {
+        return await getDocumentDownloadUrl(storagePath);
+      } catch (err) {
+        console.error('Error getting fresh download URL:', err);
+        return getPdfDownloadUrl(doc);
+      }
+    }
+    
+    return getPdfDownloadUrl(doc);
   };
 
   const openInvoiceDialog = async (record: WorkRecord) => {
@@ -349,6 +513,223 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     setShowInvoiceDialog(true);
   };
 
+  const handleFinalUpload = async (e: React.ChangeEvent<HTMLInputElement>, record: WorkRecord, client: Client, targetDocumentId?: string) => {
+    const file = e.target.files?.[0];
+    console.log('[handleFinalUpload] File selected:', file?.name, 'Size:', file?.size);
+    if (!file) {
+      console.log('[handleFinalUpload] No file selected');
+      return;
+    }
+
+    // Determine document type from file extension
+    const fileExt = file.name.toLowerCase().split('.').pop() || '';
+    const isExcel = ['xlsx', 'xls'].includes(fileExt);
+    const isPdf = fileExt === 'pdf';
+    console.log('[handleFinalUpload] File type:', fileExt, 'isExcel:', isExcel, 'isPdf:', isPdf);
+
+    if (!isExcel && !isPdf) {
+      alert('Please upload a PDF or Excel file (.pdf, .xlsx, .xls)');
+      e.target.value = '';
+      return;
+    }
+
+    try {
+      setUploadingRecordId(record.id);
+      setUploadProgress(0);
+      console.log('[handleFinalUpload] Starting upload for record:', record.id, 'client:', client.name, 'targetDoc:', targetDocumentId);
+
+      // Progress callback
+      const onProgress = (progress: number) => {
+        setUploadProgress(progress);
+      };
+
+      // If a specific document ID is provided, only upload to that document
+      if (targetDocumentId) {
+        console.log('[handleFinalUpload] Uploading to specific document:', targetDocumentId);
+        const result = await uploadFinalDocument(userEmail, targetDocumentId, file, client.name, `Final version uploaded: ${file.name}`, onProgress);
+        console.log('[handleFinalUpload] Upload result:', result);
+      } else {
+        // Find existing documents for this work record
+        const existingInvoice = invoices.find(d => d.workRecordId === record.id && d.type === 'invoice');
+        const existingTimesheet = invoices.find(d => d.workRecordId === record.id && d.type === 'timesheet');
+        console.log('[handleFinalUpload] Found invoice:', existingInvoice?.id, 'timesheet:', existingTimesheet?.id);
+
+        // Upload as final version to the appropriate document(s)
+        // If there's an invoice, upload as its final version
+        if (existingInvoice) {
+          console.log('[handleFinalUpload] Uploading final for invoice:', existingInvoice.id);
+          const result = await uploadFinalDocument(userEmail, existingInvoice.id!, file, client.name, `Final version uploaded: ${file.name}`, onProgress);
+          console.log('[handleFinalUpload] Upload result:', result);
+        }
+
+        // If there's a timesheet, upload as its final version
+        if (existingTimesheet) {
+          console.log('[handleFinalUpload] Uploading final for timesheet:', existingTimesheet.id);
+          const result = await uploadFinalDocument(userEmail, existingTimesheet.id!, file, client.name, `Final version uploaded: ${file.name}`, onProgress);
+          console.log('[handleFinalUpload] Upload result:', result);
+        }
+
+        // If no existing documents, show message
+        if (!existingInvoice && !existingTimesheet) {
+          console.log('[handleFinalUpload] No existing documents found');
+          alert('Please generate an invoice or timesheet first before uploading a final version.');
+          e.target.value = '';
+          return;
+        }
+      }
+
+      // Refresh documents list
+      console.log('[handleFinalUpload] Refreshing documents...');
+      const updatedDocs = await getDocuments(userEmail);
+      console.log('[handleFinalUpload] Documents refreshed, count:', updatedDocs.length);
+      setInvoices(updatedDocs);
+
+      alert(`Final version uploaded successfully: ${file.name}`);
+    } catch (err) {
+      console.error('[handleFinalUpload] Failed to upload final version:', err);
+      alert('Failed to upload final version. Please try again. Error: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setUploadingRecordId(null);
+      setUploadProgress(0);
+      e.target.value = '';
+    }
+  };
+
+  /**
+   * Smart upload handler - analyzes filename to determine document type and format
+   * Uploads to the correct document (invoice/timesheet) based on filename keywords
+   */
+  const handleSmartUpload = async (e: React.ChangeEvent<HTMLInputElement>, record: WorkRecord, client: Client) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      console.log('[handleSmartUpload] No file selected');
+      return;
+    }
+
+    // Parse filename
+    const fileName = file.name;
+    const fileExt = fileName.toLowerCase().split('.').pop() || '';
+    const fileNameLower = fileName.toLowerCase();
+
+    // Determine file format
+    const isExcel = ['xlsx', 'xls'].includes(fileExt);
+    const isPdf = fileExt === 'pdf';
+
+    if (!isExcel && !isPdf) {
+      alert('Please upload a PDF or Excel file (.pdf, .xlsx, .xls)');
+      e.target.value = '';
+      return;
+    }
+
+    // Determine document type from filename keywords
+    // Replace underscores with spaces for better keyword detection
+    const normalizedFileName = fileName.replace(/_/g, ' ');
+    const hasInvoiceKeyword = /\binvoice\b/i.test(normalizedFileName);
+    // Match "timesheet" (one word) or "time sheet" (two words)
+    const hasTimesheetKeyword = /\btimesheet\b/i.test(normalizedFileName) || /\btime sheet\b/i.test(normalizedFileName);
+
+    let targetType: 'invoice' | 'timesheet' | null = null;
+    if (hasInvoiceKeyword && !hasTimesheetKeyword) {
+      targetType = 'invoice';
+    } else if (hasTimesheetKeyword && !hasInvoiceKeyword) {
+      targetType = 'timesheet';
+    } else if (hasInvoiceKeyword && hasTimesheetKeyword) {
+      // Both keywords found - ask user to clarify
+      const choice = confirm(
+        `The filename contains both "invoice" and "timesheet".\n\n` +
+        `Click OK to upload as INVOICE\n` +
+        `Click Cancel to upload as TIMESHEET`
+      );
+      targetType = choice ? 'invoice' : 'timesheet';
+    } else {
+      // No clear keyword - check file format as hint
+      if (isPdf) {
+        // PDFs are typically invoices (timesheets are Excel)
+        targetType = 'invoice';
+        console.log('[handleSmartUpload] No keyword found, PDF detected - assuming invoice');
+      } else {
+        // Excel files could be either - ask user
+        const choice = confirm(
+          `Cannot determine document type from filename "${fileName}".\n\n` +
+          `Click OK to upload as INVOICE\n` +
+          `Click Cancel to upload as TIMESHEET`
+        );
+        targetType = choice ? 'invoice' : 'timesheet';
+      }
+    }
+
+    // Find the target document
+    const existingInvoice = invoices.find(d => d.workRecordId === record.id && d.type === 'invoice');
+    const existingTimesheet = invoices.find(d => d.workRecordId === record.id && d.type === 'timesheet');
+
+    console.log('[handleSmartUpload] Available documents:', {
+      invoiceId: existingInvoice?.id,
+      invoiceType: existingInvoice?.type,
+      timesheetId: existingTimesheet?.id,
+      timesheetType: existingTimesheet?.type,
+      targetType
+    });
+
+    const targetDocument = targetType === 'invoice' ? existingInvoice : existingTimesheet;
+
+    console.log('[handleSmartUpload] Selected target document:', {
+      targetDocumentId: targetDocument?.id,
+      targetDocumentType: targetDocument?.type
+    });
+
+    if (!targetDocument) {
+      alert(
+        `No ${targetType} exists for this work record yet.\n\n` +
+        `Please generate a ${targetType} first before uploading a file.`
+      );
+      e.target.value = '';
+      return;
+    }
+
+    // Show what was detected and confirm
+    const detectedInfo = [
+      `Document Type: ${targetType.toUpperCase()}`,
+      `File Format: ${isPdf ? 'PDF' : 'Excel'}`,
+      `Filename: ${fileName}`,
+    ].join('\n');
+
+    console.log('[handleSmartUpload] Detected:', { targetType, isPdf, isExcel, fileName });
+
+    try {
+      setUploadingRecordId(record.id);
+      setUploadProgress(0);
+
+      // Progress callback
+      const onProgress = (progress: number) => {
+        setUploadProgress(progress);
+      };
+
+      console.log('[handleSmartUpload] Uploading to', targetType, ':', targetDocument.id);
+      const result = await uploadFinalDocument(
+        userEmail,
+        targetDocument.id!,
+        file,
+        client.name,
+        `Final version uploaded: ${file.name}`,
+        onProgress
+      );
+      console.log('[handleSmartUpload] Upload result:', result);
+
+      // Refresh documents list
+      const updatedDocs = await getDocuments(userEmail);
+      setInvoices(updatedDocs);
+
+      alert(`✓ Uploaded successfully!\n\n${detectedInfo}`);
+    } catch (err) {
+      console.error('[handleSmartUpload] Failed to upload:', err);
+      alert('Failed to upload. Error: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setUploadingRecordId(null);
+      setUploadProgress(0);
+      e.target.value = '';
+    }
+  };
+
   const handleGenerateInvoice = async () => {
     if (!dialogRecord || !dialogClient || !invoiceNumber.trim()) return;
 
@@ -369,10 +750,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       if (base64Data.includes(',')) {
         base64Data = base64Data.split(',')[1];
       }
-      
+
       // Remove any whitespace that might have been added
       base64Data = base64Data.replace(/\s/g, '');
-      
+
       const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
@@ -426,19 +807,19 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           const descCell = worksheet.getCell(mapping.description);
           // Check if formula - if so, leave it alone
           const isFormula = descCell.value && typeof descCell.value === 'object' && 'formula' in descCell.value;
-          
+
           if (!isFormula) {
             const currentDescVal = descCell.value ? descCell.value.toString() : '';
-            
+
             if (!currentDescVal.trim()) {
               // Case 1: Empty Description -> Generate standard string
               const monthName = format(monthDate, 'MMMM');
               const year = format(monthDate, 'yyyy');
-              
+
               let newDesc = `Consulting Services for ${monthName} ${year}`;
               // If there is no specific 'daysWorked' column mapped, we usually want the days count in description
               if (!mapping.daysWorked) {
-                 newDesc += ` (${daysWorked} days)`;
+                newDesc += ` (${daysWorked} days)`;
               }
               descCell.value = newDesc;
             } else {
@@ -446,12 +827,12 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
               // Look for "X days", "X units/working days", etc.
               const daysPattern = /(\d+)(\D{0,50}days?)/i;
               if (daysPattern.test(currentDescVal)) {
-                 descCell.value = currentDescVal.replace(daysPattern, `${daysWorked}$2`);
+                descCell.value = currentDescVal.replace(daysPattern, `${daysWorked}$2`);
               }
               // If no pattern is found, we assume the user's template text is static or doesn't include days count.
             }
           }
-        } catch(e) { console.warn("Invalid description cell address", e); }
+        } catch (e) { console.warn("Invalid description cell address", e); }
       }
 
       // Replace placeholders throughout the worksheet
@@ -472,7 +853,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       });
 
       const buffer = await workbook.xlsx.writeBuffer();
-      
+
       // Convert to base64 for storage (browser-compatible)
       const bufferBytes = new Uint8Array(buffer);
       let bufferBinary = '';
@@ -481,7 +862,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       }
       const bufferBase64 = btoa(bufferBinary);
       const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
-      
+
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -512,6 +893,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         downloadUrl: '', // Will be set by saveDocument after upload
         isOutdated: false,
         outdatedAt: null,
+        isPaid: false, // Added missing property
       };
 
       await saveDocument(userEmail, invoiceData, existingInvoiceId || undefined, blob);
@@ -918,13 +1300,13 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             for (let i = 0; i < daysInMonth; i++) {
               const currentRow = startRow + i;
               const cell = worksheet.getRow(currentRow).getCell(refCol);
-              
+
               // Check if cell is safe to overwrite (empty, placeholder, or existing date)
               const currentValue = cell.value;
               const isEmpty = currentValue === null || currentValue === undefined;
               const isPlaceholder = typeof currentValue === 'string' && currentValue.includes('{{');
               const isExistingDate = getDayVal(cell) !== -1;
-              
+
               // Only write if the cell looks like it's meant for dates
               if (isEmpty || isPlaceholder || isExistingDate) {
                 // Create a UTC date at midnight to avoid local timezone shifts
@@ -936,7 +1318,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                 cell.numFmt = 'dddd, mmmm d, yyyy'; // descriptive: "Wednesday, April 1, 2026"
               }
             }
-            
+
             // Clear leftover days (e.g. days 31 in a 30-day month)
             // BUT ONLY if they look like dates! This preserves "Total" or "Signature" lines.
             for (let i = daysInMonth; i < 31; i++) {
@@ -1234,7 +1616,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       }
 
       const buffer = await workbook.xlsx.writeBuffer();
-      
+
       // Convert to base64 for storage (browser-compatible)
       const bufferBytes = new Uint8Array(buffer);
       let bufferBinary = '';
@@ -1243,7 +1625,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       }
       const bufferBase64 = btoa(bufferBinary);
       const fileData = `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${bufferBase64}`;
-      
+
       const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       });
@@ -1475,7 +1857,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           {sortedMonths.map((month) => (
             <div
               key={month}
-              className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden"
+              className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700"
             >
               {/* Month Header */}
               <div className="px-4 sm:px-6 py-4 bg-slate-50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700">
@@ -1496,126 +1878,526 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                   const client = clients.find((c) => c.id === record.clientId);
                   const invoice = getInvoiceForRecord(record.id);
                   const timesheet = getTimesheetForRecord(record.id);
-                  const hasOutdatedInvoice = invoice?.isOutdated;
-                  const hasOutdatedTimesheet = timesheet?.isOutdated;
+                  
+                  // Debug logging
+                  if (invoice || timesheet) {
+                    console.log('[Render] Record:', record.id.slice(0, 8),
+                      'Invoice:', invoice?.id?.slice(0, 8),
+                      'Timesheet:', timesheet?.id?.slice(0, 8),
+                      'Invoice finalUrl:', invoice?.finalDownloadUrl?.slice(0, 30));
+                  }
+                  
+                  // Status-based logic
+                  const invoiceStatus = invoice ? getEffectiveStatus(invoice) : null;
+                  const timesheetStatus = timesheet ? getEffectiveStatus(timesheet) : null;
+                  const hasFinalInvoice = invoice ? hasFinalVersion(invoice) : false;
+                  const hasFinalTimesheet = timesheet ? hasFinalVersion(timesheet) : false;
+                  // Check for format-specific versions (NEW: Replace by Format)
+                  const hasInvoicePdf = invoice ? hasPdfVersion(invoice) : false;
+                  const hasInvoiceExcel = invoice ? hasExcelVersion(invoice) : false;
+                  const hasTimesheetPdf = timesheet ? hasPdfVersion(timesheet) : false;
+                  const hasTimesheetExcel = timesheet ? hasExcelVersion(timesheet) : false;
+                  const isInvoicePaid = invoice?.isPaid;
+
+                  const isInvoiceDropdownOpen = openDropdown?.type === 'invoice' && openDropdown?.recordId === record.id;
+                  const isTimesheetDropdownOpen = openDropdown?.type === 'timesheet' && openDropdown?.recordId === record.id;
+
+                  const isUploadingThisRecord = uploadingRecordId === record.id;
 
                   return (
                     <div
                       key={record.id}
                       onClick={() => handleEdit(record.clientId, record.month)}
-                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group cursor-pointer"
+                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group cursor-pointer relative"
                     >
+                      {/* Upload Progress Bar */}
+                      {isUploadingThisRecord && (
+                        <div className="absolute inset-x-0 top-0 z-10">
+                          <div className="h-1 bg-indigo-100 dark:bg-indigo-900/30">
+                            <div
+                              className="h-full bg-indigo-600 transition-all duration-200"
+                              style={{ width: `${uploadProgress}%` }}
+                            />
+                          </div>
+                          <div className="absolute right-2 -top-5 text-xs text-indigo-600 dark:text-indigo-400 font-medium">
+                            {Math.round(uploadProgress)}%
+                          </div>
+                        </div>
+                      )}
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                         {/* Left: Client Info */}
                         <div className="flex items-center gap-3">
                           <div className="w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center flex-shrink-0">
                             <Building2 size={20} className="text-indigo-600" />
                           </div>
-                          <div>
+                          <div className="flex-1 min-w-0">
                             <h4 className="font-medium text-slate-900 dark:text-white">
                               {client?.name || 'Unknown Client'}
                             </h4>
-                            <div className="flex items-center gap-3 text-sm text-slate-500 dark:text-slate-400">
+                            <div className="flex items-center gap-3 text-sm text-slate-500 dark:text-slate-400 mt-1">
                               <span className="flex items-center gap-1">
                                 <Clock size={14} />
                                 {record.workingDays.length} days
                               </span>
-                              {invoice && (
-                                <span
-                                  className={`flex items-center gap-1 ${hasOutdatedInvoice
-                                    ? 'text-amber-600 dark:text-amber-400'
-                                    : 'text-green-600 dark:text-green-400'
-                                    }`}
-                                >
-                                  <FileSpreadsheet size={14} />
-                                  {invoice.documentNumber}
-                                  {hasOutdatedInvoice && (
-                                    <AlertTriangle size={12} />
-                                  )}
-                                </span>
-                              )}
-                              {timesheet && (
-                                <span
-                                  className={`flex items-center gap-1 ${hasOutdatedTimesheet
-                                    ? 'text-amber-600 dark:text-amber-400'
-                                    : 'text-blue-600 dark:text-blue-400'
-                                    }`}
-                                >
-                                  <Calendar size={14} />
-                                  {timesheet.documentNumber}
-                                  {hasOutdatedTimesheet && (
-                                    <AlertTriangle size={12} />
-                                  )}
-                                </span>
-                              )}
                             </div>
                           </div>
                         </div>
 
-                        {/* Right: Actions */}
-                        <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openInvoiceDialog(record);
-                            }}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${hasOutdatedInvoice
-                              ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
-                              : 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400'
-                              }`}
-                            title={hasOutdatedInvoice ? 'Regenerate Invoice' : 'Generate Invoice'}
-                          >
-                            <FileSpreadsheet size={16} />
-                            {invoice ? 'Regenerate' : 'Invoice'}
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openTimesheetDialog(record);
-                            }}
-                            disabled={isGeneratingTimesheet}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${hasOutdatedTimesheet
-                              ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400'
-                              : 'bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400'
-                              }`}
-                            title={hasOutdatedTimesheet ? 'Regenerate Timesheet' : 'Generate Timesheet'}
-                          >
-                            {isGeneratingTimesheet && timesheetRecord?.id === record.id ? (
-                              <Loader2 size={16} className="animate-spin" />
-                            ) : (
-                              <Calendar size={16} />
+                        {/* Right: Status Badges & Actions */}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {/* Excel Invoice Badge & Dropdown */}
+                          {invoice && (
+                            <div className="relative">
+                              <button
+                                ref={(el) => {
+                                  if (el) invoiceButtonRefs.current.set(record.id, el);
+                                }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const rect = invoiceButtonRefs.current.get(record.id)?.getBoundingClientRect();
+                                  if (rect) {
+                                    setDropdownPosition({ top: rect.bottom + 4, left: rect.left });
+                                  }
+                                  setOpenDropdown(
+                                    openDropdown?.type === 'invoice' && openDropdown?.recordId === record.id
+                                      ? null
+                                      : { type: 'invoice', recordId: record.id }
+                                  );
+                                }}
+                                className="flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                                title={`Invoice - ${hasInvoicePdf && hasInvoiceExcel ? 'PDF + Excel' : hasInvoiceExcel ? 'Excel only' : 'Generated'}`}
+                              >
+                                <FileSpreadsheet size={14} className="text-indigo-500" />
+                                <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Invoice</span>
+                                {/* Format badges - show both if both exist */}
+                                <div className="flex items-center gap-1">
+                                  {hasInvoiceExcel && (
+                                    <span className="text-[10px] px-1 py-0.5 bg-indigo-100 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 rounded">
+                                      Excel
+                                    </span>
+                                  )}
+                                  {hasInvoicePdf && (
+                                    <span className="text-[10px] px-1 py-0.5 bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded">
+                                      PDF
+                                    </span>
+                                  )}
+                                </div>
+                                <StatusBadge status={invoice.status || 'generated'} size="sm" timestamp={invoice.paidAt || invoice.sentAt || invoice.finalizedAt || invoice.generatedAt} />
+                              </button>
+
+                              {/* Invoice Dropdown Menu */}
+                              {isInvoiceDropdownOpen && dropdownPosition && (
+                                <div
+                                  className="fixed w-48 bg-white dark:bg-slate-800 rounded-lg shadow-lg border border-slate-200 dark:border-slate-700 z-[9999] py-1"
+                                  style={{ top: dropdownPosition.top, left: dropdownPosition.left }}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      openInvoiceDialog(record);
+                                      setOpenDropdown(null);
+                                    }}
+                                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                  >
+                                    <RefreshCw size={14} />
+                                    Regenerate Excel
+                                  </button>
+                                  <button
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      let excelUrl = getExcelDownloadUrl(invoice);
+                                      // If no Excel URL found, try to regenerate from storage path
+                                      if (!excelUrl && invoice.storagePath) {
+                                        excelUrl = await regenerateExcelUrl(invoice);
+                                      }
+                                      if (excelUrl) {
+                                        try {
+                                          const response = await fetch(excelUrl);
+                                          const blob = await response.blob();
+                                          const url = window.URL.createObjectURL(blob);
+                                          const link = document.createElement('a');
+                                          link.href = url;
+                                          link.download = invoice.fileName || 'invoice.xlsx';
+                                          document.body.appendChild(link);
+                                          link.click();
+                                          document.body.removeChild(link);
+                                          window.URL.revokeObjectURL(url);
+                                        } catch (err) {
+                                          console.error('Download failed:', err);
+                                          window.open(excelUrl, '_blank');
+                                        }
+                                      } else {
+                                        alert('Excel file not found. The file may have been deleted or the URL is no longer valid. Please regenerate the invoice.');
+                                      }
+                                      setOpenDropdown(null);
+                                    }}
+                                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                  >
+                                    <Download size={14} />
+                                    Download Excel
+                                  </button>
+                                  {hasInvoicePdf && (
+                                    <>
+                                      <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+                                      <button
+                                        onClick={async (e) => {
+                                          e.preventDefault();
+                                          e.stopPropagation();
+                                          const pdfUrl = await getFreshPdfUrl(invoice);
+                                          if (pdfUrl) {
+                                            try {
+                                              // Fetch the PDF content
+                                              const response = await fetch(pdfUrl);
+                                              const blob = await response.blob();
+                                              
+                                              // Get clean filename - use the stored filename but remove Firebase timestamp suffixes only
+                                              // Firebase adds timestamps like "-1234567890" before the extension
+                                              const rawFileName = invoice.finalFileName || invoice.fileName || 'invoice.pdf';
+                                              // Only remove long numeric suffixes (Firebase timestamps are 10+ digits), not years (4 digits)
+                                              const cleanFileName = rawFileName.replace(/(-\d{10,})\.pdf$/i, '.pdf');
+                                              
+                                              // Try File System Access API first (forces save dialog, no preview)
+                                              const fileNameWithoutExt = cleanFileName.replace(/\.pdf$/i, '');
+                                              if ('showSaveFilePicker' in window) {
+                                                try {
+                                                  const handle = await (window as any).showSaveFilePicker({
+                                                    suggestedName: cleanFileName,
+                                                    types: [{
+                                                      description: 'PDF files',
+                                                      accept: { 'application/pdf': ['.pdf'] }
+                                                    }]
+                                                  });
+                                                  const writable = await handle.createWritable();
+                                                  await writable.write(blob);
+                                                  await writable.close();
+                                                } catch (err: any) {
+                                                  // User cancelled or API failed, fall through to anchor method
+                                                  if (err.name !== 'AbortError') {
+                                                    console.log('File System Access API failed, using fallback:', err);
+                                                  }
+                                                  throw err; // Trigger fallback
+                                                }
+                                              } else {
+                                                // Fallback: Use anchor element with proper attributes
+                                                const blobUrl = window.URL.createObjectURL(blob);
+                                                
+                                                // Create a temporary container div
+                                                const container = document.createElement('div');
+                                                container.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+                                                document.body.appendChild(container);
+                                                
+                                                // Create anchor element
+                                                const a = document.createElement('a');
+                                                a.href = blobUrl;
+                                                a.download = cleanFileName;
+                                                // These attributes help prevent preview
+                                                a.type = 'application/pdf';
+                                                a.setAttribute('data-downloadurl', `application/pdf:${cleanFileName}:${blobUrl}`);
+                                                container.appendChild(a);
+                                                
+                                                // Programmatic click
+                                                const evt = new MouseEvent('click', {
+                                                  bubbles: false,
+                                                  cancelable: true,
+                                                  view: window
+                                                });
+                                                a.dispatchEvent(evt);
+                                                
+                                                // Cleanup
+                                                setTimeout(() => {
+                                                  document.body.removeChild(container);
+                                                  window.URL.revokeObjectURL(blobUrl);
+                                                }, 100);
+                                              }
+                                            } catch (err) {
+                                              console.error('Download failed:', err);
+                                              // Final fallback: open in new tab with download query param
+                                              const downloadUrl = new URL(pdfUrl);
+                                              downloadUrl.searchParams.set('download', '1');
+                                              const newWindow = window.open(downloadUrl.toString(), '_blank');
+                                              if (!newWindow) {
+                                                // If popup blocked, try direct navigation
+                                                window.location.href = pdfUrl;
+                                              }
+                                            }
+                                          }
+                                          setOpenDropdown(null);
+                                        }}
+                                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                      >
+                                        <Download size={14} />
+                                        Download PDF
+                                      </button>
+                                      <button
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          const pdfUrl = await getFreshPdfUrl(invoice);
+                                          if (pdfUrl) window.open(pdfUrl, '_blank');
+                                          setOpenDropdown(null);
+                                        }}
+                                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                      >
+                                        <Eye size={14} />
+                                        Preview PDF
+                                      </button>
+                                    </>
+                                  )}
+                                  {/* Status Actions for Invoice */}
+                                  <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+                                  {invoice.status !== 'sent' && invoice.status !== 'paid' && (
+                                    <button
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        try {
+                                          const { markDocumentSent } = await import('../services/db');
+                                          await markDocumentSent(userEmail!, invoice.id, `Marked as sent from WorkRecordList`);
+                                          // Refresh documents to show updated status
+                                          const { getDocuments } = await import('../services/db');
+                                          const updatedDocs = await getDocuments(userEmail!);
+                                          setInvoices(updatedDocs);
+                                        } catch (err) {
+                                          console.error('Error marking as sent:', err);
+                                          alert('Failed to mark as sent. Please try again.');
+                                        }
+                                        setOpenDropdown(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                    >
+                                      <Send size={14} />
+                                      Mark as Sent
+                                    </button>
+                                  )}
+                                  {invoice.status !== 'paid' && (
+                                    <button
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        try {
+                                          const { markInvoicePaid } = await import('../services/db');
+                                          await markInvoicePaid(userEmail!, invoice.id, `Marked as paid from WorkRecordList`);
+                                          // Refresh documents to show updated status
+                                          const { getDocuments } = await import('../services/db');
+                                          const updatedDocs = await getDocuments(userEmail!);
+                                          setInvoices(updatedDocs);
+                                        } catch (err) {
+                                          console.error('Error marking as paid:', err);
+                                          alert('Failed to mark as paid. Please try again.');
+                                        }
+                                        setOpenDropdown(null);
+                                      }}
+                                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                    >
+                                      <CheckCircle size={14} />
+                                      Mark as Paid
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Generate Invoice Button - Only show if no invoice exists */}
+                          {!invoice && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openInvoiceDialog(record);
+                              }}
+                              className="flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                            >
+                              <FileSpreadsheet size={14} className="text-indigo-500" />
+                              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Invoice</span>
+                              <span className="text-xs text-slate-400 dark:text-slate-500 italic">Not generated</span>
+                            </button>
+                          )}
+
+                          {/* Excel Timesheet Badge & Dropdown */}
+                          {timesheet && (
+                            <div className="relative">
+                              <button
+                                ref={(el) => {
+                                  if (el) timesheetButtonRefs.current.set(record.id, el);
+                                }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const rect = timesheetButtonRefs.current.get(record.id)?.getBoundingClientRect();
+                                  if (rect) {
+                                    setDropdownPosition({ top: rect.bottom + 4, left: rect.left });
+                                  }
+                                  setOpenDropdown(
+                                    openDropdown?.type === 'timesheet' && openDropdown?.recordId === record.id
+                                      ? null
+                                      : { type: 'timesheet', recordId: record.id }
+                                  );
+                                }}
+                                className="flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                                title={`Timesheet - ${hasTimesheetPdf && hasTimesheetExcel ? 'PDF + Excel' : hasTimesheetExcel ? 'Excel only' : 'Generated'}`}
+                              >
+                                <FileSpreadsheet size={14} className="text-blue-500" />
+                                <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Timesheet</span>
+                                {/* Format badges - show both if both exist */}
+                                <div className="flex items-center gap-1">
+                                  {hasTimesheetExcel && (
+                                    <span className="text-[10px] px-1 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded">
+                                      Excel
+                                    </span>
+                                  )}
+                                  {hasTimesheetPdf && (
+                                    <span className="text-[10px] px-1 py-0.5 bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded">
+                                      PDF
+                                    </span>
+                                  )}
+                                </div>
+                                <StatusBadge status={timesheet.status || 'generated'} size="sm" timestamp={timesheet.sentAt || timesheet.finalizedAt || timesheet.generatedAt} />
+                              </button>
+
+                              {/* Excel Timesheet Dropdown Menu */}
+                              {isTimesheetDropdownOpen && dropdownPosition && (
+                                <div
+                                  className="fixed w-48 bg-white dark:bg-slate-800 rounded-lg shadow-lg border border-slate-200 dark:border-slate-700 z-[9999] py-1"
+                                  style={{ top: dropdownPosition.top, left: dropdownPosition.left }}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      openTimesheetDialog(record);
+                                      setOpenDropdown(null);
+                                    }}
+                                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                  >
+                                    <RefreshCw size={14} />
+                                    Regenerate Excel
+                                  </button>
+                                  <button
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      let excelUrl = getExcelDownloadUrl(timesheet);
+                                      // If no Excel URL found, try to regenerate from storage path
+                                      if (!excelUrl && timesheet.storagePath) {
+                                        excelUrl = await regenerateExcelUrl(timesheet);
+                                      }
+                                      if (excelUrl) {
+                                        try {
+                                          const response = await fetch(excelUrl);
+                                          const blob = await response.blob();
+                                          const url = window.URL.createObjectURL(blob);
+                                          const link = document.createElement('a');
+                                          link.href = url;
+                                          link.download = timesheet.fileName || 'timesheet.xlsx';
+                                          document.body.appendChild(link);
+                                          link.click();
+                                          document.body.removeChild(link);
+                                          window.URL.revokeObjectURL(url);
+                                        } catch (err) {
+                                          console.error('Download failed:', err);
+                                          window.open(excelUrl, '_blank');
+                                        }
+                                      } else {
+                                        alert('Excel file not found. The file may have been deleted or the URL is no longer valid. Please regenerate the timesheet.');
+                                      }
+                                      setOpenDropdown(null);
+                                    }}
+                                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                  >
+                                    <Download size={14} />
+                                      Download Excel
+                                    </button>
+                                    {/* Status Actions for Timesheet */}
+                                    <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+                                    {timesheet.status !== 'sent' && (
+                                      <button
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          try {
+                                            const { markDocumentSent } = await import('../services/db');
+                                            await markDocumentSent(userEmail!, timesheet.id, `Marked as sent from WorkRecordList`);
+                                            // Refresh documents to show updated status
+                                            const { getDocuments } = await import('../services/db');
+                                            const updatedDocs = await getDocuments(userEmail!);
+                                            setInvoices(updatedDocs);
+                                          } catch (err) {
+                                            console.error('Error marking as sent:', err);
+                                            alert('Failed to mark as sent. Please try again.');
+                                          }
+                                          setOpenDropdown(null);
+                                        }}
+                                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                                      >
+                                        <Send size={14} />
+                                        Mark as Sent
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
                             )}
-                            {timesheet ? 'Regenerate' : 'Timesheet'}
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleEdit(record.clientId, record.month);
-                            }}
-                            className="p-2 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
-                            title="Edit work record"
-                          >
-                            <Edit3 size={18} />
-                          </button>
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDelete(record);
-                            }}
-                            disabled={isDeleting}
-                            className="p-2 text-slate-400 hover:text-red-600 dark:hover:text-red-400 transition-colors disabled:opacity-50"
-                            title="Delete work record"
-                          >
-                            {isDeleting ? (
-                              <Loader2 size={18} className="animate-spin" />
-                            ) : (
-                              <Trash2 size={18} />
-                            )}
-                          </button>
-                          <ChevronRight
-                            size={18}
-                            className="text-slate-300 dark:text-slate-600"
-                          />
+  
+                            {/* Generate Timesheet Button - Only show if no timesheet exists */}
+                          {!timesheet && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openTimesheetDialog(record);
+                              }}
+                              className="flex items-center gap-2 px-2 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+                            >
+                              <Calendar size={14} className="text-blue-500" />
+                              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">Timesheet</span>
+                              <span className="text-xs text-slate-400 dark:text-slate-500 italic">Not generated</span>
+                            </button>
+                          )}
+
+                          {/* Smart Upload Button - Available when invoice or timesheet exists */}
+                          {(invoice || timesheet) && (
+                            <label
+                              className="flex items-center gap-2 px-2 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 hover:bg-emerald-200 dark:hover:bg-emerald-900/50 transition-colors cursor-pointer ml-2"
+                              title="Upload file (auto-detects invoice/timesheet from filename)"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <Upload size={14} className="text-emerald-600 dark:text-emerald-400" />
+                              <span className="text-xs font-medium text-emerald-700 dark:text-emerald-300">Upload</span>
+                              <input
+                                type="file"
+                                accept=".pdf,.xlsx,.xls,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                                className="hidden"
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={(e) => {
+                                  e.stopPropagation();
+                                  handleSmartUpload(e, record, client || { id: '', name: 'Unknown' } as Client);
+                                }}
+                              />
+                            </label>
+                          )}
+
+                          {/* Edit/Delete Buttons */}
+                          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity ml-2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleEdit(record.clientId, record.month);
+                              }}
+                              className="p-2 text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors"
+                              title="Edit work record"
+                            >
+                              <Edit3 size={18} />
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDelete(record);
+                              }}
+                              disabled={isDeleting}
+                              className="p-2 text-slate-400 hover:text-red-600 dark:hover:text-red-400 transition-colors disabled:opacity-50"
+                              title="Delete work record"
+                            >
+                              {isDeleting ? (
+                                <Loader2 size={18} className="animate-spin" />
+                              ) : (
+                                <Trash2 size={18} />
+                              )}
+                            </button>
+                          </div>
                         </div>
                       </div>
                     </div>

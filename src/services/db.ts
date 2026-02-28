@@ -33,13 +33,25 @@ import type {
   WorkRecordTimesheet,
   WorkRecordTimesheetInput,
   Template,
+  DocumentStatus,
+  StatusHistoryEntry,
+  FinalDocumentInfo,
 } from '../types';
 import {
   uploadTemplate as uploadTemplateToStorage,
   deleteTemplateFile,
   uploadDocument as uploadDocumentToStorage,
+  uploadFinalDocument as uploadFinalDocumentToStorage,
   deleteDocumentFile,
+  deleteFinalDocument,
+  getFileExtension,
+  getContentType,
 } from './storage';
+import {
+  createStatusHistoryEntry,
+  addStatusToHistory,
+  isValidStatusTransition,
+} from '../utils/documentStatus';
 
 // ============================================
 // Collection References
@@ -368,9 +380,11 @@ export async function deleteWorkRecord(id: string): Promise<void> {
       query(collection(db, COLLECTIONS.DOCUMENTS), where('workRecordId', '==', id))
     );
     
-    // Delete storage files first
+    // Delete all storage files associated with documents
     for (const docSnapshot of documentsSnapshot.docs) {
       const docData = docSnapshot.data() as Document;
+      
+      // 1. Delete generated document file (storagePath)
       if (docData.storagePath) {
         try {
           await deleteDocumentFile(docData.storagePath);
@@ -380,13 +394,45 @@ export async function deleteWorkRecord(id: string): Promise<void> {
           // Continue even if storage deletion fails
         }
       }
+      
+      // 2. Delete legacy final document (finalStoragePath)
+      if (docData.finalStoragePath) {
+        try {
+          await deleteFinalDocument(docData.finalStoragePath);
+          console.log(`Deleted legacy final document: ${docData.finalStoragePath}`);
+        } catch (storageError) {
+          console.warn(`Failed to delete legacy final document ${docData.finalStoragePath}:`, storageError);
+        }
+      }
+      
+      // 3. Delete all final documents in the finalDocuments array
+      if (docData.finalDocuments && Array.isArray(docData.finalDocuments)) {
+        for (const finalDoc of docData.finalDocuments) {
+          if (finalDoc.storagePath) {
+            try {
+              await deleteFinalDocument(finalDoc.storagePath);
+              console.log(`Deleted final document: ${finalDoc.storagePath}`);
+            } catch (storageError) {
+              console.warn(`Failed to delete final document ${finalDoc.storagePath}:`, storageError);
+            }
+          }
+        }
+      }
     }
     
     // Then delete the Firestore document records
     await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
+    
+    // Delete associated timesheet configuration
+    const timesheetSnapshot = await getDocs(
+      query(collection(db, COLLECTIONS.TIMESHEETS), where('workRecordId', '==', id))
+    );
+    await Promise.all(timesheetSnapshot.docs.map(d => deleteDoc(d.ref)));
 
     // Finally delete the work record
     await deleteDoc(doc(db, COLLECTIONS.WORK_RECORDS, id));
+    
+    console.log(`Successfully deleted work record ${id} and all associated documents/files`);
   } catch (e) {
     console.error('Error deleting work record:', e);
     throw e;
@@ -468,19 +514,23 @@ export async function saveDocument(
 ): Promise<Document> {
   try {
     const id = existingId || crypto.randomUUID();
+    const now = new Date().toISOString();
 
     let storagePath = document.storagePath;
     let downloadUrl = document.downloadUrl;
 
     // Upload file to Firebase Storage if fileBlob is provided
-    // Documents are stored in flat structure: {clientName}/{month}/{filename}
+    // Documents are stored in type-specific folders: {clientName}/{month}/{type}/{filename}
     if (fileBlob && document.fileName) {
       const uploadResult = await uploadDocumentToStorage(
         userEmail,
         document.clientName,
         document.month, // YYYY-MM format
         document.fileName,
-        fileBlob
+        fileBlob,
+        undefined, // contentType - use default
+        undefined, // onProgress - no progress tracking for generated docs
+        document.type // Pass document type to organize into invoice/timesheet folders
       );
       storagePath = uploadResult.storagePath;
       downloadUrl = uploadResult.downloadUrl;
@@ -491,16 +541,48 @@ export async function saveDocument(
       throw new Error('storagePath and downloadUrl are required. Please upload a file.');
     }
 
-    // Build document data, handling null values for outdatedAt to properly clear them
+    // Build document data with status tracking
     const { outdatedAt, ...otherFields } = document;
 
     const documentData: any = {
       ...otherFields,
       userEmail: userEmail,
-      generatedAt: new Date().toISOString(),
+      generatedAt: document.generatedAt || now,
       storagePath,
       downloadUrl,
     };
+
+    // Handle status: only set status for new documents, preserve for existing
+    if (!existingId) {
+      // New document - set initial status
+      documentData.status = 'generated';
+      documentData.statusHistory = [
+        createStatusHistoryEntry('generated', 'Document generated from template'),
+      ];
+    }
+    // For existing documents, don't overwrite status - let merge: true preserve existing fields
+
+    // Add final document fields if provided
+    if (document.finalStoragePath) {
+      documentData.finalStoragePath = document.finalStoragePath;
+    }
+    if (document.finalDownloadUrl) {
+      documentData.finalDownloadUrl = document.finalDownloadUrl;
+    }
+    if (document.finalFileName) {
+      documentData.finalFileName = document.finalFileName;
+    }
+
+    // Add status date fields if provided
+    if (document.finalizedAt) {
+      documentData.finalizedAt = document.finalizedAt;
+    }
+    if (document.sentAt) {
+      documentData.sentAt = document.sentAt;
+    }
+    if (document.paidAt) {
+      documentData.paidAt = document.paidAt;
+    }
 
     // Handle outdatedAt specially - if explicitly set to null, use deleteField()
     // Otherwise include the value
@@ -514,7 +596,14 @@ export async function saveDocument(
     const documentRef = doc(db, COLLECTIONS.DOCUMENTS, id);
     await setDoc(documentRef, documentData, { merge: true });
 
-    return { ...document, userEmail: userEmail, generatedAt: documentData.generatedAt, id, storagePath, downloadUrl };
+    // Fetch the updated document to return complete data
+    const updatedDoc = await getDoc(documentRef);
+    const finalData = updatedDoc.data() as Document;
+
+    return {
+      ...finalData,
+      id,
+    };
   } catch (e) {
     console.error('Error saving document:', e);
     throw e;
@@ -563,6 +652,374 @@ export async function markDocumentAsPaid(
     );
   } catch (e) {
     console.error('Error marking document as paid:', e);
+    throw e;
+  }
+}
+
+// ============================================
+// Document Status Operations (NEW)
+// ============================================
+
+/**
+ * Update document status with history tracking
+ * Validates the transition and adds entry to status history
+ */
+export async function updateDocumentStatus(
+  userEmail: string,
+  documentId: string,
+  newStatus: DocumentStatus,
+  note?: string
+): Promise<void> {
+  try {
+    // Get current document
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    const documentSnap = await getDoc(documentRef);
+
+    if (!documentSnap.exists()) {
+      throw new Error('Document not found');
+    }
+
+    const document = documentSnap.data() as Document;
+
+    // Verify ownership
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to update this document');
+    }
+
+    // Validate status transition
+    if (!isValidStatusTransition(document.status, newStatus, document.type)) {
+      throw new Error(
+        `Invalid status transition from ${document.status} to ${newStatus} for ${document.type}`
+      );
+    }
+
+    const now = new Date().toISOString();
+
+    // Build update data
+    const updateData: any = {
+      status: newStatus,
+      updatedAt: now,
+    };
+
+    // Add status-specific date field
+    switch (newStatus) {
+      case 'excel-uploaded':
+      case 'pdf-uploaded':
+        updateData.finalizedAt = now;
+        break;
+      case 'sent':
+        updateData.sentAt = now;
+        break;
+      case 'paid':
+        updateData.paidAt = now;
+        // Also update legacy fields
+        updateData.isPaid = true;
+        break;
+    }
+
+    // Add to status history
+    updateData.statusHistory = addStatusToHistory(
+      document.statusHistory || [],
+      newStatus,
+      note
+    );
+
+    await setDoc(documentRef, updateData, { merge: true });
+  } catch (e) {
+    console.error('Error updating document status:', e);
+    throw e;
+  }
+}
+
+/**
+ * Upload a final version of a document and update status to 'final'
+ * Files are stored with their exact filename - same filename will overwrite
+ */
+export async function uploadFinalDocument(
+  userEmail: string,
+  documentId: string,
+  file: File,
+  clientName: string,
+  note?: string,
+  onProgress?: (progress: number) => void
+): Promise<{ finalStoragePath: string; finalDownloadUrl: string }> {
+  try {
+    // Get current document
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    const documentSnap = await getDoc(documentRef);
+
+    if (!documentSnap.exists()) {
+      throw new Error('Document not found');
+    }
+
+    const document = documentSnap.data() as Document;
+
+    // Verify ownership
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to update this document');
+    }
+
+    // Validate that we can transition to uploaded status
+    const currentStatus = document.status;
+    const canTransition =
+      currentStatus === 'generated' ||
+      currentStatus === 'excel-uploaded' ||
+      currentStatus === 'pdf-uploaded' ||
+      currentStatus === 'sent';
+
+    if (!canTransition) {
+      throw new Error(
+        `Cannot upload final version when document is in ${currentStatus} status`
+      );
+    }
+
+    // Check if there's an existing final document with the SAME filename (same file type)
+    // Different filenames = different files (e.g., PDF vs Excel), keep both in finalDocuments array
+    const existingFinalDocIndex = document.finalDocuments?.findIndex(
+      (fd) => fd.fileName === file.name
+    );
+
+    // Also check legacy final document
+    const hasLegacyFinalWithSameName = document.finalFileName === file.name;
+
+    // Delete existing file from storage only if same filename (same file type)
+    if (existingFinalDocIndex !== undefined && existingFinalDocIndex >= 0) {
+      const existingDoc = document.finalDocuments![existingFinalDocIndex];
+      try {
+        await deleteFinalDocument(existingDoc.storagePath);
+      } catch (e) {
+        console.warn('Failed to delete existing final file:', e);
+      }
+    } else if (hasLegacyFinalWithSameName && document.finalStoragePath) {
+      try {
+        await deleteFinalDocument(document.finalStoragePath);
+      } catch (e) {
+        console.warn('Failed to delete existing final file:', e);
+      }
+    }
+
+    // Upload new final file with progress tracking
+    // Include document type in the path to separate invoices and timesheets
+    const uploadResult = await uploadFinalDocumentToStorage(
+      userEmail,
+      clientName,
+      document.month,
+      file.name,
+      file,
+      undefined,
+      onProgress,
+      document.type
+    );
+
+    const now = new Date().toISOString();
+
+    // Get file extension for the new final document entry
+    const fileExt = file.name.toLowerCase().split('.').pop() || '';
+
+    // Create the new final document info
+    const newFinalDoc: FinalDocumentInfo = {
+      id: crypto.randomUUID(),
+      fileName: file.name,
+      storagePath: uploadResult.finalStoragePath,
+      downloadUrl: uploadResult.finalDownloadUrl,
+      contentType: file.type || getContentType(file.name),
+      fileExtension: fileExt,
+      uploadedAt: now,
+      note: note || 'Final version uploaded',
+    };
+
+    // Build the updated finalDocuments array
+    // Preserve existing documents with different filenames (e.g., PDF when uploading Excel)
+    let updatedFinalDocuments: FinalDocumentInfo[] = [];
+
+    if (document.finalDocuments && document.finalDocuments.length > 0) {
+      // Filter out any document with the same filename (we're replacing it)
+      updatedFinalDocuments = document.finalDocuments.filter(
+        (fd) => fd.fileName !== file.name
+      );
+    }
+
+    // Add the new final document
+    updatedFinalDocuments.push(newFinalDoc);
+
+    // Also migrate legacy final document if it exists and has different filename
+    if (
+      document.finalFileName &&
+      document.finalStoragePath &&
+      document.finalDownloadUrl &&
+      document.finalFileName !== file.name &&
+      !updatedFinalDocuments.some((fd) => fd.fileName === document.finalFileName)
+    ) {
+      const legacyExt = document.finalFileName.toLowerCase().split('.').pop() || '';
+      const legacyContentType = getContentType(document.finalFileName);
+      updatedFinalDocuments.push({
+        id: crypto.randomUUID(),
+        fileName: document.finalFileName,
+        storagePath: document.finalStoragePath,
+        downloadUrl: document.finalDownloadUrl,
+        contentType: legacyContentType,
+        fileExtension: legacyExt,
+        uploadedAt: document.finalizedAt || now,
+        note: 'Migrated from legacy final document',
+      });
+    }
+
+    // Update document with final version info and status
+    const updateData: any = {
+      // Legacy fields for backward compatibility (set to the most recently uploaded)
+      finalStoragePath: uploadResult.finalStoragePath,
+      finalDownloadUrl: uploadResult.finalDownloadUrl,
+      finalFileName: file.name,
+      // New array-based storage
+      finalDocuments: updatedFinalDocuments,
+      updatedAt: now,
+    };
+
+    // Determine file type for status
+    const fileExtension = file.name.toLowerCase().split('.').pop() || '';
+    const isPdf = fileExtension === 'pdf';
+    const newStatus: DocumentStatus = isPdf ? 'pdf-uploaded' : 'excel-uploaded';
+    const statusNote = note || (isPdf ? 'PDF uploaded' : 'Excel uploaded');
+
+    // Update status if transitioning from generated
+    if (currentStatus === 'generated') {
+      updateData.status = newStatus;
+      updateData.finalizedAt = now;
+      updateData.statusHistory = addStatusToHistory(
+        document.statusHistory || [],
+        newStatus,
+        statusNote
+      );
+    } else {
+      // Just add to history for re-uploads
+      updateData.statusHistory = addStatusToHistory(
+        document.statusHistory || [],
+        newStatus,
+        statusNote
+      );
+    }
+
+    await setDoc(documentRef, updateData, { merge: true });
+
+    return uploadResult;
+  } catch (e) {
+    console.error('Error uploading final document:', e);
+    throw e;
+  }
+}
+
+/**
+ * Mark document as sent to client
+ */
+export async function markDocumentSent(
+  userEmail: string,
+  documentId: string,
+  note?: string
+): Promise<void> {
+  return updateDocumentStatus(userEmail, documentId, 'sent', note || 'Sent to client');
+}
+
+/**
+ * Mark invoice as paid
+ * Only valid for invoice documents
+ */
+export async function markInvoicePaid(
+  userEmail: string,
+  documentId: string,
+  note?: string
+): Promise<void> {
+  return updateDocumentStatus(userEmail, documentId, 'paid', note || 'Invoice paid');
+}
+
+/**
+ * Get status history for a document
+ */
+export async function getDocumentStatusHistory(
+  userEmail: string,
+  documentId: string
+): Promise<StatusHistoryEntry[]> {
+  try {
+    const document = await getDocumentById(documentId);
+
+    if (!document) {
+      throw new Error('Document not found');
+    }
+
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to view this document');
+    }
+
+    return document.statusHistory || [];
+  } catch (e) {
+    console.error('Error fetching document status history:', e);
+    throw e;
+  }
+}
+
+/**
+ * Delete a final version of a document
+ * Removes the final file and clears final version fields
+ */
+export async function deleteFinalDocumentVersion(
+  userEmail: string,
+  documentId: string
+): Promise<void> {
+  try {
+    const documentRef = doc(db, COLLECTIONS.DOCUMENTS, documentId);
+    const documentSnap = await getDoc(documentRef);
+
+    if (!documentSnap.exists()) {
+      throw new Error('Document not found');
+    }
+
+    const document = documentSnap.data() as Document;
+
+    if (document.userEmail !== userEmail) {
+      throw new Error('Not authorized to update this document');
+    }
+
+    // Delete the final file from storage
+    if (document.finalStoragePath) {
+      try {
+        await deleteFinalDocument(document.finalStoragePath);
+      } catch (e) {
+        console.warn('Failed to delete final file from storage:', e);
+      }
+    }
+
+    // Clear final version fields and revert status to generated
+    const updateData: any = {
+      finalStoragePath: deleteField(),
+      finalDownloadUrl: deleteField(),
+      finalFileName: deleteField(),
+      finalizedAt: deleteField(),
+      status: 'generated',
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Add history entry
+    updateData.statusHistory = addStatusToHistory(
+      document.statusHistory || [],
+      'generated',
+      'Final version deleted, reverted to generated'
+    );
+
+      // Clear ALL final version fields and revert status to generated
+      updateData.finalStoragePath = deleteField();
+      updateData.finalDownloadUrl = deleteField();
+      updateData.finalFileName = deleteField();
+      updateData.finalPdfStoragePath = deleteField();
+      updateData.finalPdfDownloadUrl = deleteField();
+      updateData.finalPdfFileName = deleteField();
+      updateData.finalExcelStoragePath = deleteField();
+      updateData.finalExcelDownloadUrl = deleteField();
+      updateData.finalExcelFileName = deleteField();
+      updateData.finalizedAt = deleteField();
+      updateData.status = 'generated';
+
+    await setDoc(documentRef, updateData, { merge: true });
+  } catch (e) {
+    console.error('Error deleting final document version:', e);
     throw e;
   }
 }
@@ -807,7 +1264,63 @@ export async function deleteDocumentById(
   id: string
 ): Promise<void> {
   try {
-    await deleteDoc(doc(db, collectionName, id));
+    // First, fetch the document to get storage paths
+    const docRef = doc(db, collectionName, id);
+    const docSnap = await getDoc(docRef);
+    
+    if (!docSnap.exists()) {
+      throw new Error(`Document ${id} not found in ${collectionName}`);
+    }
+    
+    const docData = docSnap.data();
+    
+    // Delete associated files from storage
+    const storageDeletionErrors: Error[] = [];
+    
+    // 1. Delete generated document file (storagePath)
+    if (docData.storagePath) {
+      try {
+        await deleteDocumentFile(docData.storagePath);
+        console.log(`Deleted storage file: ${docData.storagePath}`);
+      } catch (error) {
+        console.warn(`Error deleting storage file ${docData.storagePath}:`, error);
+        storageDeletionErrors.push(error as Error);
+      }
+    }
+    
+    // 2. Delete legacy final document (finalStoragePath)
+    if (docData.finalStoragePath) {
+      try {
+        await deleteFinalDocument(docData.finalStoragePath);
+        console.log(`Deleted legacy final document: ${docData.finalStoragePath}`);
+      } catch (error) {
+        console.warn(`Error deleting legacy final document ${docData.finalStoragePath}:`, error);
+        storageDeletionErrors.push(error as Error);
+      }
+    }
+    
+    // 3. Delete all final documents in the finalDocuments array
+    if (docData.finalDocuments && Array.isArray(docData.finalDocuments)) {
+      for (const finalDoc of docData.finalDocuments) {
+        if (finalDoc.storagePath) {
+          try {
+            await deleteFinalDocument(finalDoc.storagePath);
+            console.log(`Deleted final document: ${finalDoc.storagePath}`);
+          } catch (error) {
+            console.warn(`Error deleting final document ${finalDoc.storagePath}:`, error);
+            storageDeletionErrors.push(error as Error);
+          }
+        }
+      }
+    }
+    
+    // Finally, delete the Firestore document
+    await deleteDoc(docRef);
+    
+    // Log if there were any storage deletion errors, but don't fail the operation
+    if (storageDeletionErrors.length > 0) {
+      console.warn(`Document deleted but ${storageDeletionErrors.length} storage file(s) could not be deleted`);
+    }
   } catch (e) {
     console.error(`Error deleting document from ${collectionName}:`, e);
     throw e;
