@@ -53,6 +53,8 @@ import {
 } from '../services/storage';
 import { saveDocument } from '../services/db';
 import type { Template } from '../types';
+import { StatusBadge } from './DocumentStatus';
+import { getEffectiveStatus } from '../utils/documentStatus';
 import {
   migrateDocuments,
   previewMigration,
@@ -379,18 +381,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   useEffect(() => {
     loadCollection(selectedCollection);
   }, [selectedCollection, userEmail]);
-
-  // Auto-refresh data periodically to keep status in sync with other components
-  useEffect(() => {
-    const refreshInterval = setInterval(() => {
-      // Only refresh if not currently loading and component is visible
-      if (!loading && document.visibilityState === 'visible') {
-        loadCollection(selectedCollection);
-      }
-    }, 10000); // Refresh every 10 seconds
-
-    return () => clearInterval(refreshInterval);
-  }, [selectedCollection, loading]);
 
   // Load storage files for documents to show ALL files in each folder
   // Construct folder path from document metadata (client, month, type) to ensure consistency
@@ -1446,72 +1436,9 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                             return storageFilesMap.get(folderPath) || [];
                           })();
 
-                          // Get latest status with date for tag
-                          const statusHistory = doc.data.statusHistory as Array<{status: string; timestamp: string}> | undefined;
-                          const currentStatus = doc.data.status as string | undefined;
-                          const formatStatusLabel = (status: string): string => {
-                            switch (status) {
-                              case 'excel-uploaded': return 'Excel Uploaded';
-                              case 'pdf-uploaded': return 'PDF Uploaded';
-                              case 'final': return 'Uploaded';
-                              default: return status.charAt(0).toUpperCase() + status.slice(1);
-                            }
-                          };
-                          let statusTagText = '';
-                          // First check if we have files to determine status from
-                          const hasFiles = storageFiles.length > 0 || doc.data.storagePath || doc.data.finalDocuments?.length > 0;
-                          const hasPdf = storageFiles.some(f => f.name.toLowerCase().endsWith('.pdf')) ||
-                            doc.data.finalDocuments?.some((fd: any) => fd.fileName?.toLowerCase().endsWith('.pdf'));
-                          const hasExcel = storageFiles.some(f => f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.xls')) ||
-                            doc.data.finalDocuments?.some((fd: any) => fd.fileName?.toLowerCase().match(/\.(xlsx|xls)$/));
-                          
-                          if (statusHistory && statusHistory.length > 0) {
-                            const latest = statusHistory[statusHistory.length - 1];
-                            const statusLabel = formatStatusLabel(latest.status);
-                            const statusDate = format(new Date(latest.timestamp), 'MMM d, HH:mm');
-                            statusTagText = `${statusLabel} • ${statusDate}`;
-                          } else if (currentStatus && !hasFiles) {
-                            // Only use currentStatus if no files exist
-                            statusTagText = formatStatusLabel(currentStatus);
-                          } else if (hasFiles) {
-                            // Document has files - prioritize PDF status if PDF exists
-                            if (hasPdf) {
-                              statusTagText = 'PDF Uploaded';
-                            } else if (hasExcel) {
-                              statusTagText = 'Excel Uploaded';
-                            } else if (doc.data.finalDocuments?.length > 0 || doc.data.finalStoragePath) {
-                              statusTagText = 'Uploaded';
-                            } else {
-                              statusTagText = 'Generated';
-                            }
-                          } else if (currentStatus) {
-                            statusTagText = formatStatusLabel(currentStatus);
-                          }
-
-                          const statusColors: Record<string, string> = {
-                            generated: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300',
-                            'excel-uploaded': 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
-                            'pdf-uploaded': 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300',
-                            sent: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
-                            paid: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300',
-                            uploaded: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300',
-                          };
-                          let currentStatusKey = statusHistory?.[statusHistory.length - 1]?.status;
-                          if (!currentStatusKey && hasFiles) {
-                            // Determine status from storage files (prioritize PDF over stored status)
-                            if (hasPdf) {
-                              currentStatusKey = 'pdf-uploaded';
-                            } else if (hasExcel) {
-                              currentStatusKey = 'excel-uploaded';
-                            } else if (doc.data.finalDocuments?.length > 0 || doc.data.finalStoragePath) {
-                              currentStatusKey = 'uploaded';
-                            } else {
-                              currentStatusKey = 'generated';
-                            }
-                          } else if (!currentStatusKey) {
-                            currentStatusKey = currentStatus || 'generated';
-                          }
-                          const statusColorClass = statusColors[currentStatusKey] || statusColors.generated;
+                          // Use shared getEffectiveStatus utility for consistent status display
+                          const effectiveStatus = getEffectiveStatus(doc.data as any);
+                          const statusTimestamp = doc.data.paidAt || doc.data.sentAt || doc.data.finalizedAt || doc.data.generatedAt;
 
                           return (
                             <>
@@ -1522,9 +1449,7 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                                 <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${typeColors[type] || typeColors.document}`}>
                                   {type === 'workRecord' ? 'Work Record' : type.charAt(0).toUpperCase() + type.slice(1)}
                                 </span>
-                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium shrink-0 ${statusColorClass}`}>
-                                  {statusTagText}
-                                </span>
+                                <StatusBadge status={effectiveStatus} size="sm" timestamp={statusTimestamp} />
                                 {storageFiles.length > 1 && (
                                   <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300">
                                     {storageFiles.length} files
