@@ -1804,8 +1804,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                         generated: 'bg-blue-500',
                         'excel-uploaded': 'bg-purple-500',
                         'pdf-uploaded': 'bg-indigo-500',
-                        sent: 'bg-amber-500',
-                        paid: 'bg-emerald-500',
+                        sent: 'bg-green-500',
+                        paid: 'bg-green-600',
                       };
                       const color = statusColors[entry.status] || 'bg-slate-500';
                       const displayStatus = formatStatusLabel(entry.status);
