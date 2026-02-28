@@ -380,6 +380,18 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     loadCollection(selectedCollection);
   }, [selectedCollection, userEmail]);
 
+  // Auto-refresh data periodically to keep status in sync with other components
+  useEffect(() => {
+    const refreshInterval = setInterval(() => {
+      // Only refresh if not currently loading and component is visible
+      if (!loading && document.visibilityState === 'visible') {
+        loadCollection(selectedCollection);
+      }
+    }, 10000); // Refresh every 10 seconds
+
+    return () => clearInterval(refreshInterval);
+  }, [selectedCollection, loading]);
+
   // Load storage files for documents to show ALL files in each folder
   // Construct folder path from document metadata (client, month, type) to ensure consistency
   // Files are now organized in type-specific subfolders: {client}/{month}/{type}/
