@@ -2197,7 +2197,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                               const cleanFileName = rawFileName.replace(/(-\d{10,})\.pdf$/i, '.pdf');
                                               
                                               // Try File System Access API first (forces save dialog, no preview)
-                                              const fileNameWithoutExt = cleanFileName.replace(/\.pdf$/i, '');
+                                              let downloaded = false;
                                               if ('showSaveFilePicker' in window) {
                                                 try {
                                                   const handle = await (window as any).showSaveFilePicker({
@@ -2210,44 +2210,29 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                                                   const writable = await handle.createWritable();
                                                   await writable.write(blob);
                                                   await writable.close();
+                                                  downloaded = true;
                                                 } catch (err: any) {
-                                                  // User cancelled or API failed, fall through to anchor method
-                                                  if (err.name !== 'AbortError') {
-                                                    console.log('File System Access API failed, using fallback:', err);
+                                                  // If user cancels, stop silently (don't preview)
+                                                  if (err?.name === 'AbortError') {
+                                                    downloaded = true;
+                                                  } else {
+                                                    console.log('File System Access API failed, using anchor fallback:', err);
                                                   }
-                                                  throw err; // Trigger fallback
                                                 }
-                                              } else {
-                                                // Fallback: Use anchor element with proper attributes
+                                              }
+
+                                              // Fallback: Use blob + anchor download (never preview by default)
+                                              if (!downloaded) {
                                                 const blobUrl = window.URL.createObjectURL(blob);
-                                                
-                                                // Create a temporary container div
-                                                const container = document.createElement('div');
-                                                container.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
-                                                document.body.appendChild(container);
-                                                
-                                                // Create anchor element
                                                 const a = document.createElement('a');
                                                 a.href = blobUrl;
                                                 a.download = cleanFileName;
-                                                // These attributes help prevent preview
-                                                a.type = 'application/pdf';
-                                                a.setAttribute('data-downloadurl', `application/pdf:${cleanFileName}:${blobUrl}`);
-                                                container.appendChild(a);
-                                                
-                                                // Programmatic click
-                                                const evt = new MouseEvent('click', {
-                                                  bubbles: false,
-                                                  cancelable: true,
-                                                  view: window
-                                                });
-                                                a.dispatchEvent(evt);
-                                                
-                                                // Cleanup
-                                                setTimeout(() => {
-                                                  document.body.removeChild(container);
-                                                  window.URL.revokeObjectURL(blobUrl);
-                                                }, 100);
+                                                a.rel = 'noopener noreferrer';
+                                                a.style.display = 'none';
+                                                document.body.appendChild(a);
+                                                a.click();
+                                                a.remove();
+                                                setTimeout(() => window.URL.revokeObjectURL(blobUrl), 250);
                                               }
                                             } catch (err) {
                                               console.error('Download failed:', err);

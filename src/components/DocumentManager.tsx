@@ -1710,16 +1710,35 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                                     <button
                                       onClick={async () => {
                                         try {
-                                          const { downloadFinalDocument } = await import('../services/storage');
-                                          const blob = await downloadFinalDocument(file.fullPath);
-                                          const url = URL.createObjectURL(blob);
-                                          const link = document.createElement('a');
-                                          link.href = url;
-                                          link.download = file.name;
-                                          document.body.appendChild(link);
-                                          link.click();
-                                          document.body.removeChild(link);
-                                          URL.revokeObjectURL(url);
+                                          // Prefer direct download URL first to avoid XHR/CORS issues
+                                          // from Firebase Storage SDK download calls on web.app origins.
+                                          if (file.downloadUrl) {
+                                            const link = document.createElement('a');
+                                            link.href = file.downloadUrl;
+                                            link.download = file.name;
+                                            link.rel = 'noopener noreferrer';
+                                            link.style.display = 'none';
+                                            document.body.appendChild(link);
+                                            link.click();
+                                            link.remove();
+                                          } else {
+                                            // Fallback: SDK blob download
+                                            const { downloadFinalDocument } = await import('../services/storage');
+                                            const blob = await downloadFinalDocument(file.fullPath);
+                                            const url = URL.createObjectURL(blob);
+                                            const link = document.createElement('a');
+                                            link.href = url;
+                                            link.download = file.name;
+                                            link.rel = 'noopener noreferrer';
+                                            link.style.display = 'none';
+                                            document.body.appendChild(link);
+                                            link.click();
+                                            // Delay cleanup so browser has time to start the download
+                                            setTimeout(() => {
+                                              link.remove();
+                                              URL.revokeObjectURL(url);
+                                            }, 300);
+                                          }
                                         } catch (err) {
                                           console.error('Error downloading file:', err);
                                           alert('Failed to download file');

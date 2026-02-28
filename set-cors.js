@@ -9,7 +9,14 @@ const BUCKET_NAME = 'smart-invoice-16f95.firebasestorage.app';
 
 const corsConfiguration = [
   {
-    origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000'],
+    origin: [
+      'http://localhost:3000',
+      'http://localhost:5173',
+      'http://localhost:4173',
+      'http://127.0.0.1:3000',
+      'https://smart-invoice-16f95.web.app',
+      'https://smart-invoice-16f95.firebaseapp.com',
+    ],
     method: ['GET', 'POST', 'PUT', 'DELETE', 'HEAD'],
     maxAgeSeconds: 3600,
     responseHeader: ['Content-Type', 'Authorization', 'x-goog-resumable', 'Content-Disposition'],
