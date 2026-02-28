@@ -389,6 +389,21 @@ export async function saveWorkRecord(
 
 export async function deleteWorkRecord(id: string): Promise<void> {
   try {
+    const safeDeleteDoc = async (ref: DocumentReference, context: string): Promise<boolean> => {
+      try {
+        await deleteDoc(ref);
+        return true;
+      } catch (err: any) {
+        // Legacy/mixed-ownership data can cause permission-denied on related docs.
+        // Keep deleting what we can, and only fail hard on the primary work record.
+        if (err?.code === 'permission-denied') {
+          console.warn(`[deleteWorkRecord] Skipping ${context} due to permission-denied`, err);
+          return false;
+        }
+        throw err;
+      }
+    };
+
     // First delete all associated documents and their storage files
     const documentsSnapshot = await getDocs(
       query(collection(db, COLLECTIONS.DOCUMENTS), where('workRecordId', '==', id))
@@ -434,17 +449,28 @@ export async function deleteWorkRecord(id: string): Promise<void> {
       }
     }
     
-    // Then delete the Firestore document records
-    await Promise.all(documentsSnapshot.docs.map(d => deleteDoc(d.ref)));
+    // Then delete the Firestore document records (best-effort)
+    await Promise.all(
+      documentsSnapshot.docs.map((d) => safeDeleteDoc(d.ref, `document ${d.id}`))
+    );
     
     // Delete associated timesheet configuration
     const timesheetSnapshot = await getDocs(
       query(collection(db, COLLECTIONS.TIMESHEETS), where('workRecordId', '==', id))
     );
-    await Promise.all(timesheetSnapshot.docs.map(d => deleteDoc(d.ref)));
+    await Promise.all(
+      timesheetSnapshot.docs.map((d) => safeDeleteDoc(d.ref, `timesheet ${d.id}`))
+    );
 
     // Finally delete the work record
-    await deleteDoc(doc(db, COLLECTIONS.WORK_RECORDS, id));
+    const deletedMain = await safeDeleteDoc(
+      doc(db, COLLECTIONS.WORK_RECORDS, id),
+      `workRecord ${id}`
+    );
+
+    if (!deletedMain) {
+      throw new Error('Permission denied while deleting the work record');
+    }
     
     console.log(`Successfully deleted work record ${id} and all associated documents/files`);
   } catch (e) {
@@ -1269,7 +1295,7 @@ export async function saveTimesheet(
   existingId?: string
 ): Promise<WorkRecordTimesheet> {
   try {
-    const id = existingId || crypto.randomUUID();
+    let id = existingId || crypto.randomUUID();
     const now = new Date().toISOString();
 
     // Clean undefined values for Firestore
@@ -1288,7 +1314,29 @@ export async function saveTimesheet(
     };
 
     const timesheetRef = doc(db, COLLECTIONS.TIMESHEETS, id);
-    await setDoc(timesheetRef, timesheetData, { merge: true });
+
+    try {
+      await setDoc(timesheetRef, timesheetData, { merge: true });
+    } catch (err: any) {
+      // Legacy fallback:
+      // If updating an existing doc fails due to permission issues
+      // (e.g. legacy/malformed ownership fields), create a fresh doc.
+      if (existingId && err?.code === 'permission-denied') {
+        console.warn(
+          '[saveTimesheet] Permission denied updating existing timesheet. Creating a new timesheet document instead.',
+          { existingId }
+        );
+
+        id = crypto.randomUUID();
+        const fallbackRef = doc(db, COLLECTIONS.TIMESHEETS, id);
+        await setDoc(fallbackRef, {
+          ...timesheetData,
+          createdAt: now,
+        }, { merge: true });
+      } else {
+        throw err;
+      }
+    }
 
     return { ...timesheetData, id };
   } catch (e) {

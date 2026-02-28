@@ -12,8 +12,9 @@ service cloud.firestore {
     }
     
     // Helper function to check ownership (only userEmail)
+    // Allow if userEmail matches OR if userEmail is missing (legacy)
     function isOwner(data) {
-      return isOwnerByEmail(data.userEmail);
+      return data.get('userEmail', null) == null || isOwnerByEmail(data.userEmail);
     }
     
     // Clients collection
