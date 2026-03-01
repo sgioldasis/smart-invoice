@@ -296,8 +296,25 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       (sum, wr) => sum + wr.workingDays.length,
       0
     );
-    return { totalRecords, totalDays };
-  }, [filteredRecords]);
+    
+    // Count unique work records that have invoices
+    const invoiceCount = new Set(
+      invoices
+        .filter((inv) => inv.type === 'invoice')
+        .filter((inv) => filteredRecords.some((wr) => wr.id === inv.workRecordId))
+        .map((inv) => inv.workRecordId)
+    ).size;
+    
+    // Count unique work records that have timesheets
+    const timesheetCount = new Set(
+      invoices
+        .filter((inv) => inv.type === 'timesheet')
+        .filter((inv) => filteredRecords.some((wr) => wr.id === inv.workRecordId))
+        .map((inv) => inv.workRecordId)
+    ).size;
+    
+    return { totalRecords, totalDays, invoiceCount, timesheetCount };
+  }, [filteredRecords, invoices]);
 
   // ============================================
   // Effects
@@ -2049,7 +2066,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
           <div className="flex items-center gap-2 text-slate-600 dark:text-slate-400 text-sm mb-1">
             <Briefcase size={16} />
-            Total Records
+            Total Work Records
           </div>
           <div className="text-2xl font-bold text-slate-900 dark:text-white">
             {stats.totalRecords}
@@ -2070,7 +2087,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             Invoices
           </div>
           <div className="text-2xl font-bold text-slate-900 dark:text-white">
-            {new Set(invoices.filter((inv) => inv.type === 'invoice').map((inv) => inv.workRecordId)).size}
+            {stats.invoiceCount}
           </div>
         </div>
         <div className="bg-white dark:bg-slate-800 p-4 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
@@ -2079,7 +2096,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             Timesheets
           </div>
           <div className="text-2xl font-bold text-slate-900 dark:text-white">
-            {new Set(invoices.filter((inv) => inv.type === 'timesheet').map((inv) => inv.workRecordId)).size}
+            {stats.timesheetCount}
           </div>
         </div>
       </div>
