@@ -164,6 +164,17 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     return new Date(year, month + 1, 0).getDate();
   };
 
+  // Format month string (e.g., "2026-02") to display name (e.g., "February 2026")
+  const formatMonthYear = (monthStr: string): string => {
+    try {
+      const [year, month] = monthStr.split('-');
+      const date = new Date(parseInt(year), parseInt(month) - 1, 1);
+      return format(date, 'MMMM yyyy');
+    } catch {
+      return monthStr;
+    }
+  };
+
   // Update default filename when record or template changes
   useEffect(() => {
     if (timesheetRecord && timesheetClient) {
@@ -248,8 +259,10 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       filtered = filtered.filter((wr) => {
         const client = clientMap.get(wr.clientId) as Client | undefined;
         const clientName = client?.name.toLowerCase() || '';
-        const month = wr.month.toLowerCase();
-        return clientName.includes(query) || month.includes(query);
+        // Search both display name ("february 2026") and raw format ("2026-02")
+        const monthDisplay = formatMonthYear(wr.month).toLowerCase();
+        const monthRaw = wr.month.toLowerCase();
+        return clientName.includes(query) || monthDisplay.includes(query) || monthRaw.includes(query);
       });
     }
 
@@ -258,14 +271,15 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   }, [workRecords, selectedClientId, searchQuery, clients]);
 
   const groupedByMonth = useMemo(() => {
-    const groups: Record<string, WorkRecord[]> = {};
+    const groups: Record<string, { records: WorkRecord[]; uniqueClients: Set<string> }> = {};
     console.log('[WorkRecordList] Grouping records:', filteredRecords.length);
     filteredRecords.forEach((wr, idx) => {
       console.log(`[WorkRecordList] Record ${idx}:`, { id: wr.id, month: wr.month, clientId: wr.clientId });
       if (!groups[wr.month]) {
-        groups[wr.month] = [];
+        groups[wr.month] = { records: [], uniqueClients: new Set() };
       }
-      groups[wr.month].push(wr);
+      groups[wr.month].records.push(wr);
+      groups[wr.month].uniqueClients.add(wr.clientId);
     });
     return groups;
   }, [filteredRecords]);
@@ -393,24 +407,26 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   };
 
   const handleDeleteConfirm = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget || isDeleting) return;
 
-    setShowDeleteModal(false);
     setIsDeleting(deleteTarget.id);
     try {
       await deleteWorkRecord(deleteTarget.id);
       setWorkRecords((prev) => prev.filter((wr) => wr.id !== deleteTarget.id));
+      // Close modal only after successful deletion
+      setShowDeleteModal(false);
+      setDeleteTarget(null);
+      setDeleteDocuments([]);
     } catch (error) {
       console.error('Error deleting work record:', error);
       alert('Failed to delete work record');
     } finally {
       setIsDeleting(null);
-      setDeleteTarget(null);
-      setDeleteDocuments([]);
     }
   };
 
   const handleDeleteCancel = () => {
+    if (isDeleting) return; // Prevent cancel while deleting
     setShowDeleteModal(false);
     setDeleteTarget(null);
     setDeleteDocuments([]);
@@ -1965,16 +1981,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     }
   };
 
-  const formatMonthYear = (monthStr: string): string => {
-    try {
-      const [year, month] = monthStr.split('-');
-      const date = new Date(parseInt(year), parseInt(month) - 1, 1);
-      return format(date, 'MMMM yyyy');
-    } catch {
-      return monthStr;
-    }
-  };
-
   const getClientName = (clientId: string): string => {
     return clients.find((c) => c.id === clientId)?.name || 'Unknown Client';
   };
@@ -2080,7 +2086,13 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
 
       {/* Filters */}
       <div className="flex flex-col sm:flex-row gap-4 mb-6">
-        <div className="relative flex-1">
+        <form
+          className="relative flex-1"
+          onSubmit={(e) => {
+            e.preventDefault();
+            // Search is already applied via onChange, this just prevents form submission
+          }}
+        >
           <Search
             size={18}
             className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
@@ -2092,7 +2104,7 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-10 pr-4 py-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
           />
-        </div>
+        </form>
         <select
           value={selectedClientId}
           onChange={(e) => setSelectedClientId(e.target.value)}
@@ -2158,14 +2170,14 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                     {formatMonthYear(month)}
                   </h3>
                   <span className="text-sm text-slate-500 dark:text-slate-400">
-                    ({groupedByMonth[month].length} records)
+                    ({groupedByMonth[month].uniqueClients.size} {groupedByMonth[month].uniqueClients.size === 1 ? 'client' : 'clients'})
                   </span>
                 </div>
               </div>
 
               {/* Records for this month */}
               <div className="divide-y divide-slate-100 dark:divide-slate-700">
-                {groupedByMonth[month].map((record) => {
+                {groupedByMonth[month].records.map((record) => {
                   const client = clients.find((c) => c.id === record.clientId);
                   const invoice = getInvoiceForRecord(record.id);
                   const timesheet = getTimesheetForRecord(record.id);
@@ -2989,8 +3001,12 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       <DeleteConfirmationModal
         isOpen={showDeleteModal}
         title="Confirm Deletion"
-        message="This work record has associated documents that will also be deleted:"
+        message={deleteDocuments.length > 0
+          ? "This work record has associated documents that will also be deleted:"
+          : "Are you sure you want to delete this work record?"}
         documents={deleteDocuments}
+        isLoading={!!isDeleting}
+        loadingMessage="Deleting work record and associated documents..."
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
       />
