@@ -46,6 +46,8 @@ import { getClients, getWorkRecords, deleteWorkRecord, getDocuments, saveDocumen
 import { getDocumentDownloadUrl } from '../services/storage';
 import { processTimesheetPromptSmart } from '../services/ai';
 import { hasFinalVersion, canMarkAsFinal, canMarkAsSent, canMarkAsPaid, getEffectiveDownloadUrl, STATUS_METADATA, getEffectiveStatus } from '../utils/documentStatus';
+import { UploadProgressModal, useUploadProgressModal } from './UploadProgressModal';
+import { DeleteConfirmationModal, DeleteDocument } from './DeleteConfirmationModal';
 
 interface WorkRecordListProps {
   userEmail: string;
@@ -68,10 +70,26 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   const [isLoading, setIsLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
-  const [uploadingRecordId, setUploadingRecordId] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [selectedClientId, setSelectedClientId] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Upload progress modal
+  const uploadProgressModal = useUploadProgressModal();
+
+  // Pending upload state for confirmation
+  const [pendingUpload, setPendingUpload] = useState<{
+    file: File;
+    record: WorkRecord;
+    client: Client;
+    targetType: 'invoice' | 'timesheet';
+    targetDocumentId: string;
+    isPdf: boolean;
+  } | null>(null);
+
+  // Delete confirmation modal state
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<WorkRecord | null>(null);
+  const [deleteDocuments, setDeleteDocuments] = useState<DeleteDocument[]>([]);
 
   // Dropdown menu state for document actions
   const [openDropdown, setOpenDropdown] = useState<{ type: 'invoice' | 'timesheet'; recordId: string } | null>(null);
@@ -318,34 +336,84 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
   // Handlers
   // ============================================
 
-  const handleDelete = async (record: WorkRecord) => {
+  const handleDelete = (record: WorkRecord) => {
     // Check for associated documents
     const invoice = getInvoiceForRecord(record.id);
     const timesheet = getTimesheetForRecord(record.id);
 
-    const associatedDocs: string[] = [];
-    if (invoice) associatedDocs.push(`Invoice: ${invoice.fileName || invoice.documentNumber || 'unnamed'}`);
-    if (timesheet) associatedDocs.push(`Timesheet: ${timesheet.fileName || timesheet.documentNumber || 'unnamed'}`);
-
-    let confirmMessage = 'Are you sure you want to delete this work record?';
-    if (associatedDocs.length > 0) {
-      confirmMessage = `\n⚠️ Warning: This work record has associated documents that will also be deleted:\n\n${associatedDocs.map(d => `  • ${d}`).join('\n')}\n\nAre you sure you want to delete this work record and all its associated documents?\n`;
+    const docs: DeleteDocument[] = [];
+    
+    // Add invoice section
+    if (invoice) {
+      const invoiceFiles: string[] = [];
+      // Add the main generated file
+      if (invoice.fileName) {
+        invoiceFiles.push(invoice.fileName);
+      }
+      // Add any final uploaded documents (PDFs, Excel files)
+      if (invoice.finalDocuments && invoice.finalDocuments.length > 0) {
+        invoice.finalDocuments.forEach((fd) => {
+          const fileName = fd.fileName || `final-version.${fd.fileExtension}`;
+          // Only add if not already in the list
+          if (!invoiceFiles.includes(fileName)) {
+            invoiceFiles.push(fileName);
+          }
+        });
+      }
+      if (invoiceFiles.length > 0) {
+        docs.push({ type: 'Invoice', files: invoiceFiles });
+      }
+    }
+    
+    // Add timesheet section
+    if (timesheet) {
+      const timesheetFiles: string[] = [];
+      // Add the main generated file
+      if (timesheet.fileName) {
+        timesheetFiles.push(timesheet.fileName);
+      }
+      // Add any final uploaded documents (PDFs, Excel files)
+      if (timesheet.finalDocuments && timesheet.finalDocuments.length > 0) {
+        timesheet.finalDocuments.forEach((fd) => {
+          const fileName = fd.fileName || `final-version.${fd.fileExtension}`;
+          // Only add if not already in the list
+          if (!timesheetFiles.includes(fileName)) {
+            timesheetFiles.push(fileName);
+          }
+        });
+      }
+      if (timesheetFiles.length > 0) {
+        docs.push({ type: 'Timesheet', files: timesheetFiles });
+      }
     }
 
-    if (!confirm(confirmMessage)) {
-      return;
-    }
+    setDeleteTarget(record);
+    setDeleteDocuments(docs);
+    setShowDeleteModal(true);
+  };
 
-    setIsDeleting(record.id);
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+
+    setShowDeleteModal(false);
+    setIsDeleting(deleteTarget.id);
     try {
-      await deleteWorkRecord(record.id);
-      setWorkRecords((prev) => prev.filter((wr) => wr.id !== record.id));
+      await deleteWorkRecord(deleteTarget.id);
+      setWorkRecords((prev) => prev.filter((wr) => wr.id !== deleteTarget.id));
     } catch (error) {
       console.error('Error deleting work record:', error);
       alert('Failed to delete work record');
     } finally {
       setIsDeleting(null);
+      setDeleteTarget(null);
+      setDeleteDocuments([]);
     }
+  };
+
+  const handleDeleteCancel = () => {
+    setShowDeleteModal(false);
+    setDeleteTarget(null);
+    setDeleteDocuments([]);
   };
 
   const handleEdit = (clientId: string, month: string) => {
@@ -645,14 +713,14 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       return;
     }
 
-    try {
-      setUploadingRecordId(record.id);
-      setUploadProgress(0);
-      console.log('[handleFinalUpload] Starting upload for record:', record.id, 'client:', client.name, 'targetDoc:', targetDocumentId);
+    // Open the blocking upload progress modal
+    uploadProgressModal.openUpload(file.name);
+    console.log('[handleFinalUpload] Starting upload for record:', record.id, 'client:', client.name, 'targetDoc:', targetDocumentId);
 
+    try {
       // Progress callback
       const onProgress = (progress: number) => {
-        setUploadProgress(progress);
+        uploadProgressModal.setProgress(progress);
       };
 
       // If a specific document ID is provided, only upload to that document
@@ -684,11 +752,15 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
         // If no existing documents, show message
         if (!existingInvoice && !existingTimesheet) {
           console.log('[handleFinalUpload] No existing documents found');
+          uploadProgressModal.closeUpload();
           alert('Please generate an invoice or timesheet first before uploading a final version.');
           e.target.value = '';
           return;
         }
       }
+
+      // Set processing state while refreshing
+      uploadProgressModal.setProcessing('Finalizing...');
 
       // Refresh documents list
       console.log('[handleFinalUpload] Refreshing documents...');
@@ -696,20 +768,94 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
       console.log('[handleFinalUpload] Documents refreshed, count:', updatedDocs.length);
       setInvoices(updatedDocs);
 
-      alert(`Final version uploaded successfully: ${file.name}`);
+      // Determine file format for success message
+      const isExcel = file.name.toLowerCase().endsWith('.xlsx') || file.name.toLowerCase().endsWith('.xls');
+      const isPdf = file.name.toLowerCase().endsWith('.pdf');
+
+      // Show success state with details
+      uploadProgressModal.setSuccess({
+        documentType: targetDocumentId ? 'Document' : 'Invoice / Timesheet',
+        fileFormat: isPdf ? 'PDF' : isExcel ? 'Excel' : 'File',
+        fileName: file.name,
+      });
+
+      // Wait longer so user can see success state and details
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      uploadProgressModal.closeUpload();
     } catch (err) {
       console.error('[handleFinalUpload] Failed to upload final version:', err);
-      alert('Failed to upload final version. Please try again. Error: ' + (err instanceof Error ? err.message : String(err)));
+      uploadProgressModal.setError('Failed to upload. Please try again.');
+      // Keep modal open briefly so user can see error
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      uploadProgressModal.closeUpload();
     } finally {
-      setUploadingRecordId(null);
-      setUploadProgress(0);
       e.target.value = '';
     }
   };
 
   /**
+   * Execute the upload after confirmation
+   */
+  const executeUpload = async () => {
+    if (!pendingUpload) return;
+
+    const { file, record, client, targetDocumentId, isPdf } = pendingUpload;
+    const fileName = file.name;
+
+    // Close confirm dialog and open upload modal
+    uploadProgressModal.openUpload(file.name);
+
+    try {
+      // Progress callback
+      const onProgress = (progress: number) => {
+        uploadProgressModal.setProgress(progress);
+      };
+
+      console.log('[executeUpload] Uploading to document:', targetDocumentId);
+      const result = await uploadFinalDocument(
+        userEmail,
+        targetDocumentId,
+        file,
+        client.name,
+        `Final version uploaded: ${file.name}`,
+        onProgress
+      );
+      console.log('[executeUpload] Upload result:', result);
+
+      // Set processing state while refreshing
+      uploadProgressModal.setProcessing('Finalizing...');
+
+      // Refresh documents list
+      const updatedDocs = await getDocuments(userEmail);
+      setInvoices(updatedDocs);
+
+      // Show success state with details
+      uploadProgressModal.setSuccess({
+        documentType: pendingUpload.targetType.charAt(0).toUpperCase() + pendingUpload.targetType.slice(1),
+        fileFormat: isPdf ? 'PDF' : 'Excel',
+        fileName: fileName,
+      });
+
+      // Wait longer so user can see success state and details
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      uploadProgressModal.closeUpload();
+    } catch (err) {
+      console.error('[executeUpload] Failed to upload:', err);
+      uploadProgressModal.setError('Failed to upload. Please try again.');
+      // Keep modal open briefly so user can see error
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      uploadProgressModal.closeUpload();
+    } finally {
+      // Clear the file input
+      const fileInput = document.getElementById(`smart-upload-${record.id}`) as HTMLInputElement;
+      if (fileInput) fileInput.value = '';
+      setPendingUpload(null);
+    }
+  };
+
+  /**
    * Smart upload handler - analyzes filename to determine document type and format
-   * Uploads to the correct document (invoice/timesheet) based on filename keywords
+   * Shows confirmation modal before starting upload
    */
   const handleSmartUpload = async (e: React.ChangeEvent<HTMLInputElement>, record: WorkRecord, client: Client) => {
     const file = e.target.files?.[0];
@@ -721,7 +867,6 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     // Parse filename
     const fileName = file.name;
     const fileExt = fileName.toLowerCase().split('.').pop() || '';
-    const fileNameLower = fileName.toLowerCase();
 
     // Determine file format
     const isExcel = ['xlsx', 'xls'].includes(fileExt);
@@ -734,10 +879,8 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     }
 
     // Determine document type from filename keywords
-    // Replace underscores with spaces for better keyword detection
     const normalizedFileName = fileName.replace(/_/g, ' ');
     const hasInvoiceKeyword = /\binvoice\b/i.test(normalizedFileName);
-    // Match "timesheet" (one word) or "time sheet" (two words)
     const hasTimesheetKeyword = /\btimesheet\b/i.test(normalizedFileName) || /\btime sheet\b/i.test(normalizedFileName);
 
     let targetType: 'invoice' | 'timesheet' | null = null;
@@ -746,100 +889,109 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
     } else if (hasTimesheetKeyword && !hasInvoiceKeyword) {
       targetType = 'timesheet';
     } else if (hasInvoiceKeyword && hasTimesheetKeyword) {
-      // Both keywords found - ask user to clarify
-      const choice = confirm(
-        `The filename contains both "invoice" and "timesheet".\n\n` +
-        `Click OK to upload as INVOICE\n` +
-        `Click Cancel to upload as TIMESHEET`
-      );
-      targetType = choice ? 'invoice' : 'timesheet';
+      // Both keywords found - prefer invoice
+      targetType = 'invoice';
     } else {
       // No clear keyword - check file format as hint
-      if (isPdf) {
-        // PDFs are typically invoices (timesheets are Excel)
-        targetType = 'invoice';
-        console.log('[handleSmartUpload] No keyword found, PDF detected - assuming invoice');
-      } else {
-        // Excel files could be either - ask user
-        const choice = confirm(
-          `Cannot determine document type from filename "${fileName}".\n\n` +
-          `Click OK to upload as INVOICE\n` +
-          `Click Cancel to upload as TIMESHEET`
-        );
-        targetType = choice ? 'invoice' : 'timesheet';
-      }
+      targetType = isPdf ? 'invoice' : 'invoice'; // Default to invoice, user can change in modal
     }
 
-    // Find the target document
+    // Find available documents for this work record
     const existingInvoice = invoices.find(d => d.workRecordId === record.id && d.type === 'invoice');
     const existingTimesheet = invoices.find(d => d.workRecordId === record.id && d.type === 'timesheet');
 
+    const availableDocuments: Array<{ id: string; type: 'invoice' | 'timesheet'; displayName: string }> = [];
+    if (existingInvoice) {
+      availableDocuments.push({
+        id: existingInvoice.id!,
+        type: 'invoice',
+        displayName: existingInvoice.invoiceNumber || `Invoice - ${record.month}`
+      });
+    }
+    if (existingTimesheet) {
+      availableDocuments.push({
+        id: existingTimesheet.id!,
+        type: 'timesheet',
+        displayName: existingTimesheet.fileName?.replace(/\.[^/.]+$/, '') || `Timesheet - ${record.month}`
+      });
+    }
+
     console.log('[handleSmartUpload] Available documents:', {
       invoiceId: existingInvoice?.id,
-      invoiceType: existingInvoice?.type,
       timesheetId: existingTimesheet?.id,
-      timesheetType: existingTimesheet?.type,
       targetType
     });
 
-    const targetDocument = targetType === 'invoice' ? existingInvoice : existingTimesheet;
-
-    console.log('[handleSmartUpload] Selected target document:', {
-      targetDocumentId: targetDocument?.id,
-      targetDocumentType: targetDocument?.type
-    });
-
-    if (!targetDocument) {
+    if (availableDocuments.length === 0) {
       alert(
-        `No ${targetType} exists for this work record yet.\n\n` +
-        `Please generate a ${targetType} first before uploading a file.`
+        `No documents exist for this work record yet.\n\n` +
+        `Please generate an invoice or timesheet first before uploading a file.`
       );
       e.target.value = '';
       return;
     }
 
-    // Show what was detected and confirm
-    const detectedInfo = [
-      `Document Type: ${targetType.toUpperCase()}`,
-      `File Format: ${isPdf ? 'PDF' : 'Excel'}`,
-      `Filename: ${fileName}`,
-    ].join('\n');
-
-    console.log('[handleSmartUpload] Detected:', { targetType, isPdf, isExcel, fileName });
-
-    try {
-      setUploadingRecordId(record.id);
-      setUploadProgress(0);
-
-      // Progress callback
-      const onProgress = (progress: number) => {
-        setUploadProgress(progress);
-      };
-
-      console.log('[handleSmartUpload] Uploading to', targetType, ':', targetDocument.id);
-      const result = await uploadFinalDocument(
-        userEmail,
-        targetDocument.id!,
-        file,
-        client.name,
-        `Final version uploaded: ${file.name}`,
-        onProgress
-      );
-      console.log('[handleSmartUpload] Upload result:', result);
-
-      // Refresh documents list
-      const updatedDocs = await getDocuments(userEmail);
-      setInvoices(updatedDocs);
-
-      alert(`✓ Uploaded successfully!\n\n${detectedInfo}`);
-    } catch (err) {
-      console.error('[handleSmartUpload] Failed to upload:', err);
-      alert('Failed to upload. Error: ' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setUploadingRecordId(null);
-      setUploadProgress(0);
-      e.target.value = '';
+    // Find the suggested target document
+    let targetDocumentId = '';
+    if (targetType === 'invoice' && existingInvoice) {
+      targetDocumentId = existingInvoice.id!;
+    } else if (targetType === 'timesheet' && existingTimesheet) {
+      targetDocumentId = existingTimesheet.id!;
+    } else {
+      // Fallback to first available document
+      targetDocumentId = availableDocuments[0].id;
+      targetType = availableDocuments[0].type;
     }
+
+    console.log('[handleSmartUpload] Detected:', { targetType, isPdf, fileName, targetDocumentId });
+
+    // Store pending upload info
+    setPendingUpload({
+      file,
+      record,
+      client,
+      targetType,
+      targetDocumentId,
+      isPdf,
+    });
+
+    // Open confirmation modal
+    uploadProgressModal.openConfirm({
+      fileName,
+      documentType: targetType,
+      fileFormat: isPdf ? 'PDF' : 'Excel',
+      targetDocumentId,
+      availableDocuments,
+    });
+  };
+
+  /**
+   * Handle confirmation from the modal
+   */
+  const handleUploadConfirm = (details: { documentType: 'invoice' | 'timesheet'; targetDocumentId: string }) => {
+    if (pendingUpload) {
+      // Update pending upload with confirmed details
+      setPendingUpload({
+        ...pendingUpload,
+        targetType: details.documentType,
+        targetDocumentId: details.targetDocumentId,
+      });
+      // Start upload after state update
+      setTimeout(() => executeUpload(), 0);
+    }
+  };
+
+  /**
+   * Handle cancellation from the modal
+   */
+  const handleUploadCancel = () => {
+    if (pendingUpload) {
+      // Clear the file input
+      const fileInput = document.getElementById(`smart-upload-${pendingUpload.record.id}`) as HTMLInputElement;
+      if (fileInput) fileInput.value = '';
+    }
+    setPendingUpload(null);
+    uploadProgressModal.closeUpload();
   };
 
   const handleGenerateInvoice = async () => {
@@ -2041,28 +2193,11 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
                   const isInvoiceDropdownOpen = openDropdown?.type === 'invoice' && openDropdown?.recordId === record.id;
                   const isTimesheetDropdownOpen = openDropdown?.type === 'timesheet' && openDropdown?.recordId === record.id;
 
-                  const isUploadingThisRecord = uploadingRecordId === record.id;
-
                   return (
                     <div
                       key={record.id}
-                      onClick={() => handleEdit(record.clientId, record.month)}
-                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group cursor-pointer relative"
+                      className="px-4 sm:px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors group relative"
                     >
-                      {/* Upload Progress Bar */}
-                      {isUploadingThisRecord && (
-                        <div className="absolute inset-x-0 top-0 z-10">
-                          <div className="h-1 bg-indigo-100 dark:bg-indigo-900/30">
-                            <div
-                              className="h-full bg-indigo-600 transition-all duration-200"
-                              style={{ width: `${uploadProgress}%` }}
-                            />
-                          </div>
-                          <div className="absolute right-2 -top-5 text-xs text-indigo-600 dark:text-indigo-400 font-medium">
-                            {Math.round(uploadProgress)}%
-                          </div>
-                        </div>
-                      )}
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                         {/* Left: Client Info */}
                         <div className="flex items-center gap-3">
@@ -2908,6 +3043,31 @@ export const WorkRecordList: React.FC<WorkRecordListProps> = ({
           </div>
         </div>
       )}
+
+      {/* Upload Progress Modal */}
+      <UploadProgressModal
+        isOpen={uploadProgressModal.isOpen}
+        progress={uploadProgressModal.progress}
+        fileName={uploadProgressModal.fileName}
+        state={uploadProgressModal.state}
+        statusMessage={uploadProgressModal.statusMessage}
+        errorMessage={uploadProgressModal.errorMessage}
+        successDetails={uploadProgressModal.successDetails}
+        confirmDetails={uploadProgressModal.confirmDetails}
+        availableDocuments={uploadProgressModal.confirmDetails?.availableDocuments || []}
+        onConfirm={handleUploadConfirm}
+        onCancel={handleUploadCancel}
+      />
+
+      {/* Delete Confirmation Modal */}
+      <DeleteConfirmationModal
+        isOpen={showDeleteModal}
+        title="Confirm Deletion"
+        message="This work record has associated documents that will also be deleted:"
+        documents={deleteDocuments}
+        onConfirm={handleDeleteConfirm}
+        onCancel={handleDeleteCancel}
+      />
     </div>
   );
 };

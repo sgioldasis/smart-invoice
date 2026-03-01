@@ -327,13 +327,20 @@ export function getEffectiveStatus(document: Document): DocumentStatus {
     console.log('[getEffectiveStatus] Returning: paid');
     return 'paid';
   }
-  
+
   // If document was sent, show sent status
   if (document.status === 'sent') {
     console.log('[getEffectiveStatus] Returning: sent');
     return 'sent';
   }
-  
+
+  // If status is explicitly 'generated', return that (don't infer from file extension)
+  // This ensures newly generated docs show as "Generated" not "Excel Uploaded"
+  if (document.status === 'generated') {
+    console.log('[getEffectiveStatus] Returning: generated (explicit status)');
+    return 'generated';
+  }
+
   // Check ALL file fields: finalDocuments, legacy final fields, AND main storage fields
   const finalDocs = document.finalDocuments || [];
   
@@ -562,33 +569,16 @@ export function formatStatusDate(dateString: string | undefined): string {
 
 /**
  * Format status date for compact display (e.g., in badges)
- * Shows: "Feb 28, 19:34" format
+ * Shows: "Feb 28" or "Feb 28, 2024" format (date only, no time)
  */
 export function formatStatusDateCompact(dateString: string | undefined): string {
   if (!dateString) return '';
   const date = new Date(dateString);
-  const now = new Date();
-  const isSameYear = date.getFullYear() === now.getFullYear();
-  
-  if (isSameYear) {
-    return date.toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-    }) + ', ' + date.toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
-  }
   
   return date.toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
-  }) + ', ' + date.toLocaleTimeString('en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
   });
 }
 

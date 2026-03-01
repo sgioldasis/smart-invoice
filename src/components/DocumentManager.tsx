@@ -55,6 +55,7 @@ import { saveDocument } from '../services/db';
 import type { Template } from '../types';
 import { StatusBadge } from './DocumentStatus';
 import { getEffectiveStatus } from '../utils/documentStatus';
+import { UploadProgressModal, useUploadProgressModal } from './UploadProgressModal';
 import {
   migrateDocuments,
   previewMigration,
@@ -276,8 +277,9 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
   const [uploadMonth, setUploadMonth] = useState(format(new Date(), 'yyyy-MM'));
   const [uploadType, setUploadType] = useState<'invoice' | 'timesheet'>('invoice');
   const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+
+  // Upload progress modal
+  const uploadProgressModal = useUploadProgressModal();
 
   // Clients list for upload modal
   const [uploadClientsList, setUploadClientsList] = useState<{ id: string, name: string }[]>([]);
@@ -1027,13 +1029,14 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
     e.preventDefault();
     if (!uploadFile || !uploadClient || !uploadMonth) return;
 
-    try {
-      setUploading(true);
-      setUploadProgress(0);
-      const clientId = uploadClient;
-      const clientName = clientNames.get(clientId) || uploadClientsList.find(c => c.id === clientId)?.name || 'Unknown Client';
-      const fileName = uploadFile.name;
+    const clientId = uploadClient;
+    const clientName = clientNames.get(clientId) || uploadClientsList.find(c => c.id === clientId)?.name || 'Unknown Client';
+    const fileName = uploadFile.name;
 
+    // Open the blocking upload progress modal
+    uploadProgressModal.openUpload(fileName);
+
+    try {
       // Upload the document to Firebase Storage with progress tracking
       const { storagePath, downloadUrl } = await uploadDocument(
         userEmail,
@@ -1042,8 +1045,11 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         fileName,
         uploadFile,
         undefined,
-        (progress) => setUploadProgress(progress)
+        (progress) => uploadProgressModal.setProgress(progress)
       );
+
+      // Set processing state while saving metadata
+      uploadProgressModal.setProcessing('Saving document metadata...');
 
       // Save document metadata to Firestore
       await saveDocument(userEmail, {
@@ -1064,9 +1070,15 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         totalAmount: 0,
       });
 
-      // Reset internal modal state and close
+      // Show success state
+      uploadProgressModal.setSuccess();
+
+      // Wait a moment so user can see success state
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Close modals and reset state
+      uploadProgressModal.closeUpload();
       setUploadFile(null);
-      setUploadProgress(0);
       setShowUploadModal(false);
 
       // Refresh documents
@@ -1076,9 +1088,10 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
 
     } catch (err) {
       console.error('Upload error:', err);
-      alert('Failed to upload document.');
-    } finally {
-      setUploading(false);
+      uploadProgressModal.setError('Failed to upload document. Please try again.');
+      // Keep modal open briefly so user can see error
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      uploadProgressModal.closeUpload();
     }
   };
 
@@ -2056,6 +2069,16 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
         </div>
       )}
 
+      {/* Upload Progress Modal */}
+      <UploadProgressModal
+        isOpen={uploadProgressModal.isOpen}
+        progress={uploadProgressModal.progress}
+        fileName={uploadProgressModal.fileName}
+        state={uploadProgressModal.state}
+        statusMessage={uploadProgressModal.statusMessage}
+        errorMessage={uploadProgressModal.errorMessage}
+      />
+
       {showUploadModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 print:hidden">
           <div className="bg-white dark:bg-slate-900 rounded-xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
@@ -2067,7 +2090,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
               <button
                 onClick={() => setShowUploadModal(false)}
                 className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 rounded hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
-                disabled={uploading}
               >
                 <X size={20} />
               </button>
@@ -2128,21 +2150,6 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                     required
                   />
                 </div>
-                {/* Upload Progress Bar */}
-                {uploading && (
-                  <div className="space-y-2">
-                    <div className="flex justify-between text-sm">
-                      <span className="text-slate-600 dark:text-slate-400">Uploading...</span>
-                      <span className="text-slate-800 dark:text-slate-200 font-medium">{Math.round(uploadProgress)}%</span>
-                    </div>
-                    <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2.5 overflow-hidden">
-                      <div
-                        className="bg-sky-500 h-2.5 rounded-full transition-all duration-300 ease-out"
-                        style={{ width: `${uploadProgress}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
               </form>
             </div>
             <div className="p-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-3 bg-slate-50 dark:bg-slate-800/50">
@@ -2150,17 +2157,16 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ userEmail }) =
                 type="button"
                 onClick={() => setShowUploadModal(false)}
                 className="px-4 py-2 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors"
-                disabled={uploading}
               >
                 Cancel
               </button>
               <button
                 type="submit"
                 form="upload-pdf-form"
-                disabled={!uploadFile || !uploadClient || uploading}
+                disabled={!uploadFile || !uploadClient}
                 className="px-4 py-2 bg-sky-500 hover:bg-sky-600 text-white rounded-lg transition-colors flex items-center justify-center min-w-[100px] disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {uploading ? <Loader2 size={16} className="animate-spin" /> : 'Upload'}
+                Upload
               </button>
             </div>
           </div>
